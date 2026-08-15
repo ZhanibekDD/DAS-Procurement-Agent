@@ -1,5 +1,7 @@
 # DAS Снабжение — Procurement Agent MVP
 
+[![tests](https://github.com/ZhanibekDD/DAS-Procurement-Agent/actions/workflows/test.yml/badge.svg)](https://github.com/ZhanibekDD/DAS-Procurement-Agent/actions/workflows/test.yml)
+
 Отдельный внутренний модуль для контролируемых закупок. Он использует существующий
 DAS AI как интеллектуальный слой, но хранит проекты, поставщиков, коммерческие
 предложения и согласования в собственной базе.
