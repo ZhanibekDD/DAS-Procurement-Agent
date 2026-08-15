@@ -1,0 +1,28 @@
+services:
+  procurement-agent:
+    build: .
+    image: das-procurement-agent:local
+    env_file: .env
+    environment:
+      PROCUREMENT_ENV: production
+      PROCUREMENT_DB_PATH: /data/procurement.db
+      PROCUREMENT_OUTBOX_MODE: draft_only
+    volumes:
+      - procurement-data:/data
+    ports:
+      - "127.0.0.1:9200:9200"
+    expose:
+      - "9200"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9200/health', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  procurement-data:

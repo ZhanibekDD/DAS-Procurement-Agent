@@ -1,0 +1,269 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+from contextlib import contextmanager
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, Iterator
+
+
+SCHEMA = """
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS projects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    region TEXT NOT NULL,
+    delivery_address TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'draft',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS project_sections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    code TEXT NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    UNIQUE(project_id, code)
+);
+
+CREATE TABLE IF NOT EXISTS suppliers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    tax_id TEXT NOT NULL DEFAULT '',
+    region TEXT NOT NULL,
+    email TEXT NOT NULL DEFAULT '',
+    phone TEXT NOT NULL DEFAULT '',
+    telegram TEXT NOT NULL DEFAULT '',
+    categories_json TEXT NOT NULL DEFAULT '[]',
+    rating REAL NOT NULL DEFAULT 3,
+    verified INTEGER NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1,
+    source TEXT NOT NULL DEFAULT 'manual',
+    created_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_supplier_tax_id
+ON suppliers(tax_id) WHERE tax_id != '';
+
+CREATE TABLE IF NOT EXISTS lots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    section_id INTEGER REFERENCES project_sections(id) ON DELETE SET NULL,
+    title TEXT NOT NULL,
+    region TEXT NOT NULL,
+    delivery_address TEXT NOT NULL,
+    response_deadline TEXT NOT NULL,
+    desired_delivery_date TEXT,
+    currency TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS lot_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lot_id INTEGER NOT NULL REFERENCES lots(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    quantity TEXT NOT NULL,
+    unit TEXT NOT NULL,
+    specification TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS templates (
+    code TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    body TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS campaigns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lot_id INTEGER NOT NULL REFERENCES lots(id) ON DELETE CASCADE,
+    template_code TEXT NOT NULL REFERENCES templates(code),
+    channel TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS outbox_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id INTEGER NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+    supplier_id INTEGER NOT NULL REFERENCES suppliers(id),
+    channel TEXT NOT NULL,
+    recipient TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    body TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft',
+    approved_by TEXT NOT NULL DEFAULT '',
+    approved_at TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(campaign_id, supplier_id)
+);
+
+CREATE TABLE IF NOT EXISTS quotes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lot_id INTEGER NOT NULL REFERENCES lots(id) ON DELETE CASCADE,
+    supplier_id INTEGER NOT NULL REFERENCES suppliers(id),
+    currency TEXT NOT NULL,
+    vat_included INTEGER NOT NULL,
+    delivery_cost TEXT NOT NULL,
+    lead_days INTEGER NOT NULL,
+    payment_terms TEXT NOT NULL DEFAULT '',
+    warranty TEXT NOT NULL DEFAULT '',
+    valid_until TEXT,
+    source_filename TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS quote_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    quote_id INTEGER NOT NULL REFERENCES quotes(id) ON DELETE CASCADE,
+    lot_item_id INTEGER NOT NULL REFERENCES lot_items(id),
+    unit_price TEXT NOT NULL,
+    offered_quantity TEXT,
+    compliant INTEGER NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    UNIQUE(quote_id, lot_item_id)
+);
+
+CREATE TABLE IF NOT EXISTS source_documents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+    supplier_id INTEGER REFERENCES suppliers(id) ON DELETE SET NULL,
+    document_type TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    sha256 TEXT NOT NULL UNIQUE,
+    storage_path TEXT NOT NULL,
+    extraction_status TEXT NOT NULL DEFAULT 'pending_ai_extraction',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor TEXT NOT NULL,
+    action TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+"""
+
+
+DEFAULT_TEMPLATES = {
+    "rfq-email": {
+        "name": "Запрос коммерческого предложения — email",
+        "subject": "Запрос КП: {lot_title} — ответ до {response_deadline}",
+        "body": (
+            "Здравствуйте, {supplier_name}!\n\n"
+            "Просим предоставить коммерческое предложение по заявке «{lot_title}».\n\n"
+            "Объект: {project_name}\n"
+            "Регион: {region}\n"
+            "Адрес поставки: {delivery_address}\n"
+            "Желаемый срок поставки: {desired_delivery_date}\n\n"
+            "Спецификация:\n{items}\n\n"
+            "Просим отдельно указать цену, НДС, стоимость доставки, срок поставки, "
+            "условия оплаты, гарантию и срок действия предложения.\n"
+            "Ответ ожидаем до {response_deadline}.\n\n"
+            "С уважением,\nОтдел снабжения"
+        ),
+    },
+    "rfq-messenger": {
+        "name": "Короткий запрос КП — мессенджер",
+        "subject": "Запрос КП: {lot_title}",
+        "body": (
+            "Здравствуйте! Запрашиваем КП по позиции «{lot_title}» для объекта "
+            "{project_name}, доставка: {delivery_address}.\n{items}\n"
+            "Нужны цена с НДС, доставка, срок и условия оплаты. Ответ до {response_deadline}."
+        ),
+    },
+}
+
+
+def utcnow() -> str:
+    return datetime.now(UTC).replace(microsecond=0).isoformat()
+
+
+class Database:
+    def __init__(self, path: str):
+        self.path = path
+
+    def initialize(self) -> None:
+        if self.path != ":memory:":
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        with self.connection() as conn:
+            conn.executescript(SCHEMA)
+            for code, template in DEFAULT_TEMPLATES.items():
+                conn.execute(
+                    """
+                    INSERT INTO templates(code, name, subject, body, version, updated_at)
+                    VALUES (?, ?, ?, ?, 1, ?)
+                    ON CONFLICT(code) DO NOTHING
+                    """,
+                    (code, template["name"], template["subject"], template["body"], utcnow()),
+                )
+
+    @contextmanager
+    def connection(self) -> Iterator[sqlite3.Connection]:
+        conn = sqlite3.connect(self.path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 30000")
+        if self.path != ":memory:":
+            conn.execute("PRAGMA journal_mode = WAL")
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def one(self, sql: str, params: tuple[Any, ...] = ()) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            row = conn.execute(sql, params).fetchone()
+        return dict(row) if row else None
+
+    def all(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def audit(
+        self,
+        action: str,
+        entity_type: str,
+        entity_id: str | int,
+        *,
+        actor: str = "system",
+        details: dict[str, Any] | None = None,
+        conn: sqlite3.Connection | None = None,
+    ) -> None:
+        values = (
+            actor,
+            action,
+            entity_type,
+            str(entity_id),
+            json.dumps(details or {}, ensure_ascii=False, default=str),
+            utcnow(),
+        )
+        if conn is not None:
+            conn.execute(
+                "INSERT INTO audit_log(actor, action, entity_type, entity_id, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                values,
+            )
+            return
+        with self.connection() as owned_conn:
+            owned_conn.execute(
+                "INSERT INTO audit_log(actor, action, entity_type, entity_id, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                values,
+            )
