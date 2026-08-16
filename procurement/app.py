@@ -14,6 +14,10 @@ from .models import (
     ApprovalDecision,
     CampaignCreate,
     LotCreate,
+    ProcurementSuggestionApproval,
+    ProcurementSuggestionBatch,
+    ProcurementSuggestionRejection,
+    PurchaseHistoryCreate,
     ProjectCreate,
     QuoteCreate,
     SectionCreate,
@@ -36,7 +40,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="DAS Снабжение",
-    version="0.1.0",
+    version="0.4.0",
     description="Internal supplier RFQ and tender comparison workflow",
     lifespan=lifespan,
 )
@@ -165,6 +169,50 @@ def list_source_documents(extraction_status: str = Query(default="")):
     return [{**row, "storage_path": "internal"} for row in rows]
 
 
+@app.post(
+    "/api/documents/{document_id}/procurement-suggestions",
+    dependencies=[Depends(require_api_key)],
+    status_code=201,
+)
+def register_procurement_suggestions(document_id: int, data: ProcurementSuggestionBatch):
+    try:
+        return service.register_procurement_suggestions(document_id, data.suggestions)
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
+@app.get("/api/procurement-suggestions", dependencies=[Depends(require_api_key)])
+def list_procurement_suggestions(
+    project_id: int | None = Query(default=None), status: str = Query(default="")
+):
+    try:
+        return service.list_procurement_suggestions(project_id=project_id, status=status)
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
+@app.post(
+    "/api/procurement-suggestions/{suggestion_id}/approve",
+    dependencies=[Depends(require_api_key)],
+)
+def approve_procurement_suggestion(suggestion_id: int, data: ProcurementSuggestionApproval):
+    try:
+        return service.approve_procurement_suggestion(suggestion_id, data)
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
+@app.post(
+    "/api/procurement-suggestions/{suggestion_id}/reject",
+    dependencies=[Depends(require_api_key)],
+)
+def reject_procurement_suggestion(suggestion_id: int, data: ProcurementSuggestionRejection):
+    try:
+        return service.reject_procurement_suggestion(suggestion_id, data)
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
 @app.post("/api/lots", dependencies=[Depends(require_api_key)], status_code=201)
 def create_lot(data: LotCreate):
     try:
@@ -202,6 +250,25 @@ def create_campaign(lot_id: int, data: CampaignCreate):
         raise handle_domain_error(exc) from exc
 
 
+@app.get("/api/campaigns", dependencies=[Depends(require_api_key)])
+def list_campaigns(lot_id: int | None = Query(default=None)):
+    try:
+        return service.list_campaigns(lot_id)
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
+@app.get("/api/outbox", dependencies=[Depends(require_api_key)])
+def list_outbox(
+    status: str = Query(default=""),
+    lot_id: int | None = Query(default=None),
+):
+    try:
+        return service.list_outbox(status=status, lot_id=lot_id)
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
 @app.post("/api/outbox/{message_id}/approve", dependencies=[Depends(require_api_key)])
 def approve_message(message_id: int, decision: ApprovalDecision):
     try:
@@ -218,10 +285,46 @@ def add_quote(lot_id: int, data: QuoteCreate):
         raise handle_domain_error(exc) from exc
 
 
+@app.get("/api/lots/{lot_id}/quotes", dependencies=[Depends(require_api_key)])
+def list_quotes(lot_id: int):
+    try:
+        return service.list_quotes(lot_id)
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
 @app.get("/api/lots/{lot_id}/comparison", dependencies=[Depends(require_api_key)])
 def comparison(lot_id: int):
     try:
         return service.comparison(lot_id)
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
+@app.get("/api/lots/{lot_id}/price-benchmark", dependencies=[Depends(require_api_key)])
+def price_benchmark(lot_id: int):
+    try:
+        return service.lot_price_benchmark(lot_id)
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
+@app.post("/api/price-history", dependencies=[Depends(require_api_key)], status_code=201)
+def add_price_history(data: PurchaseHistoryCreate):
+    try:
+        return service.add_purchase_history(data)
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
+@app.get("/api/price-history", dependencies=[Depends(require_api_key)])
+def list_price_history(
+    search: str = Query(default=""),
+    supplier_id: int | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=500),
+):
+    try:
+        return service.list_purchase_history(search=search, supplier_id=supplier_id, limit=limit)
     except Exception as exc:
         raise handle_domain_error(exc) from exc
 
@@ -235,5 +338,13 @@ def list_templates():
 def upsert_template(code: str, data: TemplateUpsert):
     try:
         return service.upsert_template(code, data)
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
+@app.get("/api/audit", dependencies=[Depends(require_api_key)])
+def list_audit(limit: int = Query(default=50, ge=1, le=200)):
+    try:
+        return service.list_audit(limit)
     except Exception as exc:
         raise handle_domain_error(exc) from exc

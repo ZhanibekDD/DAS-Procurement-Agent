@@ -62,6 +62,31 @@ class LotCreate(StrictModel):
     items: list[LotItemCreate] = Field(min_length=1, max_length=500)
 
 
+class ProcurementSuggestionCreate(StrictModel):
+    section_code: str = Field(min_length=1, max_length=50)
+    section_name: str = Field(min_length=2, max_length=200)
+    lot_title: str = Field(min_length=2, max_length=240)
+    items: list[LotItemCreate] = Field(min_length=1, max_length=500)
+    evidence: list[str] = Field(default_factory=list, max_length=50)
+    confidence: float = Field(ge=0, le=1)
+
+
+class ProcurementSuggestionBatch(StrictModel):
+    suggestions: list[ProcurementSuggestionCreate] = Field(min_length=1, max_length=100)
+
+
+class ProcurementSuggestionApproval(StrictModel):
+    response_deadline: date
+    desired_delivery_date: date | None = None
+    currency: str = Field(default="RUB", pattern=r"^[A-Z]{3}$")
+    approved_by: str = Field(min_length=2, max_length=160)
+
+
+class ProcurementSuggestionRejection(StrictModel):
+    reviewed_by: str = Field(min_length=2, max_length=160)
+    reason: str = Field(min_length=2, max_length=1000)
+
+
 class CampaignCreate(StrictModel):
     template_code: str = Field(default="rfq-email", min_length=2, max_length=80)
     supplier_ids: list[int] = Field(min_length=1, max_length=500)
@@ -89,6 +114,22 @@ class QuoteCreate(StrictModel):
     items: list[QuoteItemCreate] = Field(min_length=1, max_length=500)
 
 
+class PurchaseHistoryCreate(StrictModel):
+    supplier_id: int | None = Field(default=None, gt=0)
+    source_document_id: int | None = Field(default=None, gt=0)
+    item_name: str = Field(min_length=2, max_length=240)
+    quantity: Decimal = Field(gt=0)
+    unit: str = Field(min_length=1, max_length=30)
+    unit_price: Decimal = Field(gt=0)
+    currency: str = Field(default="RUB", pattern=r"^[A-Z]{3}$")
+    vat_included: bool = True
+    purchased_on: date
+    invoice_number: str = Field(default="", max_length=120)
+    project_name: str = Field(default="", max_length=240)
+    region: str = Field(default="", max_length=120)
+    confirmed_by: str = Field(min_length=2, max_length=160)
+
+
 class TemplateUpsert(StrictModel):
     name: str = Field(min_length=2, max_length=160)
     subject: str = Field(min_length=2, max_length=500)
@@ -98,4 +139,3 @@ class TemplateUpsert(StrictModel):
 class ApprovalDecision(StrictModel):
     approved_by: str = Field(min_length=2, max_length=160)
     comment: str = Field(default="", max_length=1000)
-

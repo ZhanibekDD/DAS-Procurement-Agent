@@ -132,6 +132,31 @@ CREATE TABLE IF NOT EXISTS quote_items (
     UNIQUE(quote_id, lot_item_id)
 );
 
+CREATE TABLE IF NOT EXISTS purchase_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint TEXT NOT NULL UNIQUE,
+    supplier_id INTEGER REFERENCES suppliers(id) ON DELETE SET NULL,
+    source_document_id INTEGER REFERENCES source_documents(id) ON DELETE SET NULL,
+    item_name TEXT NOT NULL,
+    normalized_name TEXT NOT NULL,
+    quantity TEXT NOT NULL,
+    unit TEXT NOT NULL,
+    unit_price TEXT NOT NULL,
+    currency TEXT NOT NULL,
+    vat_included INTEGER NOT NULL,
+    purchased_on TEXT NOT NULL,
+    invoice_number TEXT NOT NULL DEFAULT '',
+    project_name TEXT NOT NULL DEFAULT '',
+    region TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'manual',
+    review_status TEXT NOT NULL DEFAULT 'approved',
+    confirmed_by TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_purchase_history_lookup
+ON purchase_history(normalized_name, unit, currency, purchased_on DESC);
+
 CREATE TABLE IF NOT EXISTS source_documents (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
@@ -145,6 +170,27 @@ CREATE TABLE IF NOT EXISTS source_documents (
     extraction_status TEXT NOT NULL DEFAULT 'pending_ai_extraction',
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS procurement_suggestions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_document_id INTEGER NOT NULL REFERENCES source_documents(id) ON DELETE CASCADE,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    section_code TEXT NOT NULL,
+    section_name TEXT NOT NULL,
+    lot_title TEXT NOT NULL,
+    items_json TEXT NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    confidence REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'needs_review',
+    reviewed_by TEXT NOT NULL DEFAULT '',
+    reviewed_at TEXT,
+    lot_id INTEGER REFERENCES lots(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(source_document_id, section_code, lot_title)
+);
+
+CREATE INDEX IF NOT EXISTS ix_procurement_suggestions_review
+ON procurement_suggestions(status, project_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

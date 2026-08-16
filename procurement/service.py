@@ -2,14 +2,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+from difflib import SequenceMatcher
 from decimal import Decimal
 from pathlib import Path
+from statistics import median
 from typing import Any
 
 from .db import Database, utcnow
 from .models import (
     CampaignCreate,
     LotCreate,
+    LotItemCreate,
+    ProcurementSuggestionApproval,
+    ProcurementSuggestionCreate,
+    ProcurementSuggestionRejection,
+    PurchaseHistoryCreate,
     ProjectCreate,
     QuoteCreate,
     SectionCreate,
@@ -299,6 +307,55 @@ class ProcurementService:
         )
         return row
 
+    def list_campaigns(self, lot_id: int | None = None) -> list[dict[str, Any]]:
+        params: tuple[Any, ...] = ()
+        where = ""
+        if lot_id is not None:
+            self.get_lot(lot_id)
+            where = "WHERE campaigns.lot_id = ?"
+            params = (lot_id,)
+        return self.db.all(
+            f"""
+            SELECT campaigns.*, lots.title AS lot_title,
+                   COUNT(outbox_messages.id) AS message_count,
+                   SUM(CASE WHEN outbox_messages.status = 'approved' THEN 1 ELSE 0 END) AS approved_count
+            FROM campaigns
+            JOIN lots ON lots.id = campaigns.lot_id
+            LEFT JOIN outbox_messages ON outbox_messages.campaign_id = campaigns.id
+            {where}
+            GROUP BY campaigns.id
+            ORDER BY campaigns.id DESC
+            """,
+            params,
+        )
+
+    def list_outbox(self, status: str = "", lot_id: int | None = None) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status:
+            if status not in {"draft", "approved", "sent", "failed"}:
+                raise ValueError("unsupported outbox status")
+            clauses.append("outbox_messages.status = ?")
+            params.append(status)
+        if lot_id is not None:
+            self.get_lot(lot_id)
+            clauses.append("campaigns.lot_id = ?")
+            params.append(lot_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return self.db.all(
+            f"""
+            SELECT outbox_messages.*, suppliers.name AS supplier_name,
+                   campaigns.lot_id, lots.title AS lot_title
+            FROM outbox_messages
+            JOIN suppliers ON suppliers.id = outbox_messages.supplier_id
+            JOIN campaigns ON campaigns.id = outbox_messages.campaign_id
+            JOIN lots ON lots.id = campaigns.lot_id
+            {where}
+            ORDER BY outbox_messages.id DESC
+            """,
+            tuple(params),
+        )
+
     def approve_message(self, message_id: int, approved_by: str, comment: str = "") -> dict[str, Any]:
         message = self.db.one("SELECT * FROM outbox_messages WHERE id = ?", (message_id,))
         if not message:
@@ -370,8 +427,219 @@ class ProcurementService:
             self.db.audit("received", "quote", quote_id, details={"lot_id": lot_id}, conn=conn)
         return self.db.one("SELECT * FROM quotes WHERE id = ?", (quote_id,)) or {}
 
+    @staticmethod
+    def _normalized_item_name(value: str) -> str:
+        return " ".join(re.findall(r"[0-9a-zа-я]+", value.casefold().replace("ё", "е")))
+
+    @classmethod
+    def _item_match_score(cls, requested: str, historical: str) -> float:
+        left = cls._normalized_item_name(requested)
+        right = cls._normalized_item_name(historical)
+        if not left or not right:
+            return 0.0
+        if left == right:
+            return 1.0
+        left_tokens, right_tokens = set(left.split()), set(right.split())
+        token_score = len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+        containment = 0.9 if left_tokens <= right_tokens or right_tokens <= left_tokens else 0.0
+        return max(token_score, containment, SequenceMatcher(None, left, right).ratio())
+
+    def add_purchase_history(self, data: PurchaseHistoryCreate) -> dict[str, Any]:
+        if data.supplier_id is not None:
+            self.get_supplier(data.supplier_id)
+        if data.source_document_id is not None:
+            document = self.db.one(
+                "SELECT id, document_type FROM source_documents WHERE id = ?",
+                (data.source_document_id,),
+            )
+            if not document:
+                raise NotFoundError("source document not found")
+            if document["document_type"] != "paid_invoice":
+                raise ValueError("price history source must be a paid invoice")
+        normalized_name = self._normalized_item_name(data.item_name)
+        fingerprint_source = "|".join(
+            [
+                str(data.supplier_id or 0),
+                str(data.source_document_id or 0),
+                normalized_name,
+                str(data.quantity.normalize()),
+                self._normalized_item_name(data.unit),
+                str(data.unit_price.normalize()),
+                data.currency,
+                data.purchased_on.isoformat(),
+                data.invoice_number.casefold(),
+            ]
+        )
+        fingerprint = hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()
+        with self.db.connection() as conn:
+            try:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO purchase_history(
+                        fingerprint, supplier_id, source_document_id, item_name, normalized_name,
+                        quantity, unit, unit_price, currency, vat_included, purchased_on,
+                        invoice_number, project_name, region, source, review_status,
+                        confirmed_by, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', 'approved', ?, ?)
+                    """,
+                    (
+                        fingerprint,
+                        data.supplier_id,
+                        data.source_document_id,
+                        data.item_name,
+                        normalized_name,
+                        str(data.quantity),
+                        data.unit,
+                        str(data.unit_price),
+                        data.currency,
+                        int(data.vat_included),
+                        data.purchased_on.isoformat(),
+                        data.invoice_number,
+                        data.project_name,
+                        data.region,
+                        data.confirmed_by,
+                        utcnow(),
+                    ),
+                )
+            except Exception as exc:
+                if "UNIQUE constraint" in str(exc):
+                    raise ConflictError("this paid purchase is already in price history") from exc
+                raise
+            record_id = cursor.lastrowid
+            self.db.audit(
+                "confirmed",
+                "purchase_history",
+                record_id,
+                actor=data.confirmed_by,
+                details={"source": "manual", "currency": data.currency},
+                conn=conn,
+            )
+        return self.get_purchase_history(record_id)
+
+    def get_purchase_history(self, record_id: int) -> dict[str, Any]:
+        row = self.db.one(
+            """
+            SELECT purchase_history.*, suppliers.name AS supplier_name
+            FROM purchase_history
+            LEFT JOIN suppliers ON suppliers.id = purchase_history.supplier_id
+            WHERE purchase_history.id = ?
+            """,
+            (record_id,),
+        )
+        if not row:
+            raise NotFoundError("purchase history record not found")
+        row["vat_included"] = bool(row["vat_included"])
+        return row
+
+    def list_purchase_history(
+        self,
+        *,
+        search: str = "",
+        supplier_id: int | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        if limit < 1 or limit > 500:
+            raise ValueError("price history limit must be between 1 and 500")
+        clauses = ["purchase_history.review_status = 'approved'"]
+        params: list[Any] = []
+        if supplier_id is not None:
+            clauses.append("purchase_history.supplier_id = ?")
+            params.append(supplier_id)
+        if search:
+            clauses.append("purchase_history.normalized_name LIKE ?")
+            params.append(f"%{self._normalized_item_name(search)}%")
+        params.append(limit)
+        rows = self.db.all(
+            f"""
+            SELECT purchase_history.*, suppliers.name AS supplier_name
+            FROM purchase_history
+            LEFT JOIN suppliers ON suppliers.id = purchase_history.supplier_id
+            WHERE {' AND '.join(clauses)}
+            ORDER BY purchase_history.purchased_on DESC, purchase_history.id DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        )
+        for row in rows:
+            row["vat_included"] = bool(row["vat_included"])
+        return rows
+
+    def lot_price_benchmark(self, lot_id: int) -> dict[str, Any]:
+        lot = self.get_lot(lot_id)
+        history = self.list_purchase_history(limit=500)
+        items: list[dict[str, Any]] = []
+        for item in lot["items"]:
+            candidates = []
+            for record in history:
+                if record["currency"] != lot["currency"]:
+                    continue
+                if self._normalized_item_name(record["unit"]) != self._normalized_item_name(
+                    item["unit"]
+                ):
+                    continue
+                score = self._item_match_score(item["name"], record["item_name"])
+                if score >= 0.75:
+                    candidates.append((score, record))
+            prices = [Decimal(record["unit_price"]) for _, record in candidates]
+            items.append(
+                {
+                    "lot_item_id": item["id"],
+                    "item_name": item["name"],
+                    "unit": item["unit"],
+                    "currency": lot["currency"],
+                    "history_count": len(prices),
+                    "median_unit_price": float(median(prices)) if prices else None,
+                    "min_unit_price": float(min(prices)) if prices else None,
+                    "max_unit_price": float(max(prices)) if prices else None,
+                    "latest_unit_price": (
+                        float(Decimal(candidates[0][1]["unit_price"])) if candidates else None
+                    ),
+                    "match_confidence": round(max((score for score, _ in candidates), default=0.0), 3),
+                }
+            )
+        return {
+            "lot_id": lot_id,
+            "currency": lot["currency"],
+            "matched_items": sum(1 for item in items if item["history_count"]),
+            "total_items": len(items),
+            "items": items,
+            "policy": "approved_paid_invoices_same_currency_unit_match_gte_0_75",
+        }
+
+    def list_quotes(self, lot_id: int) -> list[dict[str, Any]]:
+        self.get_lot(lot_id)
+        rows = self.db.all(
+            """
+            SELECT quotes.*, suppliers.name AS supplier_name
+            FROM quotes JOIN suppliers ON suppliers.id = quotes.supplier_id
+            WHERE quotes.lot_id = ? ORDER BY quotes.id DESC
+            """,
+            (lot_id,),
+        )
+        for row in rows:
+            row["vat_included"] = bool(row["vat_included"])
+            row["items"] = self.db.all(
+                """
+                SELECT quote_items.*, lot_items.name AS lot_item_name, lot_items.unit
+                FROM quote_items JOIN lot_items ON lot_items.id = quote_items.lot_item_id
+                WHERE quote_items.quote_id = ? ORDER BY quote_items.id
+                """,
+                (row["id"],),
+            )
+        return rows
+
+    def list_audit(self, limit: int = 50) -> list[dict[str, Any]]:
+        if limit < 1 or limit > 200:
+            raise ValueError("audit limit must be between 1 and 200")
+        rows = self.db.all("SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,))
+        for row in rows:
+            row["details"] = json.loads(row.pop("details_json"))
+        return rows
+
     def comparison(self, lot_id: int) -> dict[str, Any]:
         lot = self.get_lot(lot_id)
+        benchmark = self.lot_price_benchmark(lot_id)
+        benchmark_by_item = {int(item["lot_item_id"]): item for item in benchmark["items"]}
         requested = {int(item["id"]): Decimal(item["quantity"]) for item in lot["items"]}
         quotes = self.db.all(
             """
@@ -390,6 +658,39 @@ class ProcurementService:
             complete = {int(item["lot_item_id"]) for item in items} == set(requested)
             compliant = complete and all(bool(item["compliant"]) for item in items)
             total = subtotal + Decimal(quote["delivery_cost"])
+            history_quote_total = Decimal("0")
+            history_median_total = Decimal("0")
+            history_matches = 0
+            for item in items:
+                item_id = int(item["lot_item_id"])
+                item_benchmark = benchmark_by_item[item_id]
+                median_price = item_benchmark["median_unit_price"]
+                if median_price is None:
+                    continue
+                history_matches += 1
+                quantity = requested[item_id]
+                history_quote_total += quantity * Decimal(item["unit_price"])
+                history_median_total += quantity * Decimal(str(median_price))
+            variance = None
+            potential_saving = None
+            price_signal = "insufficient_history"
+            if history_median_total > 0:
+                variance = float(
+                    (
+                        (history_quote_total - history_median_total)
+                        / history_median_total
+                        * 100
+                    ).quantize(Decimal("0.1"))
+                )
+                potential_saving = float(
+                    max(Decimal("0"), history_quote_total - history_median_total)
+                )
+                if variance > 10:
+                    price_signal = "above_history"
+                elif variance < -10:
+                    price_signal = "below_history"
+                else:
+                    price_signal = "near_history"
             rows.append(
                 {
                     "quote_id": quote["id"],
@@ -406,10 +707,15 @@ class ProcurementService:
                     "vat_included": bool(quote["vat_included"]),
                     "compliant": compliant,
                     "coverage": f"{len(items)}/{len(requested)}",
+                    "history_coverage": f"{history_matches}/{len(requested)}",
+                    "history_variance_pct": variance,
+                    "potential_saving": potential_saving,
+                    "price_signal": price_signal,
                 }
             )
         return {
             "lot": lot,
+            "price_benchmark": benchmark,
             "ranking_policy": "landed_cost_60_delivery_15_reliability_15_terms_10",
             "quotes": rank_quotes(rows),
             "decision": "human_approval_required",
@@ -491,6 +797,243 @@ class ProcurementService:
             )
         return self.db.all("SELECT * FROM source_documents ORDER BY id DESC")
 
+    @staticmethod
+    def _decode_suggestion(row: dict[str, Any]) -> dict[str, Any]:
+        row["items"] = json.loads(row.pop("items_json"))
+        row["evidence"] = json.loads(row.pop("evidence_json"))
+        return row
+
+    def register_procurement_suggestions(
+        self, document_id: int, suggestions: list[ProcurementSuggestionCreate]
+    ) -> list[dict[str, Any]]:
+        document = self.db.one("SELECT * FROM source_documents WHERE id = ?", (document_id,))
+        if not document:
+            raise NotFoundError("source document not found")
+        if document["document_type"] != "project_section":
+            raise ValueError("procurement suggestions require a project section document")
+        if document["project_id"] is None:
+            raise ValueError("project section document must be linked to a project")
+        created: list[int] = []
+        with self.db.connection() as conn:
+            for suggestion in suggestions:
+                try:
+                    cursor = conn.execute(
+                        """
+                        INSERT INTO procurement_suggestions(
+                            source_document_id, project_id, section_code, section_name,
+                            lot_title, items_json, evidence_json, confidence, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            document_id,
+                            document["project_id"],
+                            suggestion.section_code,
+                            suggestion.section_name,
+                            suggestion.lot_title,
+                            json.dumps(
+                                [item.model_dump(mode="json") for item in suggestion.items],
+                                ensure_ascii=False,
+                            ),
+                            json.dumps(suggestion.evidence, ensure_ascii=False),
+                            suggestion.confidence,
+                            utcnow(),
+                        ),
+                    )
+                except Exception as exc:
+                    if "UNIQUE constraint" in str(exc):
+                        raise ConflictError("procurement suggestion already exists") from exc
+                    raise
+                created.append(int(cursor.lastrowid))
+            conn.execute(
+                "UPDATE source_documents SET extraction_status='needs_review' WHERE id=?",
+                (document_id,),
+            )
+            self.db.audit(
+                "extracted",
+                "source_document",
+                document_id,
+                details={"procurement_suggestions": len(created), "decision": "human_review_required"},
+                conn=conn,
+            )
+        return [self.get_procurement_suggestion(suggestion_id) for suggestion_id in created]
+
+    def get_procurement_suggestion(self, suggestion_id: int) -> dict[str, Any]:
+        row = self.db.one(
+            """
+            SELECT s.*, d.filename AS source_filename, p.name AS project_name,
+                   p.region AS project_region, p.delivery_address
+            FROM procurement_suggestions s
+            JOIN source_documents d ON d.id = s.source_document_id
+            JOIN projects p ON p.id = s.project_id
+            WHERE s.id = ?
+            """,
+            (suggestion_id,),
+        )
+        if not row:
+            raise NotFoundError("procurement suggestion not found")
+        return self._decode_suggestion(row)
+
+    @staticmethod
+    def _finish_document_review(conn: Any, source_document_id: int) -> None:
+        conn.execute(
+            """
+            UPDATE source_documents
+            SET extraction_status='approved'
+            WHERE id=? AND NOT EXISTS (
+                SELECT 1 FROM procurement_suggestions
+                WHERE source_document_id=? AND status IN ('needs_review', 'approving')
+            )
+            """,
+            (source_document_id, source_document_id),
+        )
+
+    def list_procurement_suggestions(
+        self, *, project_id: int | None = None, status: str = ""
+    ) -> list[dict[str, Any]]:
+        allowed_statuses = {"needs_review", "approved", "rejected"}
+        if status and status not in allowed_statuses:
+            raise ValueError("unsupported procurement suggestion status")
+        clauses, params = [], []
+        if project_id is not None:
+            self.get_project(project_id)
+            clauses.append("s.project_id = ?")
+            params.append(project_id)
+        if status:
+            clauses.append("s.status = ?")
+            params.append(status)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = self.db.all(
+            """
+            SELECT s.*, d.filename AS source_filename, p.name AS project_name,
+                   p.region AS project_region, p.delivery_address
+            FROM procurement_suggestions s
+            JOIN source_documents d ON d.id = s.source_document_id
+            JOIN projects p ON p.id = s.project_id
+            """
+            + where
+            + " ORDER BY s.id DESC",
+            tuple(params),
+        )
+        return [self._decode_suggestion(row) for row in rows]
+
+    def approve_procurement_suggestion(
+        self, suggestion_id: int, data: ProcurementSuggestionApproval
+    ) -> dict[str, Any]:
+        suggestion = self.get_procurement_suggestion(suggestion_id)
+        if suggestion["status"] != "needs_review":
+            raise ConflictError("only suggestions awaiting review can be approved")
+        with self.db.connection() as conn:
+            claimed = conn.execute(
+                "UPDATE procurement_suggestions SET status='approving' WHERE id=? AND status='needs_review'",
+                (suggestion_id,),
+            )
+            if claimed.rowcount != 1:
+                raise ConflictError("only suggestions awaiting review can be approved")
+            section = conn.execute(
+                "SELECT * FROM project_sections WHERE project_id=? AND code=?",
+                (suggestion["project_id"], suggestion["section_code"]),
+            ).fetchone()
+            if section:
+                section_id = int(section["id"])
+            else:
+                section_cursor = conn.execute(
+                    """
+                    INSERT INTO project_sections(project_id, code, name, description, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        suggestion["project_id"],
+                        suggestion["section_code"],
+                        suggestion["section_name"],
+                        f"Создано из {suggestion['source_filename']}",
+                        utcnow(),
+                    ),
+                )
+                section_id = int(section_cursor.lastrowid)
+                self.db.audit("created", "project_section", section_id, conn=conn)
+            lot_cursor = conn.execute(
+                """
+                INSERT INTO lots(
+                    project_id, section_id, title, region, delivery_address,
+                    response_deadline, desired_delivery_date, currency, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    suggestion["project_id"],
+                    section_id,
+                    suggestion["lot_title"],
+                    suggestion["project_region"],
+                    suggestion["delivery_address"],
+                    data.response_deadline.isoformat(),
+                    data.desired_delivery_date.isoformat() if data.desired_delivery_date else None,
+                    data.currency,
+                    utcnow(),
+                ),
+            )
+            lot_id = int(lot_cursor.lastrowid)
+            for item_data in suggestion["items"]:
+                item = LotItemCreate.model_validate(item_data)
+                conn.execute(
+                    "INSERT INTO lot_items(lot_id, name, quantity, unit, specification) VALUES (?, ?, ?, ?, ?)",
+                    (lot_id, item.name, str(item.quantity), item.unit, item.specification),
+                )
+            self.db.audit(
+                "created",
+                "lot",
+                lot_id,
+                details={"project_name": suggestion["project_name"], "source": "ai_suggestion"},
+                conn=conn,
+            )
+            conn.execute(
+                """
+                UPDATE procurement_suggestions
+                SET status='approved', reviewed_by=?, reviewed_at=?, lot_id=?
+                WHERE id=? AND status='approving'
+                """,
+                (data.approved_by, utcnow(), lot_id, suggestion_id),
+            )
+            self._finish_document_review(conn, suggestion["source_document_id"])
+            self.db.audit(
+                "approved",
+                "procurement_suggestion",
+                suggestion_id,
+                actor=data.approved_by,
+                details={"lot_id": lot_id, "source_document_id": suggestion["source_document_id"]},
+                conn=conn,
+            )
+        return {
+            "suggestion": self.get_procurement_suggestion(suggestion_id),
+            "lot": self.get_lot(lot_id),
+        }
+
+    def reject_procurement_suggestion(
+        self, suggestion_id: int, data: ProcurementSuggestionRejection
+    ) -> dict[str, Any]:
+        suggestion = self.get_procurement_suggestion(suggestion_id)
+        if suggestion["status"] != "needs_review":
+            raise ConflictError("only suggestions awaiting review can be rejected")
+        with self.db.connection() as conn:
+            rejected = conn.execute(
+                """
+                UPDATE procurement_suggestions
+                SET status='rejected', reviewed_by=?, reviewed_at=?
+                WHERE id=? AND status='needs_review'
+                """,
+                (data.reviewed_by, utcnow(), suggestion_id),
+            )
+            if rejected.rowcount != 1:
+                raise ConflictError("only suggestions awaiting review can be rejected")
+            self._finish_document_review(conn, suggestion["source_document_id"])
+            self.db.audit(
+                "rejected",
+                "procurement_suggestion",
+                suggestion_id,
+                actor=data.reviewed_by,
+                details={"reason": data.reason},
+                conn=conn,
+            )
+        return self.get_procurement_suggestion(suggestion_id)
+
     def dashboard(self) -> dict[str, int]:
         return {
             "projects": int((self.db.one("SELECT COUNT(*) AS n FROM projects") or {"n": 0})["n"]),
@@ -514,6 +1057,14 @@ class ProcurementService:
                 (
                     self.db.one(
                         "SELECT COUNT(*) AS n FROM source_documents WHERE extraction_status='pending_ai_extraction'"
+                    )
+                    or {"n": 0}
+                )["n"]
+            ),
+            "historical_prices": int(
+                (
+                    self.db.one(
+                        "SELECT COUNT(*) AS n FROM purchase_history WHERE review_status='approved'"
                     )
                     or {"n": 0}
                 )["n"]
