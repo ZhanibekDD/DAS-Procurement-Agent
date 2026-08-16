@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from datetime import date, timedelta
 from decimal import Decimal
+from pathlib import Path
 from unittest.mock import patch
 
 from openpyxl import Workbook
@@ -17,7 +18,11 @@ from procurement.models import (
     CampaignCreate,
     LotCreate,
     LotItemCreate,
+    ProcurementSuggestionApproval,
+    ProcurementSuggestionCreate,
+    ProcurementSuggestionRejection,
     ProjectCreate,
+    PurchaseHistoryCreate,
     QuoteCreate,
     QuoteItemCreate,
     SupplierCreate,
@@ -121,6 +126,22 @@ class ProcurementTestCase(unittest.TestCase):
                 items=[QuoteItemCreate(lot_item_id=item_id, unit_price=Decimal("12500"))],
             ),
         )
+
+        history = self.service.add_purchase_history(
+            PurchaseHistoryCreate(
+                supplier_id=supplier_a["id"],
+                item_name="Окно ПВХ 1400x1200",
+                quantity=Decimal("60"),
+                unit="шт.",
+                unit_price=Decimal("12000"),
+                currency="RUB",
+                purchased_on=date.today() - timedelta(days=90),
+                invoice_number="INV-OLD-42",
+                region="Воронеж",
+                confirmed_by="Руководитель снабжения",
+            )
+        )
+        self.assertEqual(history["review_status"], "approved")
         self.service.add_quote(
             lot["id"],
             QuoteCreate(
@@ -137,6 +158,204 @@ class ProcurementTestCase(unittest.TestCase):
         self.assertEqual(comparison["quotes"][0]["rank"], 1)
         self.assertEqual(comparison["quotes"][0]["supplier_name"], "Окна Регион")
         self.assertEqual(comparison["quotes"][0]["total_cost"], 1_090_000.0)
+        self.assertEqual(comparison["price_benchmark"]["matched_items"], 1)
+        self.assertEqual(comparison["quotes"][0]["history_coverage"], "1/1")
+        self.assertEqual(comparison["quotes"][0]["history_variance_pct"], 4.2)
+        self.assertEqual(comparison["quotes"][0]["potential_saving"], 42_000.0)
+
+        campaigns = self.service.list_campaigns(lot["id"])
+        self.assertEqual(campaigns[0]["message_count"], 2)
+        self.assertEqual(campaigns[0]["approved_count"], 1)
+
+        drafts = self.service.list_outbox(status="draft", lot_id=lot["id"])
+        self.assertEqual(len(drafts), 1)
+        self.assertEqual(drafts[0]["supplier_name"], "Строй Комплект")
+
+        quotes = self.service.list_quotes(lot["id"])
+        self.assertEqual(len(quotes), 2)
+        self.assertEqual(quotes[0]["items"][0]["lot_item_name"], "Окно ПВХ 1400×1200")
+
+        audit = self.service.list_audit(limit=10)
+        self.assertTrue(any(row["action"] == "approved" for row in audit))
+        self.assertTrue(any(row["entity_type"] == "purchase_history" for row in audit))
+        self.assertTrue(all(isinstance(row["details"], dict) for row in audit))
+
+    def test_price_memory_matches_similar_names_but_not_wrong_currency_or_unit(self):
+        _, lot = self._project_and_lot()
+        supplier = self.service.create_supplier(
+            SupplierCreate(name="Исторический поставщик", region="Воронеж")
+        )
+        common = {
+            "supplier_id": supplier["id"],
+            "quantity": Decimal("10"),
+            "purchased_on": date.today(),
+            "confirmed_by": "Комиссия",
+        }
+        self.service.add_purchase_history(
+            PurchaseHistoryCreate(
+                **common,
+                item_name="Окно ПВХ 1400×1200 белое",
+                unit="шт.",
+                unit_price=Decimal("11000"),
+                currency="RUB",
+            )
+        )
+        self.service.add_purchase_history(
+            PurchaseHistoryCreate(
+                **common,
+                item_name="Окно ПВХ 1400×1200 белое",
+                unit="м2",
+                unit_price=Decimal("5000"),
+                currency="RUB",
+            )
+        )
+        self.service.add_purchase_history(
+            PurchaseHistoryCreate(
+                **common,
+                item_name="Окно ПВХ 1400×1200 белое",
+                unit="шт.",
+                unit_price=Decimal("999"),
+                currency="KZT",
+            )
+        )
+
+        benchmark = self.service.lot_price_benchmark(lot["id"])
+        self.assertEqual(benchmark["matched_items"], 1)
+        self.assertEqual(benchmark["items"][0]["history_count"], 1)
+        self.assertEqual(benchmark["items"][0]["median_unit_price"], 11000.0)
+
+        search = self.service.list_purchase_history(search="окно пвх")
+        self.assertEqual(len(search), 3)
+
+    def test_duplicate_paid_purchase_is_rejected(self):
+        data = PurchaseHistoryCreate(
+            item_name="Кирпич М150",
+            quantity=Decimal("1000"),
+            unit="шт.",
+            unit_price=Decimal("42.50"),
+            currency="RUB",
+            purchased_on=date.today(),
+            invoice_number="СЧ-10",
+            confirmed_by="Снабженец",
+        )
+        self.service.add_purchase_history(data)
+        with self.assertRaisesRegex(ConflictError, "already in price history"):
+            self.service.add_purchase_history(data)
+
+    def test_project_document_suggestion_requires_review_before_creating_lot(self):
+        project = self.service.create_project(
+            ProjectCreate(
+                name="Бизнес-центр",
+                region="Воронеж",
+                delivery_address="ул. Монтажная, 10",
+            )
+        )
+        document = self.service.register_source_document(
+            filename="АР.pdf",
+            content=b"%PDF-1.4\nproject section",
+            document_type="project_section",
+            project_id=project["id"],
+        )
+        suggestions = self.service.register_procurement_suggestions(
+            document["id"],
+            [
+                ProcurementSuggestionCreate(
+                    section_code="АР",
+                    section_name="Архитектурные решения",
+                    lot_title="Оконные блоки",
+                    confidence=0.94,
+                    evidence=["АР-12", "Ведомость заполнения проёмов"],
+                    items=[
+                        LotItemCreate(
+                            name="Окно ПВХ 1400×1200",
+                            quantity=84,
+                            unit="шт.",
+                            specification="двухкамерный стеклопакет",
+                        )
+                    ],
+                )
+            ],
+        )
+        suggestion = suggestions[0]
+        self.assertEqual(suggestion["status"], "needs_review")
+        self.assertEqual(self.service.list_lots(), [])
+        self.assertEqual(suggestion["items"][0]["quantity"], "84")
+        self.assertEqual(
+            self.service.list_source_documents()[0]["extraction_status"], "needs_review"
+        )
+        self.assertEqual(
+            [row["id"] for row in self.service.list_procurement_suggestions(status="needs_review")],
+            [suggestion["id"]],
+        )
+
+        approved = self.service.approve_procurement_suggestion(
+            suggestion["id"],
+            ProcurementSuggestionApproval(
+                response_deadline=date.today() + timedelta(days=7),
+                desired_delivery_date=date.today() + timedelta(days=30),
+                approved_by="Начальник снабжения",
+            ),
+        )
+        self.assertEqual(approved["suggestion"]["status"], "approved")
+        self.assertEqual(approved["lot"]["title"], "Оконные блоки")
+        self.assertEqual(approved["lot"]["items"][0]["quantity"], "84")
+        self.assertEqual(len(self.service.get_project(project["id"])["sections"]), 1)
+        self.assertEqual(self.service.list_source_documents()[0]["extraction_status"], "approved")
+        with self.assertRaisesRegex(ConflictError, "awaiting review"):
+            self.service.approve_procurement_suggestion(
+                suggestion["id"],
+                ProcurementSuggestionApproval(
+                    response_deadline=date.today() + timedelta(days=7),
+                    approved_by="Другой сотрудник",
+                ),
+            )
+
+    def test_project_document_suggestion_can_be_rejected_without_creating_lot(self):
+        project = self.service.create_project(
+            ProjectCreate(name="Склад", region="Алматы", delivery_address="ул. Абая, 1")
+        )
+        document = self.service.register_source_document(
+            filename="КР.pdf",
+            content=b"%PDF-1.4\nstructural section",
+            document_type="project_section",
+            project_id=project["id"],
+        )
+        suggestion = self.service.register_procurement_suggestions(
+            document["id"],
+            [
+                ProcurementSuggestionCreate(
+                    section_code="КР",
+                    section_name="Конструктивные решения",
+                    lot_title="Арматура",
+                    confidence=0.71,
+                    items=[LotItemCreate(name="Арматура А500С", quantity=10, unit="т")],
+                )
+            ],
+        )[0]
+        rejected = self.service.reject_procurement_suggestion(
+            suggestion["id"],
+            ProcurementSuggestionRejection(
+                reviewed_by="Технический эксперт", reason="Позиция уже закуплена"
+            ),
+        )
+        self.assertEqual(rejected["status"], "rejected")
+        self.assertEqual(self.service.list_lots(), [])
+        self.assertEqual(self.service.list_source_documents()[0]["extraction_status"], "approved")
+        with self.assertRaisesRegex(ConflictError, "awaiting review"):
+            self.service.reject_procurement_suggestion(
+                suggestion["id"],
+                ProcurementSuggestionRejection(
+                    reviewed_by="Другой эксперт", reason="Повторное решение"
+                ),
+            )
+
+    def test_list_filters_fail_closed_on_invalid_values(self):
+        with self.assertRaisesRegex(ValueError, "unsupported outbox status"):
+            self.service.list_outbox(status="unknown")
+        with self.assertRaisesRegex(ValueError, "between 1 and 200"):
+            self.service.list_audit(limit=0)
+        with self.assertRaisesRegex(ValueError, "unsupported procurement suggestion status"):
+            self.service.list_procurement_suggestions(status="approving")
 
     def test_incomplete_quote_is_disqualified(self):
         project = self.service.create_project(
@@ -243,6 +462,76 @@ class SettingsTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "API_KEY"):
                 Settings.from_env()
+
+
+class StaticPreviewTests(unittest.TestCase):
+    def test_demo_mode_is_bundled_into_the_real_control_center(self):
+        static_dir = Path(__file__).parents[1] / "procurement" / "static"
+        html = (static_dir / "index.html").read_text(encoding="utf-8")
+        self.assertIn('id="demoBtn"', html)
+        self.assertIn("const DEMO_DATA=", html)
+        self.assertIn("function loadDemo()", html)
+        self.assertIn("В демонстрации изменения не сохраняются", html)
+
+    def test_premium_visual_assets_are_bundled_locally(self):
+        static_dir = Path(__file__).parents[1] / "procurement" / "static"
+        html = (static_dir / "index.html").read_text(encoding="utf-8")
+        hero = static_dir / "assets" / "procurement-hero.webp"
+        supplier_network = static_dir / "assets" / "supplier-network.webp"
+        self.assertTrue(hero.is_file())
+        self.assertGreater(hero.stat().st_size, 50_000)
+        self.assertTrue(supplier_network.is_file())
+        self.assertGreater(supplier_network.stat().st_size, 40_000)
+        self.assertIn('url("assets/procurement-hero.webp")', html)
+        self.assertIn('url("assets/supplier-network.webp")', html)
+        for icon in (
+            "brand",
+            "home",
+            "projects",
+            "lots",
+            "suppliers",
+            "mail",
+            "compare",
+            "price",
+            "docs",
+            "templates",
+            "shield",
+            "map",
+            "star",
+            "upload",
+            "clock",
+            "location",
+            "box",
+            "send",
+            "filter",
+            "truck",
+            "arrow",
+        ):
+            self.assertIn(f'id="i-{icon}"', html)
+
+    def test_daily_procurement_views_have_visual_workflow_controls(self):
+        static_dir = Path(__file__).parents[1] / "procurement" / "static"
+        html = (static_dir / "index.html").read_text(encoding="utf-8")
+        for marker in (
+            'class="project-grid"',
+            'id="lotStatusFilter"',
+            'id="lotProjectFilter"',
+            'class="rfq-flow"',
+            'class="message-list"',
+            "function filterLots()",
+            "function showProjectLots(id)",
+            'id="tender"',
+            'class="tender-workspace"',
+            'class="tender-stage"',
+            "function renderTender()",
+            "function openTenderRfq()",
+            'class="ai-review"',
+            'class="suggestion-grid"',
+            "const DEMO_SUGGESTIONS=",
+            "function approveSuggestion(id)",
+            "function rejectSuggestion(id)",
+        ):
+            self.assertIn(marker, html)
 
 
 if __name__ == "__main__":
