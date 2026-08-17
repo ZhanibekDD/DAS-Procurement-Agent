@@ -17,7 +17,7 @@ _ALLOWED_ROLES = {"admin", "staff"}
 
 
 class TokenError(ValueError):
-    """Raised when a signed SSO or session token is not trustworthy."""
+    """Raised when a signed Procurement session token is not trustworthy."""
 
 
 def _b64encode(raw: bytes) -> str:
