@@ -151,6 +151,25 @@ curl -H 'X-API-Key: change-me' http://127.0.0.1:9200/api/dashboard
 Для production сервис должен публиковаться только через HTTPS reverse proxy,
 корпоративную аутентификацию и серверное хранилище секретов.
 
+### Единый вход из DAS
+
+Интеграция не передаёт `PROCUREMENT_API_KEY` в браузер. Django DAS создаёт
+подписанный launch-token на срок не более 120 секунд, а Procurement Agent
+обменивает его на HttpOnly/SameSite session-cookie. Launch-token одноразовый:
+его `jti` атомарно фиксируется в локальной БД.
+
+Оба сервиса должны получать один случайный секрет длиной не менее 32 символов:
+
+```text
+PROCUREMENT_SSO_SECRET=<shared secret from server secret store>
+PROCUREMENT_SSO_ISSUER=das
+PROCUREMENT_SESSION_TTL_SECONDS=28800
+```
+
+В production cookie устанавливается с флагом `Secure`. API-ключ остаётся только
+для внутренних server-to-server вызовов и аварийной диагностики; сохранять его
+в `localStorage` запрещено.
+
 ## Импорт базы поставщиков
 
 Поддерживаются `.csv` и `.xlsx`. Распознаются русские и английские заголовки:
