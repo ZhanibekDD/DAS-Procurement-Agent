@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import hmac
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi import Cookie, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
+from fastapi.responses import HTMLResponse, RedirectResponse
 
+from .auth import TokenError, issue_token, verify_token
 from .config import Settings
 from .db import Database
 from .imports import parse_supplier_table
@@ -46,9 +48,40 @@ app = FastAPI(
 )
 
 
-def require_api_key(x_api_key: str = Header(default="")) -> None:
-    if settings.api_key and not hmac.compare_digest(x_api_key, settings.api_key):
-        raise HTTPException(status_code=403, detail="invalid API key")
+SESSION_COOKIE = "das_procurement_session"
+SSO_AUDIENCE = "das-procurement-agent"
+SESSION_ISSUER = "das-procurement-agent"
+SESSION_AUDIENCE = "das-procurement-web"
+
+
+def require_access(
+    x_api_key: str = Header(default=""),
+    session_token: str = Cookie(default="", alias=SESSION_COOKIE),
+) -> None:
+    if (
+        settings.api_key
+        and x_api_key
+        and hmac.compare_digest(x_api_key, settings.api_key)
+    ):
+        return
+
+    if settings.sso_secret and session_token:
+        try:
+            verify_token(
+                settings.sso_secret,
+                session_token,
+                issuer=SESSION_ISSUER,
+                audience=SESSION_AUDIENCE,
+                kind="session",
+                max_ttl_seconds=settings.session_ttl_seconds,
+            )
+            return
+        except TokenError:
+            pass
+
+    if not settings.api_key and settings.environment != "production":
+        return
+    raise HTTPException(status_code=403, detail="access denied")
 
 
 def handle_domain_error(exc: Exception) -> HTTPException:
@@ -64,18 +97,81 @@ def health() -> dict[str, str]:
     return {"status": "ok", "service": "das-procurement-agent", "outbox": settings.outbox_mode}
 
 
+@app.get("/auth/sso", include_in_schema=False)
+def sso_login(token: str = Query(..., min_length=32, max_length=4096)) -> RedirectResponse:
+    if not settings.sso_secret:
+        raise HTTPException(status_code=404, detail="SSO is not configured")
+
+    now = int(time.time())
+    try:
+        claims = verify_token(
+            settings.sso_secret,
+            token,
+            issuer=settings.sso_issuer,
+            audience=SSO_AUDIENCE,
+            kind="launch",
+            max_ttl_seconds=120,
+            now=now,
+        )
+    except TokenError as exc:
+        raise HTTPException(status_code=403, detail="invalid SSO token") from exc
+
+    if not db.consume_sso_jti(str(claims["jti"]), int(claims["exp"]), now):
+        raise HTTPException(status_code=403, detail="SSO token already used")
+
+    session_token = issue_token(
+        settings.sso_secret,
+        issuer=SESSION_ISSUER,
+        audience=SESSION_AUDIENCE,
+        subject=str(claims["sub"]),
+        role=str(claims["role"]),
+        kind="session",
+        ttl_seconds=settings.session_ttl_seconds,
+        now=now,
+    )
+    db.audit(
+        "sso_login",
+        "session",
+        str(claims["jti"]),
+        actor=str(claims["sub"]),
+        details={"role": claims["role"]},
+    )
+
+    response = RedirectResponse(url="/", status_code=303)
+    response.set_cookie(
+        SESSION_COOKIE,
+        session_token,
+        max_age=settings.session_ttl_seconds,
+        httponly=True,
+        secure=settings.environment == "production",
+        samesite="lax",
+        path="/",
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
+@app.post("/auth/logout", include_in_schema=False)
+def sso_logout() -> RedirectResponse:
+    response = RedirectResponse(url="/", status_code=303)
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> HTMLResponse:
     path = Path(__file__).parent / "static" / "index.html"
     return HTMLResponse(path.read_text(encoding="utf-8"))
 
 
-@app.get("/api/dashboard", dependencies=[Depends(require_api_key)])
+@app.get("/api/dashboard", dependencies=[Depends(require_access)])
 def dashboard():
     return service.dashboard()
 
 
-@app.post("/api/projects", dependencies=[Depends(require_api_key)], status_code=201)
+@app.post("/api/projects", dependencies=[Depends(require_access)], status_code=201)
 def create_project(data: ProjectCreate):
     try:
         return service.create_project(data)
@@ -83,12 +179,12 @@ def create_project(data: ProjectCreate):
         raise handle_domain_error(exc) from exc
 
 
-@app.get("/api/projects", dependencies=[Depends(require_api_key)])
+@app.get("/api/projects", dependencies=[Depends(require_access)])
 def list_projects():
     return service.list_projects()
 
 
-@app.get("/api/projects/{project_id}", dependencies=[Depends(require_api_key)])
+@app.get("/api/projects/{project_id}", dependencies=[Depends(require_access)])
 def get_project(project_id: int):
     try:
         return service.get_project(project_id)
@@ -96,7 +192,7 @@ def get_project(project_id: int):
         raise handle_domain_error(exc) from exc
 
 
-@app.post("/api/projects/{project_id}/sections", dependencies=[Depends(require_api_key)], status_code=201)
+@app.post("/api/projects/{project_id}/sections", dependencies=[Depends(require_access)], status_code=201)
 def add_section(project_id: int, data: SectionCreate):
     try:
         return service.add_section(project_id, data)
@@ -104,7 +200,7 @@ def add_section(project_id: int, data: SectionCreate):
         raise handle_domain_error(exc) from exc
 
 
-@app.post("/api/suppliers", dependencies=[Depends(require_api_key)], status_code=201)
+@app.post("/api/suppliers", dependencies=[Depends(require_access)], status_code=201)
 def create_supplier(data: SupplierCreate):
     try:
         return service.create_supplier(data)
@@ -112,12 +208,12 @@ def create_supplier(data: SupplierCreate):
         raise handle_domain_error(exc) from exc
 
 
-@app.get("/api/suppliers", dependencies=[Depends(require_api_key)])
+@app.get("/api/suppliers", dependencies=[Depends(require_access)])
 def list_suppliers(region: str = Query(default=""), category: str = Query(default="")):
     return service.list_suppliers(region=region, category=category)
 
 
-@app.post("/api/suppliers/import", dependencies=[Depends(require_api_key)])
+@app.post("/api/suppliers/import", dependencies=[Depends(require_access)])
 async def import_suppliers(file: UploadFile = File(...), commit: bool = Query(default=False)):
     try:
         content = await file.read()
@@ -141,7 +237,7 @@ async def import_suppliers(file: UploadFile = File(...), commit: bool = Query(de
         raise handle_domain_error(exc) from exc
 
 
-@app.post("/api/documents", dependencies=[Depends(require_api_key)], status_code=201)
+@app.post("/api/documents", dependencies=[Depends(require_access)], status_code=201)
 async def upload_source_document(
     file: UploadFile = File(...),
     document_type: str = Query(...),
@@ -163,7 +259,7 @@ async def upload_source_document(
         raise handle_domain_error(exc) from exc
 
 
-@app.get("/api/documents", dependencies=[Depends(require_api_key)])
+@app.get("/api/documents", dependencies=[Depends(require_access)])
 def list_source_documents(extraction_status: str = Query(default="")):
     rows = service.list_source_documents(extraction_status)
     return [{**row, "storage_path": "internal"} for row in rows]
@@ -171,7 +267,7 @@ def list_source_documents(extraction_status: str = Query(default="")):
 
 @app.post(
     "/api/documents/{document_id}/procurement-suggestions",
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_access)],
     status_code=201,
 )
 def register_procurement_suggestions(document_id: int, data: ProcurementSuggestionBatch):
@@ -181,7 +277,7 @@ def register_procurement_suggestions(document_id: int, data: ProcurementSuggesti
         raise handle_domain_error(exc) from exc
 
 
-@app.get("/api/procurement-suggestions", dependencies=[Depends(require_api_key)])
+@app.get("/api/procurement-suggestions", dependencies=[Depends(require_access)])
 def list_procurement_suggestions(
     project_id: int | None = Query(default=None), status: str = Query(default="")
 ):
@@ -193,7 +289,7 @@ def list_procurement_suggestions(
 
 @app.post(
     "/api/procurement-suggestions/{suggestion_id}/approve",
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_access)],
 )
 def approve_procurement_suggestion(suggestion_id: int, data: ProcurementSuggestionApproval):
     try:
@@ -204,7 +300,7 @@ def approve_procurement_suggestion(suggestion_id: int, data: ProcurementSuggesti
 
 @app.post(
     "/api/procurement-suggestions/{suggestion_id}/reject",
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_access)],
 )
 def reject_procurement_suggestion(suggestion_id: int, data: ProcurementSuggestionRejection):
     try:
@@ -213,7 +309,7 @@ def reject_procurement_suggestion(suggestion_id: int, data: ProcurementSuggestio
         raise handle_domain_error(exc) from exc
 
 
-@app.post("/api/lots", dependencies=[Depends(require_api_key)], status_code=201)
+@app.post("/api/lots", dependencies=[Depends(require_access)], status_code=201)
 def create_lot(data: LotCreate):
     try:
         return service.create_lot(data)
@@ -221,12 +317,12 @@ def create_lot(data: LotCreate):
         raise handle_domain_error(exc) from exc
 
 
-@app.get("/api/lots", dependencies=[Depends(require_api_key)])
+@app.get("/api/lots", dependencies=[Depends(require_access)])
 def list_lots():
     return service.list_lots()
 
 
-@app.get("/api/lots/{lot_id}", dependencies=[Depends(require_api_key)])
+@app.get("/api/lots/{lot_id}", dependencies=[Depends(require_access)])
 def get_lot(lot_id: int):
     try:
         return service.get_lot(lot_id)
@@ -234,7 +330,7 @@ def get_lot(lot_id: int):
         raise handle_domain_error(exc) from exc
 
 
-@app.get("/api/lots/{lot_id}/supplier-matches", dependencies=[Depends(require_api_key)])
+@app.get("/api/lots/{lot_id}/supplier-matches", dependencies=[Depends(require_access)])
 def supplier_matches(lot_id: int):
     try:
         return service.match_suppliers(lot_id)
@@ -242,7 +338,7 @@ def supplier_matches(lot_id: int):
         raise handle_domain_error(exc) from exc
 
 
-@app.post("/api/lots/{lot_id}/campaigns", dependencies=[Depends(require_api_key)], status_code=201)
+@app.post("/api/lots/{lot_id}/campaigns", dependencies=[Depends(require_access)], status_code=201)
 def create_campaign(lot_id: int, data: CampaignCreate):
     try:
         return service.create_campaign(lot_id, data)
@@ -250,7 +346,7 @@ def create_campaign(lot_id: int, data: CampaignCreate):
         raise handle_domain_error(exc) from exc
 
 
-@app.get("/api/campaigns", dependencies=[Depends(require_api_key)])
+@app.get("/api/campaigns", dependencies=[Depends(require_access)])
 def list_campaigns(lot_id: int | None = Query(default=None)):
     try:
         return service.list_campaigns(lot_id)
@@ -258,7 +354,7 @@ def list_campaigns(lot_id: int | None = Query(default=None)):
         raise handle_domain_error(exc) from exc
 
 
-@app.get("/api/outbox", dependencies=[Depends(require_api_key)])
+@app.get("/api/outbox", dependencies=[Depends(require_access)])
 def list_outbox(
     status: str = Query(default=""),
     lot_id: int | None = Query(default=None),
@@ -269,7 +365,7 @@ def list_outbox(
         raise handle_domain_error(exc) from exc
 
 
-@app.post("/api/outbox/{message_id}/approve", dependencies=[Depends(require_api_key)])
+@app.post("/api/outbox/{message_id}/approve", dependencies=[Depends(require_access)])
 def approve_message(message_id: int, decision: ApprovalDecision):
     try:
         return service.approve_message(message_id, decision.approved_by, decision.comment)
@@ -277,7 +373,7 @@ def approve_message(message_id: int, decision: ApprovalDecision):
         raise handle_domain_error(exc) from exc
 
 
-@app.post("/api/lots/{lot_id}/quotes", dependencies=[Depends(require_api_key)], status_code=201)
+@app.post("/api/lots/{lot_id}/quotes", dependencies=[Depends(require_access)], status_code=201)
 def add_quote(lot_id: int, data: QuoteCreate):
     try:
         return service.add_quote(lot_id, data)
@@ -285,7 +381,7 @@ def add_quote(lot_id: int, data: QuoteCreate):
         raise handle_domain_error(exc) from exc
 
 
-@app.get("/api/lots/{lot_id}/quotes", dependencies=[Depends(require_api_key)])
+@app.get("/api/lots/{lot_id}/quotes", dependencies=[Depends(require_access)])
 def list_quotes(lot_id: int):
     try:
         return service.list_quotes(lot_id)
@@ -293,7 +389,7 @@ def list_quotes(lot_id: int):
         raise handle_domain_error(exc) from exc
 
 
-@app.get("/api/lots/{lot_id}/comparison", dependencies=[Depends(require_api_key)])
+@app.get("/api/lots/{lot_id}/comparison", dependencies=[Depends(require_access)])
 def comparison(lot_id: int):
     try:
         return service.comparison(lot_id)
@@ -301,7 +397,7 @@ def comparison(lot_id: int):
         raise handle_domain_error(exc) from exc
 
 
-@app.get("/api/lots/{lot_id}/price-benchmark", dependencies=[Depends(require_api_key)])
+@app.get("/api/lots/{lot_id}/price-benchmark", dependencies=[Depends(require_access)])
 def price_benchmark(lot_id: int):
     try:
         return service.lot_price_benchmark(lot_id)
@@ -309,7 +405,7 @@ def price_benchmark(lot_id: int):
         raise handle_domain_error(exc) from exc
 
 
-@app.post("/api/price-history", dependencies=[Depends(require_api_key)], status_code=201)
+@app.post("/api/price-history", dependencies=[Depends(require_access)], status_code=201)
 def add_price_history(data: PurchaseHistoryCreate):
     try:
         return service.add_purchase_history(data)
@@ -317,7 +413,7 @@ def add_price_history(data: PurchaseHistoryCreate):
         raise handle_domain_error(exc) from exc
 
 
-@app.get("/api/price-history", dependencies=[Depends(require_api_key)])
+@app.get("/api/price-history", dependencies=[Depends(require_access)])
 def list_price_history(
     search: str = Query(default=""),
     supplier_id: int | None = Query(default=None),
@@ -329,12 +425,12 @@ def list_price_history(
         raise handle_domain_error(exc) from exc
 
 
-@app.get("/api/templates", dependencies=[Depends(require_api_key)])
+@app.get("/api/templates", dependencies=[Depends(require_access)])
 def list_templates():
     return service.list_templates()
 
 
-@app.put("/api/templates/{code}", dependencies=[Depends(require_api_key)])
+@app.put("/api/templates/{code}", dependencies=[Depends(require_access)])
 def upsert_template(code: str, data: TemplateUpsert):
     try:
         return service.upsert_template(code, data)
@@ -342,7 +438,7 @@ def upsert_template(code: str, data: TemplateUpsert):
         raise handle_domain_error(exc) from exc
 
 
-@app.get("/api/audit", dependencies=[Depends(require_api_key)])
+@app.get("/api/audit", dependencies=[Depends(require_access)])
 def list_audit(limit: int = Query(default=50, ge=1, le=200)):
     try:
         return service.list_audit(limit)
