@@ -5,7 +5,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Cookie, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
+from fastapi import Cookie, Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from .auth import TokenError, issue_token, verify_token
@@ -97,8 +97,8 @@ def health() -> dict[str, str]:
     return {"status": "ok", "service": "das-procurement-agent", "outbox": settings.outbox_mode}
 
 
-@app.get("/auth/sso", include_in_schema=False)
-def sso_login(token: str = Query(..., min_length=32, max_length=4096)) -> RedirectResponse:
+@app.post("/auth/sso", include_in_schema=False)
+def sso_login(token: str = Form(..., min_length=32, max_length=4096)) -> RedirectResponse:
     if not settings.sso_secret:
         raise HTTPException(status_code=404, detail="SSO is not configured")
 
