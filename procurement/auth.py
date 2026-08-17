@@ -12,6 +12,7 @@ from typing import Any
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_.:@-]{1,128}$")
 _JTI_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+_TOKEN_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _ALLOWED_ROLES = {"admin", "staff"}
 
 
@@ -98,6 +99,11 @@ def verify_token(
         encoded, supplied_signature = token.split(".", 1)
     except ValueError as exc:
         raise TokenError("invalid token format") from exc
+    if (
+        not _TOKEN_SEGMENT_RE.fullmatch(encoded)
+        or not _TOKEN_SEGMENT_RE.fullmatch(supplied_signature)
+    ):
+        raise TokenError("invalid token encoding")
 
     expected_signature = hmac.new(
         secret.encode("utf-8"),
