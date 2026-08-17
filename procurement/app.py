@@ -4,6 +4,7 @@ import hmac
 import threading
 import time
 from contextlib import asynccontextmanager
+from ipaddress import ip_address, ip_network
 from pathlib import Path
 from typing import Any
 
@@ -87,8 +88,38 @@ def _session_claims(session_token: str) -> dict[str, Any] | None:
         return None
 
 
-def _login_key(request: Request) -> str:
-    return request.client.host if request.client else "unknown"
+def _client_ip(request: Request) -> str:
+    peer = request.client.host if request.client else "unknown"
+    try:
+        peer_address = ip_address(peer)
+    except ValueError:
+        return peer
+
+    trusted_networks = tuple(
+        ip_network(value, strict=False) for value in settings.trusted_proxy_networks
+    )
+    if not any(peer_address in network for network in trusted_networks):
+        return str(peer_address)
+
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if not forwarded:
+        return str(peer_address)
+    try:
+        chain = [ip_address(value.strip()) for value in forwarded.split(",")]
+    except ValueError:
+        return str(peer_address)
+
+    for address in reversed(chain):
+        if not any(address in network for network in trusted_networks):
+            return str(address)
+    return str(chain[0])
+
+
+def _login_keys(request: Request, username: str) -> tuple[str, str]:
+    return (
+        f"ip:{_client_ip(request)}",
+        f"account:{username.casefold()}",
+    )
 
 
 def _recent_failures(key: str, now: float) -> list[float]:
@@ -102,17 +133,18 @@ def _recent_failures(key: str, now: float) -> list[float]:
         return recent
 
 
-def _record_login_failure(key: str, now: float) -> None:
+def _record_login_failure(keys: tuple[str, ...], now: float) -> None:
     with _LOGIN_LOCK:
-        failures = _LOGIN_FAILURES.setdefault(key, [])
-        failures.append(now)
-        if len(_LOGIN_FAILURES) > 2048:
+        for key in keys:
+            _LOGIN_FAILURES.setdefault(key, []).append(now)
+        while len(_LOGIN_FAILURES) > 2048:
             _LOGIN_FAILURES.pop(next(iter(_LOGIN_FAILURES)))
 
 
-def _clear_login_failures(key: str) -> None:
+def _clear_login_failures(keys: tuple[str, ...]) -> None:
     with _LOGIN_LOCK:
-        _LOGIN_FAILURES.pop(key, None)
+        for key in keys:
+            _LOGIN_FAILURES.pop(key, None)
 
 
 def _login_page(*, error: str = "", status_code: int = 200) -> HTMLResponse:
@@ -192,19 +224,22 @@ def login(
         )
 
     now = time.time()
-    key = _login_key(request)
-    if len(_recent_failures(key, now)) >= LOGIN_MAX_FAILURES:
+    keys = _login_keys(request, username)
+    limited = any(
+        len(_recent_failures(key, now)) >= LOGIN_MAX_FAILURES for key in keys
+    )
+    username_ok = hmac.compare_digest(username, settings.admin_username)
+    password_ok = verify_password(password, settings.admin_password_hash)
+    if username_ok and password_ok:
+        _clear_login_failures(keys)
+    elif limited:
         response = _login_page(error="limited", status_code=429)
         response.headers["Retry-After"] = str(LOGIN_WINDOW_SECONDS)
         return response
-
-    username_ok = hmac.compare_digest(username, settings.admin_username)
-    password_ok = verify_password(password, settings.admin_password_hash)
-    if not (username_ok and password_ok):
-        _record_login_failure(key, now)
+    else:
+        _record_login_failure(keys, now)
         return _login_page(error="invalid", status_code=403)
 
-    _clear_login_failures(key)
     session_token = issue_token(
         settings.auth_secret,
         issuer=SESSION_ISSUER,

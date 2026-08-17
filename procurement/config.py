@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
+from ipaddress import ip_network
 
 from .passwords import validate_password_hash
 
@@ -20,6 +21,7 @@ class Settings:
     admin_username: str
     admin_password_hash: str
     session_ttl_seconds: int
+    trusted_proxy_networks: tuple[str, ...] = ()
 
     @property
     def local_auth_configured(self) -> bool:
@@ -29,6 +31,20 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
+        trusted_proxy_values = tuple(
+            value.strip()
+            for value in os.getenv("PROCUREMENT_TRUSTED_PROXY_IPS", "").split(",")
+            if value.strip()
+        )
+        try:
+            trusted_proxy_networks = tuple(
+                str(ip_network(value, strict=False)) for value in trusted_proxy_values
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                "PROCUREMENT_TRUSTED_PROXY_IPS contains an invalid IP or network"
+            ) from exc
+
         settings = cls(
             environment=os.getenv("PROCUREMENT_ENV", "development").strip().lower(),
             api_key=os.getenv("PROCUREMENT_API_KEY", "").strip(),
@@ -42,6 +58,7 @@ class Settings:
             session_ttl_seconds=int(
                 os.getenv("PROCUREMENT_SESSION_TTL_SECONDS", "28800").strip()
             ),
+            trusted_proxy_networks=trusted_proxy_networks,
         )
         if settings.environment == "production" and not settings.api_key:
             raise RuntimeError("PROCUREMENT_API_KEY is required in production")

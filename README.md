@@ -166,6 +166,7 @@ PROCUREMENT_AUTH_SECRET=<random urlsafe secret, at least 32 characters>
 PROCUREMENT_ADMIN_USERNAME=<standalone administrator login>
 PROCUREMENT_ADMIN_PASSWORD_HASH=<scrypt hash from python -m procurement.passwords>
 PROCUREMENT_SESSION_TTL_SECONDS=28800
+PROCUREMENT_TRUSTED_PROXY_IPS=<exact nginx peer IP or CIDR>
 ```
 
 Форма `POST /auth/login` проверяет scrypt-хэш и выдаёт отдельную
@@ -174,6 +175,17 @@ production. Неудачные попытки ограничиваются. Па
 `PROCUREMENT_API_KEY` никогда не передаются клиентскому JavaScript и не
 сохраняются в `localStorage`. API-ключ предназначен только для внутренних
 server-to-server вызовов и аварийной диагностики.
+
+Правильные учётные данные всегда снимают накопленный лимит, поэтому посторонний
+не может заблокировать администратора серией неверных паролей. Заголовок
+`X-Forwarded-For` учитывается только когда непосредственный peer входит в
+`PROCUREMENT_TRUSTED_PROXY_IPS`; от остальных клиентов он игнорируется. Указывайте
+точный адрес nginx или Docker gateway, а не широкую внутреннюю сеть. Автоматическая
+обработка proxy headers в Uvicorn отключена в `Dockerfile`.
+
+Для публичного домена дополнительно ограничьте частоту запросов к
+`/auth/login` на nginx по реальному адресу клиента. Это защищает CPU от массовых
+scrypt-проверок; встроенный лимит приложения отвечает за перебор учётных данных.
 
 ## Импорт базы поставщиков
 

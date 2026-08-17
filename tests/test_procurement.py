@@ -465,6 +465,12 @@ class SettingsTests(unittest.TestCase):
 
 
 class StaticPreviewTests(unittest.TestCase):
+    def test_uvicorn_does_not_trust_proxy_headers_before_the_app(self):
+        dockerfile = (Path(__file__).parents[1] / "Dockerfile").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("--no-proxy-headers", dockerfile)
+
     def test_demo_mode_is_bundled_into_the_real_control_center(self):
         static_dir = Path(__file__).parents[1] / "procurement" / "static"
         html = (static_dir / "index.html").read_text(encoding="utf-8")

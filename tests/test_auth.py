@@ -103,11 +103,16 @@ class StandaloneSettingsTests(unittest.TestCase):
                 "PROCUREMENT_AUTH_SECRET": SECRET,
                 "PROCUREMENT_ADMIN_USERNAME": "snab-admin",
                 "PROCUREMENT_ADMIN_PASSWORD_HASH": PASSWORD_HASH,
+                "PROCUREMENT_TRUSTED_PROXY_IPS": "127.0.0.1,172.17.0.1/32",
             },
             clear=True,
         ):
             settings = Settings.from_env()
         self.assertTrue(settings.local_auth_configured)
+        self.assertEqual(
+            settings.trusted_proxy_networks,
+            ("127.0.0.1/32", "172.17.0.1/32"),
+        )
 
     def test_production_requires_standalone_auth(self):
         with patch.dict(
@@ -145,4 +150,16 @@ class StandaloneSettingsTests(unittest.TestCase):
             clear=True,
         ):
             with self.assertRaisesRegex(RuntimeError, "AUTH_SECRET"):
+                Settings.from_env()
+
+    def test_invalid_trusted_proxy_is_rejected(self):
+        with patch.dict(
+            os.environ,
+            {
+                "PROCUREMENT_ENV": "development",
+                "PROCUREMENT_TRUSTED_PROXY_IPS": "not-an-ip",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "TRUSTED_PROXY_IPS"):
                 Settings.from_env()
