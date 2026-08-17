@@ -70,8 +70,13 @@ class Settings:
             settings.admin_password_hash
         ):
             raise RuntimeError("PROCUREMENT_ADMIN_PASSWORD_HASH is invalid")
-        if settings.environment == "production" and not settings.local_auth_configured:
-            raise RuntimeError("standalone Procurement authentication is required in production")
+        if (
+            settings.environment == "production"
+            and not settings.local_auth_configured
+        ):
+            raise RuntimeError(
+                "standalone Procurement authentication is required in production"
+            )
         if not 300 <= settings.session_ttl_seconds <= 86_400:
             raise RuntimeError(
                 "PROCUREMENT_SESSION_TTL_SECONDS must be between 300 and 86400"
