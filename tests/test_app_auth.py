@@ -86,6 +86,22 @@ class SsoHttpFlowTests(unittest.TestCase):
         response = self.client.get(f"/auth/sso?token={self._launch_token()}")
         self.assertEqual(response.status_code, 405)
 
+    def test_non_ascii_token_segments_are_rejected_with_403(self):
+        encoded, signature = self._launch_token().split(".", 1)
+        malformed_tokens = (
+            f"é{encoded}.{signature}",
+            f"{encoded}.é{signature}",
+        )
+
+        for token in malformed_tokens:
+            with self.subTest(token_part=token.index("é")):
+                response = self.client.post(
+                    "/auth/sso",
+                    data={"token": token},
+                    follow_redirects=False,
+                )
+                self.assertEqual(response.status_code, 403)
+
     def test_replayed_post_is_rejected(self):
         token = self._launch_token("http-flow-token-000002")
         first = self.client.post(
