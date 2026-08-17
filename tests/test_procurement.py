@@ -472,6 +472,9 @@ class StaticPreviewTests(unittest.TestCase):
         self.assertIn("const DEMO_DATA=", html)
         self.assertIn("function loadDemo()", html)
         self.assertIn("В демонстрации изменения не сохраняются", html)
+        self.assertIn("Единый вход через DAS", html)
+        self.assertIn("credentials:'same-origin'", html)
+        self.assertNotIn("localStorage", html)
 
     def test_premium_visual_assets_are_bundled_locally(self):
         static_dir = Path(__file__).parents[1] / "procurement" / "static"

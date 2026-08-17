@@ -201,6 +201,12 @@ CREATE TABLE IF NOT EXISTS audit_log (
     details_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS sso_login_nonces (
+    jti TEXT PRIMARY KEY,
+    expires_at INTEGER NOT NULL,
+    used_at TEXT NOT NULL
+);
 """
 
 
@@ -283,6 +289,22 @@ class Database:
         with self.connection() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [dict(row) for row in rows]
+
+    def consume_sso_jti(self, jti: str, expires_at: int, now: int) -> bool:
+        """Atomically accepts a launch token once and prunes expired nonces."""
+        with self.connection() as conn:
+            conn.execute("DELETE FROM sso_login_nonces WHERE expires_at <= ?", (now,))
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO sso_login_nonces(jti, expires_at, used_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (jti, expires_at, utcnow()),
+                )
+            except sqlite3.IntegrityError:
+                return False
+        return True
 
     def audit(
         self,
