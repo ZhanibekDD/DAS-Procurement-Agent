@@ -154,8 +154,9 @@ curl -H 'X-API-Key: change-me' http://127.0.0.1:9200/api/dashboard
 ### Единый вход из DAS
 
 Интеграция не передаёт `PROCUREMENT_API_KEY` в браузер. Django DAS создаёт
-подписанный launch-token на срок не более 120 секунд, а Procurement Agent
-обменивает его на HttpOnly/SameSite session-cookie. Launch-token одноразовый:
+подписанный launch-token на срок не более 120 секунд и отправляет его только в
+теле одноразовой POST-формы — не в query string. Procurement Agent обменивает
+его на HttpOnly/SameSite session-cookie. Launch-token одноразовый:
 его `jti` атомарно фиксируется в локальной БД.
 
 Оба сервиса должны получать один случайный секрет длиной не менее 32 символов:
