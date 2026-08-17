@@ -56,7 +56,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="DAS Снабжение",
-    version="0.4.0",
+    version="0.5.0",
     description="Internal supplier RFQ and tender comparison workflow",
     lifespan=lifespan,
 )
@@ -145,7 +145,11 @@ def require_access(
         return
     if _session_claims(session_token):
         return
-    if not settings.api_key and not settings.local_auth_configured and settings.environment != "production":
+    if (
+        not settings.api_key
+        and not settings.local_auth_configured
+        and settings.environment != "production"
+    ):
         return
     raise HTTPException(status_code=403, detail="access denied")
 
@@ -168,7 +172,9 @@ def login_page(
     session_token: str = Cookie(default="", alias=SESSION_COOKIE),
 ):
     if not settings.local_auth_configured:
-        raise HTTPException(status_code=404, detail="local authentication is not configured")
+        raise HTTPException(
+            status_code=404, detail="local authentication is not configured"
+        )
     if _session_claims(session_token):
         return RedirectResponse(url="/", status_code=303)
     return _login_page()
@@ -181,7 +187,9 @@ def login(
     password: str = Form(..., min_length=1, max_length=256),
 ):
     if not settings.local_auth_configured:
-        raise HTTPException(status_code=404, detail="local authentication is not configured")
+        raise HTTPException(
+            status_code=404, detail="local authentication is not configured"
+        )
 
     now = time.time()
     key = _login_key(request)
