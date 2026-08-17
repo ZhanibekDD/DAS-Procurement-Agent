@@ -5,7 +5,7 @@
 ### Внутренняя цифровая служба снабжения: от проекта до проверяемого выбора поставщика
 
 [![tests](https://github.com/ZhanibekDD/DAS-Procurement-Agent/actions/workflows/test.yml/badge.svg)](https://github.com/ZhanibekDD/DAS-Procurement-Agent/actions/workflows/test.yml)
-![version](https://img.shields.io/badge/version-0.4.0-5b8cff?style=flat-square)
+![version](https://img.shields.io/badge/version-0.5.0-5b8cff?style=flat-square)
 ![python](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat-square&logo=python&logoColor=white)
 ![fastapi](https://img.shields.io/badge/FastAPI-0.115+-009688?style=flat-square&logo=fastapi&logoColor=white)
 ![mode](https://img.shields.io/badge/outbox-draft__only-E9A23B?style=flat-square)
@@ -84,7 +84,7 @@ AI-разбор разделов и ручная проверка объёмов
 Решение комиссии / руководителя
 ```
 
-## Реализовано в версии 0.4.0
+## Реализовано в версии 0.5.0
 
 | Контур | Возможности |
 |---|---|
