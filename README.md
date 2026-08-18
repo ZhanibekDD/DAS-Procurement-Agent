@@ -5,7 +5,7 @@
 ### Внутренняя цифровая служба снабжения: от проекта до проверяемого выбора поставщика
 
 [![tests](https://github.com/ZhanibekDD/DAS-Procurement-Agent/actions/workflows/test.yml/badge.svg)](https://github.com/ZhanibekDD/DAS-Procurement-Agent/actions/workflows/test.yml)
-![version](https://img.shields.io/badge/version-0.4.0-5b8cff?style=flat-square)
+![version](https://img.shields.io/badge/version-0.5.0-5b8cff?style=flat-square)
 ![python](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat-square&logo=python&logoColor=white)
 ![fastapi](https://img.shields.io/badge/FastAPI-0.115+-009688?style=flat-square&logo=fastapi&logoColor=white)
 ![mode](https://img.shields.io/badge/outbox-draft__only-E9A23B?style=flat-square)
@@ -84,7 +84,7 @@ AI-разбор разделов и ручная проверка объёмов
 Решение комиссии / руководителя
 ```
 
-## Реализовано в версии 0.4.0
+## Реализовано в версии 0.5.0
 
 | Контур | Возможности |
 |---|---|
@@ -99,7 +99,7 @@ AI-разбор разделов и ручная проверка объёмов
 | **Сравнение** | полная стоимость, рейтинг, дисквалификация и потенциал переговоров |
 | **Память цен** | ориентир по подтверждённым оплаченным счетам с сопоставлением единиц и валюты |
 | **Документы** | PDF/DOCX/XLSX/CSV до 25 МБ, SHA-256 защита от дублей, очередь разбора |
-| **Контроль** | API-ключ, аудит действий, fail-closed проверки и режим `draft_only` |
+| **Контроль** | самостоятельный вход, HttpOnly-сессия, серверный API-ключ, аудит, fail-closed проверки и `draft_only` |
 
 ## Почему это не обычный чат
 
@@ -131,10 +131,17 @@ AI-разбор разделов и ручная проверка объёмов
 
 ## Локальный запуск
 
+Сервис имеет собственный вход и не зависит от DAS. Создайте серверные секреты и
+хэш пароля; открытый пароль в `.env`, GitHub или командной строке не хранится.
+
 ```bash
 cp .env.example .env
-# Укажите уникальный PROCUREMENT_API_KEY в .env
-docker compose up --build
+python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
+# Запишите результат как PROCUREMENT_AUTH_SECRET и создайте отдельный PROCUREMENT_API_KEY.
+docker compose build
+docker compose run --rm --entrypoint python procurement-agent -m procurement.passwords
+# Запишите выведенный scrypt-хэш как PROCUREMENT_ADMIN_PASSWORD_HASH.
+docker compose up -d
 ```
 
 После запуска:
@@ -148,28 +155,37 @@ curl http://127.0.0.1:9200/health
 curl -H 'X-API-Key: change-me' http://127.0.0.1:9200/api/dashboard
 ```
 
-Для production сервис должен публиковаться только через HTTPS reverse proxy,
-корпоративную аутентификацию и серверное хранилище секретов.
+Для production сервис публикуется на собственном HTTPS-домене, например
+`https://snab.stroydnepr.ru`, через reverse proxy. Он не добавляется в меню DAS
+и не использует общий DAS SSO.
 
-### Единый вход из DAS
-
-Интеграция не передаёт `PROCUREMENT_API_KEY` в браузер. Django DAS создаёт
-подписанный launch-token на срок не более 120 секунд и отправляет его только в
-теле одноразовой POST-формы — не в query string. Procurement Agent обменивает
-его на HttpOnly/SameSite session-cookie. Launch-token одноразовый:
-его `jti` атомарно фиксируется в локальной БД.
-
-Оба сервиса должны получать один случайный секрет длиной не менее 32 символов:
+### Самостоятельная аутентификация
 
 ```text
-PROCUREMENT_SSO_SECRET=<shared secret from server secret store>
-PROCUREMENT_SSO_ISSUER=das
+PROCUREMENT_AUTH_SECRET=<random urlsafe secret, at least 32 characters>
+PROCUREMENT_ADMIN_USERNAME=<standalone administrator login>
+PROCUREMENT_ADMIN_PASSWORD_HASH=<scrypt hash from python -m procurement.passwords>
 PROCUREMENT_SESSION_TTL_SECONDS=28800
+PROCUREMENT_TRUSTED_PROXY_IPS=<exact nginx peer IP or CIDR>
 ```
 
-В production cookie устанавливается с флагом `Secure`. API-ключ остаётся только
-для внутренних server-to-server вызовов и аварийной диагностики; сохранять его
-в `localStorage` запрещено.
+Форма `POST /auth/login` проверяет scrypt-хэш и выдаёт отдельную
+`procurement_session` cookie с `HttpOnly`, `SameSite=Lax` и `Secure` в
+production. Неудачные попытки ограничиваются. Пароль и серверный
+`PROCUREMENT_API_KEY` никогда не передаются клиентскому JavaScript и не
+сохраняются в `localStorage`. API-ключ предназначен только для внутренних
+server-to-server вызовов и аварийной диагностики.
+
+Правильные учётные данные всегда снимают накопленный лимит, поэтому посторонний
+не может заблокировать администратора серией неверных паролей. Заголовок
+`X-Forwarded-For` учитывается только когда непосредственный peer входит в
+`PROCUREMENT_TRUSTED_PROXY_IPS`; от остальных клиентов он игнорируется. Указывайте
+точный адрес nginx или Docker gateway, а не широкую внутреннюю сеть. Автоматическая
+обработка proxy headers в Uvicorn отключена в `Dockerfile`.
+
+Для публичного домена дополнительно ограничьте частоту запросов к
+`/auth/login` на nginx по реальному адресу клиента. Это защищает CPU от массовых
+scrypt-проверок; встроенный лимит приложения отвечает за перебор учётных данных.
 
 ## Импорт базы поставщиков
 
@@ -240,7 +256,7 @@ docs/
 - [ ] искать новых поставщиков по категории и региону;
 - [ ] проверять реквизиты и каналы связи до первого контакта;
 - [ ] экспортировать сравнительную таблицу и протокол в XLSX/DOCX/PDF;
-- [ ] перейти на PostgreSQL, объектное хранилище, очередь задач, SSO и RBAC;
+- [ ] перейти на PostgreSQL, объектное хранилище и очередь задач; добавить многопользовательский RBAC;
 - [ ] добавить метрики экономии, скорости тендера и конверсии ответов.
 
 ## Ключевые метрики продукта

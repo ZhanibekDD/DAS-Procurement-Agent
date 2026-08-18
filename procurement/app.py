@@ -1,11 +1,25 @@
 from __future__ import annotations
 
 import hmac
+import threading
 import time
 from contextlib import asynccontextmanager
+from ipaddress import ip_address, ip_network
 from pathlib import Path
+from typing import Any
 
-from fastapi import Cookie, Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
+from fastapi import (
+    Cookie,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from .auth import TokenError, issue_token, verify_token
@@ -26,6 +40,7 @@ from .models import (
     SupplierCreate,
     TemplateUpsert,
 )
+from .passwords import verify_password
 from .service import ConflictError, NotFoundError, ProcurementService
 
 
@@ -42,16 +57,112 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="DAS Снабжение",
-    version="0.4.0",
+    version="0.5.0",
     description="Internal supplier RFQ and tender comparison workflow",
     lifespan=lifespan,
 )
 
 
-SESSION_COOKIE = "das_procurement_session"
-SSO_AUDIENCE = "das-procurement-agent"
+SESSION_COOKIE = "procurement_session"
 SESSION_ISSUER = "das-procurement-agent"
 SESSION_AUDIENCE = "das-procurement-web"
+LOGIN_WINDOW_SECONDS = 15 * 60
+LOGIN_MAX_FAILURES = 5
+_LOGIN_FAILURES: dict[str, list[float]] = {}
+_LOGIN_LOCK = threading.Lock()
+
+
+def _session_claims(session_token: str) -> dict[str, Any] | None:
+    if not settings.auth_secret or not session_token:
+        return None
+    try:
+        return verify_token(
+            settings.auth_secret,
+            session_token,
+            issuer=SESSION_ISSUER,
+            audience=SESSION_AUDIENCE,
+            kind="session",
+            max_ttl_seconds=settings.session_ttl_seconds,
+        )
+    except TokenError:
+        return None
+
+
+def _client_ip(request: Request) -> str:
+    peer = request.client.host if request.client else "unknown"
+    try:
+        peer_address = ip_address(peer)
+    except ValueError:
+        return peer
+
+    trusted_networks = tuple(
+        ip_network(value, strict=False) for value in settings.trusted_proxy_networks
+    )
+    if not any(peer_address in network for network in trusted_networks):
+        return str(peer_address)
+
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if not forwarded:
+        return str(peer_address)
+    try:
+        chain = [ip_address(value.strip()) for value in forwarded.split(",")]
+    except ValueError:
+        return str(peer_address)
+
+    for address in reversed(chain):
+        if not any(address in network for network in trusted_networks):
+            return str(address)
+    return str(chain[0])
+
+
+def _login_keys(request: Request, username: str) -> tuple[str, str]:
+    return (
+        f"ip:{_client_ip(request)}",
+        f"account:{username.casefold()}",
+    )
+
+
+def _recent_failures(key: str, now: float) -> list[float]:
+    cutoff = now - LOGIN_WINDOW_SECONDS
+    with _LOGIN_LOCK:
+        recent = [stamp for stamp in _LOGIN_FAILURES.get(key, []) if stamp >= cutoff]
+        if recent:
+            _LOGIN_FAILURES[key] = recent
+        else:
+            _LOGIN_FAILURES.pop(key, None)
+        return recent
+
+
+def _record_login_failure(keys: tuple[str, ...], now: float) -> None:
+    with _LOGIN_LOCK:
+        for key in keys:
+            _LOGIN_FAILURES.setdefault(key, []).append(now)
+        while len(_LOGIN_FAILURES) > 2048:
+            _LOGIN_FAILURES.pop(next(iter(_LOGIN_FAILURES)))
+
+
+def _clear_login_failures(keys: tuple[str, ...]) -> None:
+    with _LOGIN_LOCK:
+        for key in keys:
+            _LOGIN_FAILURES.pop(key, None)
+
+
+def _login_page(*, error: str = "", status_code: int = 200) -> HTMLResponse:
+    path = Path(__file__).parent / "static" / "login.html"
+    message = (
+        '<div class="error" role="alert">Неверный логин или пароль.</div>'
+        if error == "invalid"
+        else '<div class="error" role="alert">Слишком много попыток. Повторите позже.</div>'
+        if error == "limited"
+        else ""
+    )
+    response = HTMLResponse(
+        path.read_text(encoding="utf-8").replace("{{ERROR_MESSAGE}}", message),
+        status_code=status_code,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
 
 
 def require_access(
@@ -64,22 +175,13 @@ def require_access(
         and hmac.compare_digest(x_api_key, settings.api_key)
     ):
         return
-
-    if settings.sso_secret and session_token:
-        try:
-            verify_token(
-                settings.sso_secret,
-                session_token,
-                issuer=SESSION_ISSUER,
-                audience=SESSION_AUDIENCE,
-                kind="session",
-                max_ttl_seconds=settings.session_ttl_seconds,
-            )
-            return
-        except TokenError:
-            pass
-
-    if not settings.api_key and settings.environment != "production":
+    if _session_claims(session_token):
+        return
+    if (
+        not settings.api_key
+        and not settings.local_auth_configured
+        and settings.environment != "production"
+    ):
         return
     raise HTTPException(status_code=403, detail="access denied")
 
@@ -97,46 +199,63 @@ def health() -> dict[str, str]:
     return {"status": "ok", "service": "das-procurement-agent", "outbox": settings.outbox_mode}
 
 
-@app.post("/auth/sso", include_in_schema=False)
-def sso_login(token: str = Form(..., min_length=32, max_length=4096)) -> RedirectResponse:
-    if not settings.sso_secret:
-        raise HTTPException(status_code=404, detail="SSO is not configured")
-
-    now = int(time.time())
-    try:
-        claims = verify_token(
-            settings.sso_secret,
-            token,
-            issuer=settings.sso_issuer,
-            audience=SSO_AUDIENCE,
-            kind="launch",
-            max_ttl_seconds=120,
-            now=now,
+@app.get("/login", response_class=HTMLResponse, include_in_schema=False)
+def login_page(
+    session_token: str = Cookie(default="", alias=SESSION_COOKIE),
+):
+    if not settings.local_auth_configured:
+        raise HTTPException(
+            status_code=404, detail="local authentication is not configured"
         )
-    except TokenError as exc:
-        raise HTTPException(status_code=403, detail="invalid SSO token") from exc
+    if _session_claims(session_token):
+        return RedirectResponse(url="/", status_code=303)
+    return _login_page()
 
-    if not db.consume_sso_jti(str(claims["jti"]), int(claims["exp"]), now):
-        raise HTTPException(status_code=403, detail="SSO token already used")
+
+@app.post("/auth/login", include_in_schema=False)
+def login(
+    request: Request,
+    username: str = Form(..., min_length=1, max_length=128),
+    password: str = Form(..., min_length=1, max_length=256),
+):
+    if not settings.local_auth_configured:
+        raise HTTPException(
+            status_code=404, detail="local authentication is not configured"
+        )
+
+    now = time.time()
+    keys = _login_keys(request, username)
+    limited = any(
+        len(_recent_failures(key, now)) >= LOGIN_MAX_FAILURES for key in keys
+    )
+    username_ok = hmac.compare_digest(username, settings.admin_username)
+    password_ok = verify_password(password, settings.admin_password_hash)
+    if username_ok and password_ok:
+        _clear_login_failures(keys)
+    elif limited:
+        response = _login_page(error="limited", status_code=429)
+        response.headers["Retry-After"] = str(LOGIN_WINDOW_SECONDS)
+        return response
+    else:
+        _record_login_failure(keys, now)
+        return _login_page(error="invalid", status_code=403)
 
     session_token = issue_token(
-        settings.sso_secret,
+        settings.auth_secret,
         issuer=SESSION_ISSUER,
         audience=SESSION_AUDIENCE,
-        subject=str(claims["sub"]),
-        role=str(claims["role"]),
+        subject=settings.admin_username,
+        role="admin",
         kind="session",
         ttl_seconds=settings.session_ttl_seconds,
-        now=now,
     )
     db.audit(
-        "sso_login",
+        "local_login",
         "session",
-        str(claims["jti"]),
-        actor=str(claims["sub"]),
-        details={"role": claims["role"]},
+        settings.admin_username,
+        actor=settings.admin_username,
+        details={"role": "admin"},
     )
-
     response = RedirectResponse(url="/", status_code=303)
     response.set_cookie(
         SESSION_COOKIE,
@@ -153,17 +272,35 @@ def sso_login(token: str = Form(..., min_length=32, max_length=4096)) -> Redirec
 
 
 @app.post("/auth/logout", include_in_schema=False)
-def sso_logout() -> RedirectResponse:
-    response = RedirectResponse(url="/", status_code=303)
+def logout(
+    session_token: str = Cookie(default="", alias=SESSION_COOKIE),
+) -> RedirectResponse:
+    claims = _session_claims(session_token)
+    if claims:
+        db.audit(
+            "local_logout",
+            "session",
+            str(claims["sub"]),
+            actor=str(claims["sub"]),
+            details={},
+        )
+    response = RedirectResponse(url="/login", status_code=303)
     response.delete_cookie(SESSION_COOKIE, path="/")
     response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
     return response
 
 
 @app.get("/", response_class=HTMLResponse)
-def index() -> HTMLResponse:
+def index(
+    session_token: str = Cookie(default="", alias=SESSION_COOKIE),
+):
+    if settings.local_auth_configured and not _session_claims(session_token):
+        return RedirectResponse(url="/login", status_code=303)
     path = Path(__file__).parent / "static" / "index.html"
-    return HTMLResponse(path.read_text(encoding="utf-8"))
+    response = HTMLResponse(path.read_text(encoding="utf-8"))
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.get("/api/dashboard", dependencies=[Depends(require_access)])

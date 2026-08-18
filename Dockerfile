@@ -14,4 +14,4 @@ RUN useradd --create-home --uid 10001 procurement \
 
 USER procurement
 EXPOSE 9200
-CMD ["uvicorn", "procurement.app:app", "--host", "0.0.0.0", "--port", "9200"]
+CMD ["uvicorn", "procurement.app:app", "--host", "0.0.0.0", "--port", "9200", "--no-proxy-headers"]
