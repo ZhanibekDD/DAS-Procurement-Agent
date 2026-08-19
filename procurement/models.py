@@ -14,6 +14,7 @@ class StrictModel(BaseModel):
 class ProjectCreate(StrictModel):
     name: str = Field(min_length=2, max_length=200)
     region: str = Field(min_length=2, max_length=120)
+    cluster: Literal["cluster_1", "cluster_2", ""] = ""
     delivery_address: str = Field(min_length=3, max_length=500)
     description: str = Field(default="", max_length=4000)
 
@@ -31,6 +32,8 @@ class SupplierCreate(StrictModel):
     email: str = Field(default="", max_length=320)
     phone: str = Field(default="", max_length=40)
     telegram: str = Field(default="", max_length=120)
+    max_contact: str = Field(default="", max_length=120)
+    cluster: Literal["cluster_1", "cluster_2", ""] = ""
     categories: list[str] = Field(default_factory=list, max_length=50)
     rating: float = Field(default=3.0, ge=0, le=5)
     verified: bool = False
@@ -48,6 +51,9 @@ class LotItemCreate(StrictModel):
     quantity: Decimal = Field(gt=0)
     unit: str = Field(min_length=1, max_length=30)
     specification: str = Field(default="", max_length=8000)
+    source_document_id: int | None = Field(default=None, gt=0)
+    source_page: int | None = Field(default=None, ge=1, le=10000)
+    source_reference: str = Field(default="", max_length=500)
 
 
 class LotCreate(StrictModel):
@@ -55,6 +61,7 @@ class LotCreate(StrictModel):
     section_id: int | None = Field(default=None, gt=0)
     title: str = Field(min_length=2, max_length=240)
     region: str = Field(min_length=2, max_length=120)
+    cluster: Literal["cluster_1", "cluster_2", ""] = ""
     delivery_address: str = Field(min_length=3, max_length=500)
     response_deadline: date
     desired_delivery_date: date | None = None
@@ -90,7 +97,7 @@ class ProcurementSuggestionRejection(StrictModel):
 class CampaignCreate(StrictModel):
     template_code: str = Field(default="rfq-email", min_length=2, max_length=80)
     supplier_ids: list[int] = Field(min_length=1, max_length=500)
-    channel: Literal["email", "telegram", "whatsapp"] = "email"
+    channel: Literal["email", "telegram", "max"] = "email"
 
 
 class QuoteItemCreate(StrictModel):

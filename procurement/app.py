@@ -57,7 +57,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="DAS Снабжение",
-    version="0.5.0",
+    version="0.6.0",
     description="Internal supplier RFQ and tender comparison workflow",
     lifespan=lifespan,
 )
@@ -403,6 +403,21 @@ def list_source_documents(extraction_status: str = Query(default="")):
 
 
 @app.post(
+    "/api/documents/{document_id}/extract/fence-schedule",
+    dependencies=[Depends(require_access)],
+    status_code=201,
+)
+def extract_fence_schedule(
+    document_id: int,
+    page: int = Query(..., ge=1, le=10000),
+):
+    try:
+        return service.analyze_fence_schedule(document_id, page_number=page)
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
+@app.post(
     "/api/documents/{document_id}/procurement-suggestions",
     dependencies=[Depends(require_access)],
     status_code=201,
@@ -420,6 +435,28 @@ def list_procurement_suggestions(
 ):
     try:
         return service.list_procurement_suggestions(project_id=project_id, status=status)
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
+@app.post(
+    "/api/procurement-suggestions/{suggestion_id}/reference-checks/{reference_document_id}",
+    dependencies=[Depends(require_access)],
+)
+def check_procurement_reference(suggestion_id: int, reference_document_id: int):
+    try:
+        return service.check_fence_reference(suggestion_id, reference_document_id)
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
+@app.get(
+    "/api/procurement-suggestions/{suggestion_id}/reference-checks",
+    dependencies=[Depends(require_access)],
+)
+def list_procurement_reference_checks(suggestion_id: int):
+    try:
+        return service.list_reference_checks(suggestion_id)
     except Exception as exc:
         raise handle_domain_error(exc) from exc
 

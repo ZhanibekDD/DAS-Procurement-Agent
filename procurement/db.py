@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS projects (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     region TEXT NOT NULL,
+    cluster TEXT NOT NULL DEFAULT '',
     delivery_address TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'draft',
@@ -39,6 +40,8 @@ CREATE TABLE IF NOT EXISTS suppliers (
     email TEXT NOT NULL DEFAULT '',
     phone TEXT NOT NULL DEFAULT '',
     telegram TEXT NOT NULL DEFAULT '',
+    max_contact TEXT NOT NULL DEFAULT '',
+    cluster TEXT NOT NULL DEFAULT '',
     categories_json TEXT NOT NULL DEFAULT '[]',
     rating REAL NOT NULL DEFAULT 3,
     verified INTEGER NOT NULL DEFAULT 0,
@@ -56,6 +59,7 @@ CREATE TABLE IF NOT EXISTS lots (
     section_id INTEGER REFERENCES project_sections(id) ON DELETE SET NULL,
     title TEXT NOT NULL,
     region TEXT NOT NULL,
+    cluster TEXT NOT NULL DEFAULT '',
     delivery_address TEXT NOT NULL,
     response_deadline TEXT NOT NULL,
     desired_delivery_date TEXT,
@@ -70,7 +74,10 @@ CREATE TABLE IF NOT EXISTS lot_items (
     name TEXT NOT NULL,
     quantity TEXT NOT NULL,
     unit TEXT NOT NULL,
-    specification TEXT NOT NULL DEFAULT ''
+    specification TEXT NOT NULL DEFAULT '',
+    source_document_id INTEGER REFERENCES source_documents(id) ON DELETE SET NULL,
+    source_page INTEGER,
+    source_reference TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS templates (
@@ -192,6 +199,16 @@ CREATE TABLE IF NOT EXISTS procurement_suggestions (
 CREATE INDEX IF NOT EXISTS ix_procurement_suggestions_review
 ON procurement_suggestions(status, project_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS document_reference_checks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    suggestion_id INTEGER NOT NULL REFERENCES procurement_suggestions(id) ON DELETE CASCADE,
+    reference_document_id INTEGER NOT NULL REFERENCES source_documents(id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(suggestion_id, reference_document_id)
+);
+
 CREATE TABLE IF NOT EXISTS audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     actor TEXT NOT NULL,
@@ -247,6 +264,7 @@ class Database:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self.connection() as conn:
             conn.executescript(SCHEMA)
+            self._migrate_columns(conn)
             for code, template in DEFAULT_TEMPLATES.items():
                 conn.execute(
                     """
@@ -256,6 +274,33 @@ class Database:
                     """,
                     (code, template["name"], template["subject"], template["body"], utcnow()),
                 )
+
+    @staticmethod
+    def _migrate_columns(conn: sqlite3.Connection) -> None:
+        additions = {
+            "projects": (
+                ("cluster", "TEXT NOT NULL DEFAULT ''"),
+            ),
+            "suppliers": (
+                ("max_contact", "TEXT NOT NULL DEFAULT ''"),
+                ("cluster", "TEXT NOT NULL DEFAULT ''"),
+            ),
+            "lots": (
+                ("cluster", "TEXT NOT NULL DEFAULT ''"),
+            ),
+            "lot_items": (
+                ("source_document_id", "INTEGER REFERENCES source_documents(id) ON DELETE SET NULL"),
+                ("source_page", "INTEGER"),
+                ("source_reference", "TEXT NOT NULL DEFAULT ''"),
+            ),
+        }
+        for table, columns in additions.items():
+            existing = {
+                str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for name, definition in columns:
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
