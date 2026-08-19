@@ -16,8 +16,10 @@ HEADER_ALIASES = {
     "tax_id": {"инн", "бин", "иин", "огрн", "tax_id", "tax id"},
     "region": {"регион", "город", "область", "region", "city"},
     "email": {"email", "e-mail", "электронная почта", "почта"},
-    "phone": {"телефон", "phone", "мобильный", "whatsapp", "ватсап"},
+    "phone": {"телефон", "phone", "мобильный"},
     "telegram": {"telegram", "телеграм", "tg"},
+    "max_contact": {"max", "мах", "макс", "max контакт", "мах контакт"},
+    "cluster": {"кластер", "cluster"},
     "categories": {"категория", "категории", "товары", "услуги", "category"},
     "rating": {"рейтинг", "rating", "оценка"},
     "verified": {"проверен", "проверенный", "verified"},
@@ -69,6 +71,8 @@ def _supplier_from_row(row: list[object], mapping: dict[int, str]) -> SupplierCr
         email=str(values.get("email") or ""),
         phone=str(values.get("phone") or ""),
         telegram=str(values.get("telegram") or ""),
+        max_contact=str(values.get("max_contact") or ""),
+        cluster=str(values.get("cluster") or ""),
         categories=categories,
         rating=float(raw_rating) if raw_rating else 3.0,
         verified=_bool(values.get("verified")),
@@ -112,4 +116,3 @@ def parse_supplier_table(content: bytes, filename: str) -> ImportPreview:
         finally:
             workbook.close()
     raise ValueError("only .csv and .xlsx supplier tables are supported")
-

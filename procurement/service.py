@@ -10,6 +10,13 @@ from statistics import median
 from typing import Any
 
 from .db import Database, utcnow
+from .document_analysis import (
+    compare_fence_documents,
+    extract_bulat_fence_schedule,
+    extract_bulat_invoice,
+    extract_pdf_page,
+    read_stored_pdf,
+)
 from .models import (
     CampaignCreate,
     LotCreate,
@@ -25,6 +32,7 @@ from .models import (
     TemplateUpsert,
 )
 from .ranking import rank_quotes
+from .regions import resolve_cluster
 from .templates import render_template
 
 
@@ -41,10 +49,22 @@ class ProcurementService:
         self.db = db
 
     def create_project(self, data: ProjectCreate) -> dict[str, Any]:
+        cluster = resolve_cluster(data.region, data.cluster)
         with self.db.connection() as conn:
             cursor = conn.execute(
-                "INSERT INTO projects(name, region, delivery_address, description, created_at) VALUES (?, ?, ?, ?, ?)",
-                (data.name, data.region, data.delivery_address, data.description, utcnow()),
+                """
+                INSERT INTO projects(
+                    name, region, cluster, delivery_address, description, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    data.name,
+                    data.region,
+                    cluster,
+                    data.delivery_address,
+                    data.description,
+                    utcnow(),
+                ),
             )
             project_id = cursor.lastrowid
             self.db.audit("created", "project", project_id, conn=conn)
@@ -77,14 +97,15 @@ class ProcurementService:
         return self.db.one("SELECT * FROM project_sections WHERE id = ?", (section_id,)) or {}
 
     def create_supplier(self, data: SupplierCreate, *, source: str = "manual") -> dict[str, Any]:
+        cluster = resolve_cluster(data.region, data.cluster)
         with self.db.connection() as conn:
             try:
                 cursor = conn.execute(
                     """
                     INSERT INTO suppliers(
-                        name, tax_id, region, email, phone, telegram, categories_json,
-                        rating, verified, source, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        name, tax_id, region, email, phone, telegram, max_contact, cluster,
+                        categories_json, rating, verified, source, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         data.name,
@@ -93,6 +114,8 @@ class ProcurementService:
                         data.email,
                         data.phone,
                         data.telegram,
+                        data.max_contact,
+                        cluster,
                         json.dumps(data.categories, ensure_ascii=False),
                         data.rating,
                         int(data.verified),
@@ -133,6 +156,7 @@ class ProcurementService:
 
     def create_lot(self, data: LotCreate) -> dict[str, Any]:
         project = self.get_project(data.project_id)
+        cluster = resolve_cluster(data.region, data.cluster or project["cluster"])
         if data.section_id is not None:
             section = self.db.one(
                 "SELECT id FROM project_sections WHERE id = ? AND project_id = ?",
@@ -144,15 +168,16 @@ class ProcurementService:
             cursor = conn.execute(
                 """
                 INSERT INTO lots(
-                    project_id, section_id, title, region, delivery_address,
+                    project_id, section_id, title, region, cluster, delivery_address,
                     response_deadline, desired_delivery_date, currency, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     data.project_id,
                     data.section_id,
                     data.title,
                     data.region,
+                    cluster,
                     data.delivery_address,
                     data.response_deadline.isoformat(),
                     data.desired_delivery_date.isoformat() if data.desired_delivery_date else None,
@@ -163,8 +188,22 @@ class ProcurementService:
             lot_id = cursor.lastrowid
             for item in data.items:
                 conn.execute(
-                    "INSERT INTO lot_items(lot_id, name, quantity, unit, specification) VALUES (?, ?, ?, ?, ?)",
-                    (lot_id, item.name, str(item.quantity), item.unit, item.specification),
+                    """
+                    INSERT INTO lot_items(
+                        lot_id, name, quantity, unit, specification,
+                        source_document_id, source_page, source_reference
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        lot_id,
+                        item.name,
+                        str(item.quantity),
+                        item.unit,
+                        item.specification,
+                        item.source_document_id,
+                        item.source_page,
+                        item.source_reference,
+                    ),
                 )
             self.db.audit(
                 "created", "lot", lot_id, details={"project_name": project["name"]}, conn=conn
@@ -192,6 +231,8 @@ class ProcurementService:
         search_text = " ".join([lot["title"], *(item["name"] for item in lot["items"])]).casefold()
         candidates = []
         for supplier in self.list_suppliers():
+            if lot["cluster"] and supplier["cluster"] != lot["cluster"]:
+                continue
             region_match = lot["region"].casefold() in supplier["region"].casefold() or supplier[
                 "region"
             ].casefold() in lot["region"].casefold()
@@ -204,6 +245,7 @@ class ProcurementService:
             if score > 0:
                 supplier["match_score"] = round(score, 2)
                 supplier["match_reasons"] = {
+                    "cluster": lot["cluster"] or "legacy_unassigned",
                     "region": region_match,
                     "category_hits": category_hits,
                     "verified": supplier["verified"],
@@ -236,6 +278,17 @@ class ProcurementService:
         if not template:
             raise NotFoundError("template not found")
         suppliers = [self.get_supplier(supplier_id) for supplier_id in dict.fromkeys(data.supplier_ids)]
+        if lot["cluster"]:
+            invalid = [
+                supplier["id"]
+                for supplier in suppliers
+                if supplier["cluster"] != lot["cluster"]
+            ]
+            if invalid:
+                raise ValueError(
+                    "supplier cluster must match lot cluster; blocked supplier ids: "
+                    + ", ".join(str(value) for value in invalid)
+                )
         items_text = "\n".join(
             f"- {item['name']}: {item['quantity']} {item['unit']}"
             + (f"; {item['specification']}" if item["specification"] else "")
@@ -246,7 +299,7 @@ class ProcurementService:
             recipient = {
                 "email": supplier["email"],
                 "telegram": supplier["telegram"],
-                "whatsapp": supplier["phone"],
+                "max": supplier["max_contact"],
             }[data.channel]
             if not recipient:
                 raise ValueError(f"supplier {supplier['id']} has no {data.channel} contact")
@@ -716,7 +769,7 @@ class ProcurementService:
         return {
             "lot": lot,
             "price_benchmark": benchmark,
-            "ranking_policy": "landed_cost_60_delivery_15_reliability_15_terms_10",
+            "ranking_policy": "price_60_delivery_25_vat_15",
             "quotes": rank_quotes(rows),
             "decision": "human_approval_required",
         }
@@ -788,6 +841,110 @@ class ProcurementService:
                 conn=conn,
             )
         return self.db.one("SELECT * FROM source_documents WHERE id = ?", (document_id,)) or {}
+
+    def analyze_fence_schedule(
+        self, document_id: int, *, page_number: int
+    ) -> dict[str, Any]:
+        document = self.db.one("SELECT * FROM source_documents WHERE id = ?", (document_id,))
+        if not document:
+            raise NotFoundError("source document not found")
+        if document["document_type"] != "project_section":
+            raise ValueError("fence schedule extraction requires a project section document")
+        if document["project_id"] is None:
+            raise ValueError("project section document must be linked to a project")
+        content = read_stored_pdf(document["storage_path"])
+        text = extract_pdf_page(content, page_number)
+        suggestion_data = extract_bulat_fence_schedule(
+            text,
+            page_number=page_number,
+            source_document_id=document_id,
+        )
+        suggestion = self.register_procurement_suggestions(
+            document_id, [suggestion_data]
+        )[0]
+        return {
+            "suggestion": suggestion,
+            "profile": "bulat_fence_schedule_v1",
+            "source_page": page_number,
+            "missing_rfq_fields": [
+                "delivery_address_confirmation",
+                "response_deadline",
+                "coating",
+                "color_ral",
+                "mesh_cell",
+                "rod_diameter",
+                "delivery_or_pickup",
+            ],
+            "decision": "human_review_required",
+        }
+
+    def check_fence_reference(
+        self, suggestion_id: int, reference_document_id: int
+    ) -> dict[str, Any]:
+        suggestion = self.get_procurement_suggestion(suggestion_id)
+        reference_document = self.db.one(
+            "SELECT * FROM source_documents WHERE id = ?", (reference_document_id,)
+        )
+        if not reference_document:
+            raise NotFoundError("reference document not found")
+        if reference_document["document_type"] not in {"paid_invoice", "commercial_offer"}:
+            raise ValueError("reference check requires an invoice or commercial offer")
+        content = read_stored_pdf(reference_document["storage_path"])
+        text = extract_pdf_page(content, 1)
+        reference = extract_bulat_invoice(text)
+        result = compare_fence_documents(suggestion["items"], reference)
+        with self.db.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO document_reference_checks(
+                    suggestion_id, reference_document_id, status, result_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(suggestion_id, reference_document_id) DO UPDATE SET
+                    status=excluded.status,
+                    result_json=excluded.result_json,
+                    created_at=excluded.created_at
+                """,
+                (
+                    suggestion_id,
+                    reference_document_id,
+                    result["status"],
+                    json.dumps(result, ensure_ascii=False),
+                    utcnow(),
+                ),
+            )
+            self.db.audit(
+                "reference_checked",
+                "procurement_suggestion",
+                suggestion_id,
+                details={
+                    "reference_document_id": reference_document_id,
+                    "status": result["status"],
+                    "can_use_as_current_quote": result["can_use_as_current_quote"],
+                },
+                conn=conn,
+            )
+        return {
+            **result,
+            "suggestion_id": suggestion_id,
+            "reference_document_id": reference_document_id,
+            "reference_filename": reference_document["filename"],
+        }
+
+    def list_reference_checks(self, suggestion_id: int) -> list[dict[str, Any]]:
+        self.get_procurement_suggestion(suggestion_id)
+        rows = self.db.all(
+            """
+            SELECT c.*, d.filename AS reference_filename
+            FROM document_reference_checks c
+            JOIN source_documents d ON d.id = c.reference_document_id
+            WHERE c.suggestion_id = ?
+            ORDER BY c.id DESC
+            """,
+            (suggestion_id,),
+        )
+        for row in rows:
+            row["result"] = json.loads(row.pop("result_json"))
+        return rows
 
     def list_source_documents(self, extraction_status: str = "") -> list[dict[str, Any]]:
         if extraction_status:
@@ -861,7 +1018,8 @@ class ProcurementService:
         row = self.db.one(
             """
             SELECT s.*, d.filename AS source_filename, p.name AS project_name,
-                   p.region AS project_region, p.delivery_address
+                   p.region AS project_region, p.cluster AS project_cluster,
+                   p.delivery_address
             FROM procurement_suggestions s
             JOIN source_documents d ON d.id = s.source_document_id
             JOIN projects p ON p.id = s.project_id
@@ -905,7 +1063,8 @@ class ProcurementService:
         rows = self.db.all(
             """
             SELECT s.*, d.filename AS source_filename, p.name AS project_name,
-                   p.region AS project_region, p.delivery_address
+                   p.region AS project_region, p.cluster AS project_cluster,
+                   p.delivery_address
             FROM procurement_suggestions s
             JOIN source_documents d ON d.id = s.source_document_id
             JOIN projects p ON p.id = s.project_id
@@ -954,15 +1113,16 @@ class ProcurementService:
             lot_cursor = conn.execute(
                 """
                 INSERT INTO lots(
-                    project_id, section_id, title, region, delivery_address,
+                    project_id, section_id, title, region, cluster, delivery_address,
                     response_deadline, desired_delivery_date, currency, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     suggestion["project_id"],
                     section_id,
                     suggestion["lot_title"],
                     suggestion["project_region"],
+                    suggestion["project_cluster"],
                     suggestion["delivery_address"],
                     data.response_deadline.isoformat(),
                     data.desired_delivery_date.isoformat() if data.desired_delivery_date else None,
@@ -974,8 +1134,22 @@ class ProcurementService:
             for item_data in suggestion["items"]:
                 item = LotItemCreate.model_validate(item_data)
                 conn.execute(
-                    "INSERT INTO lot_items(lot_id, name, quantity, unit, specification) VALUES (?, ?, ?, ?, ?)",
-                    (lot_id, item.name, str(item.quantity), item.unit, item.specification),
+                    """
+                    INSERT INTO lot_items(
+                        lot_id, name, quantity, unit, specification,
+                        source_document_id, source_page, source_reference
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        lot_id,
+                        item.name,
+                        str(item.quantity),
+                        item.unit,
+                        item.specification,
+                        item.source_document_id,
+                        item.source_page,
+                        item.source_reference,
+                    ),
                 )
             self.db.audit(
                 "created",
