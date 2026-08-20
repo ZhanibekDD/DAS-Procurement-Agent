@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS lots (
     response_deadline TEXT NOT NULL,
     desired_delivery_date TEXT,
     currency TEXT NOT NULL,
+    rfq_requirements_json TEXT NOT NULL DEFAULT '{}',
     status TEXT NOT NULL DEFAULT 'draft',
     created_at TEXT NOT NULL
 );
@@ -287,6 +288,7 @@ class Database:
             ),
             "lots": (
                 ("cluster", "TEXT NOT NULL DEFAULT ''"),
+                ("rfq_requirements_json", "TEXT NOT NULL DEFAULT '{}'"),
             ),
             "lot_items": (
                 ("source_document_id", "INTEGER REFERENCES source_documents(id) ON DELETE SET NULL"),

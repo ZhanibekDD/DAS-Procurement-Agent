@@ -5,7 +5,7 @@
 ### Внутренняя цифровая служба снабжения: от проекта до проверяемого выбора поставщика
 
 [![tests](https://github.com/ZhanibekDD/DAS-Procurement-Agent/actions/workflows/test.yml/badge.svg)](https://github.com/ZhanibekDD/DAS-Procurement-Agent/actions/workflows/test.yml)
-![version](https://img.shields.io/badge/version-0.6.0-5b8cff?style=flat-square)
+![version](https://img.shields.io/badge/version-0.7.0-5b8cff?style=flat-square)
 ![python](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat-square&logo=python&logoColor=white)
 ![fastapi](https://img.shields.io/badge/FastAPI-0.115+-009688?style=flat-square&logo=fastapi&logoColor=white)
 ![mode](https://img.shields.io/badge/outbox-draft__only-E9A23B?style=flat-square)
@@ -84,7 +84,7 @@ AI-разбор разделов и ручная проверка объёмов
 Решение комиссии / руководителя
 ```
 
-## Реализовано в версии 0.6.0
+## Реализовано в версии 0.7.0
 
 | Контур | Возможности |
 |---|---|
@@ -221,6 +221,13 @@ curl -H 'X-API-Key: change-me' \
 
 Для ведомостей ограждения типа «Булат» доступен детерминированный профиль разбора:
 
+В разделе **Документы** мастер «Документ → запрос КП» проводит сотрудника через
+четыре явных этапа: загрузка и извлечение, проверка трассируемых позиций и
+справочного счёта, выбор поставщиков того же кластера, создание черновиков.
+Покрытие, RAL, ячейка, диаметр прутка, логистика и подтверждённый адрес
+сохраняются в лоте и включаются в текст запроса. Ни один этап не отправляет письмо
+автоматически.
+
 ```bash
 curl -H 'X-API-Key: change-me' \
   -F 'file=@project.pdf' \
@@ -252,7 +259,7 @@ RAL, ячейка, диаметр прутка и способ доставки 
 - `cluster_2`: ЯНАО, ХМАО, Тюменская, Свердловская и Омская области.
 
 Каналы запросов: email, Telegram и MAX. Сообщения по-прежнему создаются только
-как черновики; отправка в версии 0.6.0 отсутствует.
+как черновики; отправка в версии 0.7.0 отсутствует.
 
 ## Архитектура
 

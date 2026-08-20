@@ -57,7 +57,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="DAS Снабжение",
-    version="0.6.0",
+    version="0.7.0",
     description="Internal supplier RFQ and tender comparison workflow",
     lifespan=lifespan,
 )

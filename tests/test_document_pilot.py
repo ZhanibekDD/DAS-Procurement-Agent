@@ -20,6 +20,7 @@ from procurement.models import (
     ProcurementSuggestionApproval,
     ProcurementSuggestionCreate,
     ProjectCreate,
+    RfqRequirements,
     SupplierCreate,
 )
 from procurement.ranking import rank_quotes
@@ -155,6 +156,7 @@ class FenceDocumentPilotTests(unittest.TestCase):
             self.assertIn("max_contact", columns["suppliers"])
             self.assertIn("cluster", columns["suppliers"])
             self.assertIn("cluster", columns["lots"])
+            self.assertIn("rfq_requirements_json", columns["lots"])
             self.assertIn("source_page", columns["lot_items"])
         finally:
             for suffix in ("", "-wal", "-shm"):
@@ -290,12 +292,43 @@ class ClusterAndApprovalTests(unittest.TestCase):
             ProcurementSuggestionApproval(
                 response_deadline=date.today() + timedelta(days=7),
                 approved_by="Начальник снабжения",
+                rfq_requirements=RfqRequirements(
+                    delivery_address_confirmation="г. Екатеринбург, Промышленная, 1",
+                    coating="горячее цинкование",
+                    color_ral="RAL 6005",
+                    mesh_cell="50×200 мм",
+                    rod_diameter="5 мм",
+                    delivery_or_pickup="supplier_choice",
+                ),
             ),
         )
         item = approved["lot"]["items"][0]
         self.assertEqual(item["source_document_id"], document["id"])
         self.assertEqual(item["source_page"], 13)
         self.assertEqual(item["source_reference"], "Спецификация, поз. П1")
+        self.assertEqual(approved["lot"]["rfq_requirements"]["color_ral"], "RAL 6005")
+        self.assertEqual(
+            approved["lot"]["delivery_address"], "г. Екатеринбург, Промышленная, 1"
+        )
+        listed = self.service.list_lots()[0]
+        self.assertEqual(listed["rfq_requirements"]["coating"], "горячее цинкование")
+        self.assertNotIn("rfq_requirements_json", listed)
+
+        supplier = self.service.create_supplier(
+            SupplierCreate(
+                name="Урал Ограждения",
+                region="Свердловская область",
+                email="rfq@ural.example",
+                categories=["ограждение"],
+            )
+        )
+        campaign = self.service.create_campaign(
+            approved["lot"]["id"], CampaignCreate(supplier_ids=[supplier["id"]])
+        )
+        body = campaign["messages"][0]["body"]
+        self.assertIn("Дополнительные требования", body)
+        self.assertIn("RAL 6005", body)
+        self.assertIn("указать оба варианта", body)
 
     def test_region_helpers_cover_two_non_crossing_clusters(self):
         self.assertEqual(infer_cluster("Тамбовская область"), "cluster_1")
@@ -338,6 +371,22 @@ class RankingPolicyTests(unittest.TestCase):
         self.assertIn('data-view="certificates"', html)
         self.assertIn('<option value="max">MAX</option>', html)
         self.assertNotIn('value="whatsapp"', html)
+
+    def test_ui_wires_document_to_rfq_flow_without_auto_send(self):
+        html = (
+            Path(__file__).parents[1] / "procurement" / "static" / "index.html"
+        ).read_text(encoding="utf-8")
+        self.assertIn("Документ → запрос КП", html)
+        self.assertIn("extractDocumentFlow()", html)
+        self.assertIn("runDocumentReferenceCheck()", html)
+        self.assertIn("approveDocumentFlow()", html)
+        self.assertIn("createDocumentDraft()", html)
+        self.assertIn("/extract/fence-schedule?page=", html)
+        self.assertIn("/reference-checks/", html)
+        self.assertIn("rfq_requirements", html)
+        self.assertIn("documentFlowSupplier", html)
+        self.assertIn("Режим сервиса — draft_only", html)
+        self.assertNotIn("sendDocumentRfq", html)
 
 
 if __name__ == "__main__":
