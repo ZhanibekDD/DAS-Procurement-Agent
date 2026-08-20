@@ -169,8 +169,9 @@ class ProcurementService:
                 """
                 INSERT INTO lots(
                     project_id, section_id, title, region, cluster, delivery_address,
-                    response_deadline, desired_delivery_date, currency, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    response_deadline, desired_delivery_date, currency,
+                    rfq_requirements_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     data.project_id,
@@ -182,6 +183,12 @@ class ProcurementService:
                     data.response_deadline.isoformat(),
                     data.desired_delivery_date.isoformat() if data.desired_delivery_date else None,
                     data.currency,
+                    json.dumps(
+                        data.rfq_requirements.model_dump(mode="json")
+                        if data.rfq_requirements
+                        else {},
+                        ensure_ascii=False,
+                    ),
                     utcnow(),
                 ),
             )
@@ -214,17 +221,23 @@ class ProcurementService:
         row = self.db.one("SELECT * FROM lots WHERE id = ?", (lot_id,))
         if not row:
             raise NotFoundError("lot not found")
+        row["rfq_requirements"] = json.loads(row.pop("rfq_requirements_json", "{}") or "{}")
         row["items"] = self.db.all("SELECT * FROM lot_items WHERE lot_id = ? ORDER BY id", (lot_id,))
         return row
 
     def list_lots(self) -> list[dict[str, Any]]:
-        return self.db.all(
+        rows = self.db.all(
             """
             SELECT lots.*, projects.name AS project_name
             FROM lots JOIN projects ON projects.id = lots.project_id
             ORDER BY lots.id DESC
             """
         )
+        for row in rows:
+            row["rfq_requirements"] = json.loads(
+                row.pop("rfq_requirements_json", "{}") or "{}"
+            )
+        return rows
 
     def match_suppliers(self, lot_id: int) -> list[dict[str, Any]]:
         lot = self.get_lot(lot_id)
@@ -294,6 +307,27 @@ class ProcurementService:
             + (f"; {item['specification']}" if item["specification"] else "")
             for item in lot["items"]
         )
+        requirements = lot.get("rfq_requirements") or {}
+        requirement_labels = {
+            "delivery_address_confirmation": "Подтверждение адреса доставки",
+            "coating": "Покрытие",
+            "color_ral": "Цвет RAL",
+            "mesh_cell": "Ячейка сетки",
+            "rod_diameter": "Диаметр прутка",
+            "delivery_or_pickup": "Логистика",
+        }
+        requirement_values = {
+            "delivery": "доставка поставщиком",
+            "pickup": "самовывоз",
+            "supplier_choice": "указать оба варианта",
+        }
+        requirements_text = "\n".join(
+            f"- {requirement_labels[key]}: {requirement_values.get(str(value), value)}"
+            for key, value in requirements.items()
+            if value and key in requirement_labels
+        )
+        if requirements_text:
+            items_text += "\n\nДополнительные требования:\n" + requirements_text
         prepared: list[tuple[dict[str, Any], str, str, str]] = []
         for supplier in suppliers:
             recipient = {
@@ -1114,8 +1148,9 @@ class ProcurementService:
                 """
                 INSERT INTO lots(
                     project_id, section_id, title, region, cluster, delivery_address,
-                    response_deadline, desired_delivery_date, currency, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    response_deadline, desired_delivery_date, currency,
+                    rfq_requirements_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     suggestion["project_id"],
@@ -1123,10 +1158,21 @@ class ProcurementService:
                     suggestion["lot_title"],
                     suggestion["project_region"],
                     suggestion["project_cluster"],
-                    suggestion["delivery_address"],
+                    (
+                        data.rfq_requirements.delivery_address_confirmation
+                        if data.rfq_requirements
+                        and data.rfq_requirements.delivery_address_confirmation
+                        else suggestion["delivery_address"]
+                    ),
                     data.response_deadline.isoformat(),
                     data.desired_delivery_date.isoformat() if data.desired_delivery_date else None,
                     data.currency,
+                    json.dumps(
+                        data.rfq_requirements.model_dump(mode="json")
+                        if data.rfq_requirements
+                        else {},
+                        ensure_ascii=False,
+                    ),
                     utcnow(),
                 ),
             )

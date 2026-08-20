@@ -56,6 +56,15 @@ class LotItemCreate(StrictModel):
     source_reference: str = Field(default="", max_length=500)
 
 
+class RfqRequirements(StrictModel):
+    delivery_address_confirmation: str = Field(default="", max_length=500)
+    coating: str = Field(default="", max_length=160)
+    color_ral: str = Field(default="", max_length=80)
+    mesh_cell: str = Field(default="", max_length=120)
+    rod_diameter: str = Field(default="", max_length=120)
+    delivery_or_pickup: Literal["delivery", "pickup", "supplier_choice", ""] = ""
+
+
 class LotCreate(StrictModel):
     project_id: int = Field(gt=0)
     section_id: int | None = Field(default=None, gt=0)
@@ -66,6 +75,7 @@ class LotCreate(StrictModel):
     response_deadline: date
     desired_delivery_date: date | None = None
     currency: str = Field(default="RUB", pattern=r"^[A-Z]{3}$")
+    rfq_requirements: RfqRequirements | None = None
     items: list[LotItemCreate] = Field(min_length=1, max_length=500)
 
 
@@ -87,6 +97,7 @@ class ProcurementSuggestionApproval(StrictModel):
     desired_delivery_date: date | None = None
     currency: str = Field(default="RUB", pattern=r"^[A-Z]{3}$")
     approved_by: str = Field(min_length=2, max_length=160)
+    rfq_requirements: RfqRequirements | None = None
 
 
 class ProcurementSuggestionRejection(StrictModel):
