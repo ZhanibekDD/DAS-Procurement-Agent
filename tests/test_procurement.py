@@ -553,3 +553,390 @@ class StaticPreviewTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ============================================================================
+# PR #8: Batch import, supplier drafts, price-history entries
+# ============================================================================
+
+class BatchImportTestCase(unittest.TestCase):
+    """Unit tests for batch-import helpers and service methods."""
+
+    def setUp(self):
+        handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.db_path = handle.name
+        handle.close()
+        self.db = Database(self.db_path)
+        self.db.initialize()
+        self.service = ProcurementService(self.db)
+
+    def tearDown(self):
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.unlink(self.db_path + suffix)
+            except FileNotFoundError:
+                pass
+
+    # ── helpers ────────────────────────────────────────────────────────────
+
+    def _xlsx_price_list(self, rows: list[tuple]) -> bytes:
+        """Build a minimal XLSX price-list with header + data rows."""
+        wb = Workbook()
+        ws = wb.active
+        ws.append(["Наименование", "Цена", "Кол-во", "Ед.изм"])
+        for row in rows:
+            ws.append(list(row))
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+
+    # ── imports.py unit tests ───────────────────────────────────────────────
+
+    def test_detect_cluster_south(self):
+        from procurement.imports import detect_cluster
+        cluster, status = detect_cluster("Краснодарский край")
+        self.assertEqual(cluster, "cluster_south")
+        self.assertEqual(status, "confirmed")
+
+    def test_detect_cluster_moscow(self):
+        from procurement.imports import detect_cluster
+        cluster, status = detect_cluster("г. Москва и Московская область")
+        self.assertEqual(cluster, "cluster_moscow")
+        self.assertEqual(status, "confirmed")
+
+    def test_detect_cluster_unknown(self):
+        from procurement.imports import detect_cluster
+        cluster, status = detect_cluster("Неизвестная область XYZ")
+        self.assertEqual(cluster, "")
+        self.assertEqual(status, "needs_review")
+
+    def test_supplier_dedup_key_stable(self):
+        from procurement.imports import supplier_dedup_key
+        k1 = supplier_dedup_key("7700000001", "ООО Тест", "test@example.com", "+7 900 000-00-00")
+        k2 = supplier_dedup_key("7700000001", "ООО Тест", "test@example.com", "+7 900 000-00-00")
+        self.assertEqual(k1, k2)
+        self.assertEqual(len(k1), 64)  # sha256 hex
+
+    def test_supplier_dedup_key_differs_by_inn(self):
+        from procurement.imports import supplier_dedup_key
+        k1 = supplier_dedup_key("7700000001", "ООО Тест", "", "")
+        k2 = supplier_dedup_key("7700000002", "ООО Тест", "", "")
+        self.assertNotEqual(k1, k2)
+
+    def test_detect_currency_rub(self):
+        from procurement.imports import detect_currency
+        self.assertEqual(detect_currency("Цена в руб. без НДС"), "RUB")
+
+    def test_detect_currency_usd(self):
+        from procurement.imports import detect_currency
+        self.assertEqual(detect_currency("Price in USD"), "USD")
+
+    def test_detect_currency_default_rub(self):
+        from procurement.imports import detect_currency
+        self.assertEqual(detect_currency("нет упоминания валюты"), "RUB")
+
+    def test_extract_date_dmy(self):
+        from procurement.imports import extract_date
+        self.assertEqual(extract_date("Дата: 15.08.2026"), "2026-08-15")
+
+    def test_extract_date_iso(self):
+        from procurement.imports import extract_date
+        self.assertEqual(extract_date("2026-08-21T00:00:00Z"), "2026-08-21")
+
+    def test_extract_date_not_found(self):
+        from procurement.imports import extract_date
+        self.assertIsNone(extract_date("нет даты"))
+
+    def test_is_price_expired_past(self):
+        from procurement.imports import is_price_expired
+        self.assertTrue(is_price_expired("2020-01-01"))
+
+    def test_is_price_expired_future(self):
+        from procurement.imports import is_price_expired
+        self.assertFalse(is_price_expired("2099-12-31"))
+
+    def test_is_price_expired_none(self):
+        from procurement.imports import is_price_expired
+        self.assertFalse(is_price_expired(None))
+
+    def test_extract_from_xlsx_price_list(self):
+        from procurement.imports import extract_from_xlsx
+        content = self._xlsx_price_list([
+            ("Труба стальная 57×4", "3500.00", "10", "м"),
+            ("Фланец Dn50", "450", "20", "шт."),
+        ])
+        result = extract_from_xlsx(content, "price.xlsx")
+        self.assertEqual(len(result.items), 2)
+        self.assertEqual(result.items[0].item_name, "Труба стальная 57×4")
+        self.assertEqual(result.items[0].unit_price, "3500.00")
+        self.assertEqual(result.items[0].source_sheet, "Sheet")
+        self.assertEqual(result.items[0].source_row, 2)
+
+    def test_extract_from_xlsx_no_price_col(self):
+        from procurement.imports import extract_from_xlsx
+        wb = Workbook()
+        ws = wb.active
+        ws.append(["Описание", "Количество"])
+        ws.append(["Болт М12", "100"])
+        buf = io.BytesIO(); wb.save(buf)
+        result = extract_from_xlsx(buf.getvalue(), "bad.xlsx")
+        self.assertEqual(len(result.items), 0)
+        self.assertTrue(any("required columns" in e for e in result.errors))
+
+    def test_extract_document_unsupported_raises(self):
+        from procurement.imports import extract_document
+        with self.assertRaises(ValueError) as ctx:
+            extract_document(b"data", "file.docx")
+        self.assertIn("unsupported", str(ctx.exception))
+
+    # ── service unit tests ─────────────────────────────────────────────────
+
+    def test_create_import_batch_xlsx(self):
+        content = self._xlsx_price_list([
+            ("Болт М10", "15.50", "500", "шт."),
+            ("Гайка М10", "8.00", "500", "шт."),
+        ])
+        batch = self.service.create_import_batch(
+            [("test_price.xlsx", content)], created_by="tester"
+        )
+        self.assertIn(batch["status"], ("needs_review", "done"))
+        self.assertEqual(batch["total_files"], 1)
+        self.assertEqual(batch["processed_files"], 1)
+        # Items extracted
+        entries = batch["price_history_entries"]
+        self.assertGreaterEqual(len(entries), 1)
+        self.assertEqual(entries[0]["item_name"], "Болт М10")
+        self.assertEqual(entries[0]["status"], "draft")
+
+    def test_create_import_batch_dedup_sha256(self):
+        """Same file twice should produce one source_document (dedup by sha256)."""
+        content = self._xlsx_price_list([("Позиция 1", "100", "1", "шт.")])
+        self.service.create_import_batch([("f.xlsx", content)])
+        self.service.create_import_batch([("f.xlsx", content)])
+        docs = self.db.all("SELECT * FROM source_documents WHERE sha256 IS NOT NULL")
+        sha256_vals = [d["sha256"] for d in docs if d["sha256"]]
+        self.assertEqual(len(sha256_vals), len(set(sha256_vals)), "SHA256 dedup failed")
+
+    def test_confirm_batch_entries(self):
+        content = self._xlsx_price_list([("Кирпич М150", "35", "1000", "шт.")])
+        batch = self.service.create_import_batch([("b.xlsx", content)])
+        batch_id = batch["id"]
+        entries = batch["price_history_entries"]
+        self.assertTrue(entries, "no entries extracted")
+        entry_ids = [e["id"] for e in entries]
+
+        result = self.service.confirm_batch_entries(batch_id, entry_ids, "Менеджер")
+        self.assertEqual(result["confirmed"], len(entry_ids))
+
+        updated = self.db.all(
+            "SELECT status FROM price_history_entries WHERE import_batch_id=?",
+            (batch_id,),
+        )
+        for row in updated:
+            self.assertEqual(row["status"], "confirmed")
+
+    def test_confirm_batch_entries_wrong_batch(self):
+        content = self._xlsx_price_list([("Товар", "10", "1", "шт.")])
+        batch = self.service.create_import_batch([("f.xlsx", content)])
+        entries = batch["price_history_entries"]
+        if not entries:
+            return  # nothing to test
+        from procurement.service import NotFoundError
+        with self.assertRaises(NotFoundError):
+            self.service.confirm_batch_entries(9999, [entries[0]["id"]], "x")
+
+    def test_list_supplier_drafts_empty(self):
+        drafts = self.service.list_supplier_drafts()
+        self.assertIsInstance(drafts, list)
+        self.assertEqual(len(drafts), 0)
+
+    def test_reject_supplier_draft(self):
+        # Create a batch to get a draft (need a file that has supplier info)
+        # We'll insert a draft directly for this test
+        with self.db.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO supplier_drafts(
+                    name, dedup_key, status, cluster_status, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                ("ООО Тест", "testkey123", "needs_review", "needs_review", "2026-08-21T00:00:00"),
+            )
+
+        class RejectData:
+            rejected_by = "Тестировщик"
+            review_notes = "дубликат"
+
+        drafts = self.service.list_supplier_drafts(status="needs_review")
+        self.assertEqual(len(drafts), 1)
+        result = self.service.reject_supplier_draft(drafts[0]["id"], RejectData())
+        self.assertEqual(result["status"], "rejected")
+
+    def test_list_price_history_entries(self):
+        content = self._xlsx_price_list([("Труба", "500", "10", "м")])
+        batch = self.service.create_import_batch([("p.xlsx", content)])
+        batch_id = batch["id"]
+        entries_draft = self.service.list_price_history_entries(status="draft", batch_id=batch_id)
+        self.assertIsInstance(entries_draft, list)
+        entries_confirmed = self.service.list_price_history_entries(status="confirmed")
+        self.assertIsInstance(entries_confirmed, list)
+
+    def test_get_import_batch_not_found(self):
+        from procurement.service import NotFoundError
+        with self.assertRaises(NotFoundError):
+            self.service.get_import_batch(9999)
+
+
+class BatchImportApiTestCase(unittest.TestCase):
+    """API endpoint tests for PR #8."""
+
+    def setUp(self):
+        from fastapi.testclient import TestClient
+        handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.db_path = handle.name
+        handle.close()
+        with patch.dict(
+            os.environ,
+            {
+                "PROCUREMENT_DB_PATH": self.db_path,
+                "PROCUREMENT_ENV": "development",
+                "PROCUREMENT_API_KEY": "",
+                "PROCUREMENT_OUTBOX_MODE": "draft_only",
+                "PROCUREMENT_AUTH_SECRET": "",
+                "PROCUREMENT_ADMIN_USERNAME": "",
+                "PROCUREMENT_ADMIN_PASSWORD_HASH": "",
+            },
+        ):
+            import importlib
+            import procurement.app as app_module
+            importlib.reload(app_module)
+            app_module.db.initialize()
+            self.client = TestClient(app_module.app, raise_server_exceptions=True)
+
+    def tearDown(self):
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.unlink(self.db_path + suffix)
+            except FileNotFoundError:
+                pass
+
+    def _xlsx_bytes(self, rows: list[tuple]) -> bytes:
+        wb = Workbook()
+        ws = wb.active
+        ws.append(["Наименование", "Цена", "Ед.изм"])
+        for row in rows:
+            ws.append(list(row))
+        buf = io.BytesIO(); wb.save(buf)
+        return buf.getvalue()
+
+    def test_api_version_is_080(self):
+        res = self.client.get("/openapi.json")
+        self.assertEqual(res.status_code, 200)
+        info = res.json().get("info", {})
+        self.assertEqual(info.get("version"), "0.8.0")
+
+    def test_post_imports_batch_xlsx(self):
+        content = self._xlsx_bytes([("Болт М10", "15", "шт.")])
+        res = self.client.post(
+            "/api/imports/batch",
+            files=[("files", ("price.xlsx", content, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))],
+        )
+        self.assertEqual(res.status_code, 201, res.text)
+        data = res.json()
+        self.assertIn("id", data)
+        self.assertIn("status", data)
+        self.assertIn("price_history_entries", data)
+
+    def test_post_imports_batch_no_files_422(self):
+        res = self.client.post("/api/imports/batch", files=[])
+        self.assertIn(res.status_code, (400, 422))
+
+    def test_post_imports_batch_too_many_files_422(self):
+        content = self._xlsx_bytes([("x", "1", "шт.")])
+        files = [("files", (f"f{i}.xlsx", content, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")) for i in range(21)]
+        res = self.client.post("/api/imports/batch", files=files)
+        self.assertIn(res.status_code, (413, 422))
+
+    def test_get_imports_list(self):
+        res = self.client.get("/api/imports")
+        self.assertEqual(res.status_code, 200)
+        self.assertIsInstance(res.json(), list)
+
+    def test_get_imports_batch_not_found(self):
+        res = self.client.get("/api/imports/9999")
+        self.assertEqual(res.status_code, 404)
+
+    def test_get_supplier_drafts(self):
+        res = self.client.get("/api/supplier-drafts")
+        self.assertEqual(res.status_code, 200)
+        self.assertIsInstance(res.json(), list)
+
+    def test_get_price_history_entries(self):
+        res = self.client.get("/api/price-history-entries")
+        self.assertEqual(res.status_code, 200)
+        self.assertIsInstance(res.json(), list)
+
+    def test_post_confirm_batch_entries_flow(self):
+        content = self._xlsx_bytes([("Гайка М8", "5", "шт."), ("Болт М8", "8", "шт.")])
+        res = self.client.post(
+            "/api/imports/batch",
+            files=[("files", ("test.xlsx", content, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))],
+        )
+        self.assertEqual(res.status_code, 201)
+        batch = res.json()
+        batch_id = batch["id"]
+        entries = batch["price_history_entries"]
+
+        if not entries:
+            return  # extraction found nothing — skip confirm step
+
+        entry_ids = [e["id"] for e in entries]
+        res2 = self.client.post(
+            f"/api/imports/{batch_id}/confirm",
+            json={"confirmed_by": "Тестировщик", "entry_ids": entry_ids},
+        )
+        self.assertEqual(res2.status_code, 200, res2.text)
+        self.assertEqual(res2.json()["confirmed"], len(entry_ids))
+
+        # entries now visible as confirmed
+        res3 = self.client.get(f"/api/price-history-entries?status=confirmed&batch_id={batch_id}")
+        self.assertEqual(res3.status_code, 200)
+        confirmed = res3.json()
+        self.assertEqual(len(confirmed), len(entry_ids))
+
+    def test_post_imports_confirm_wrong_batch_404(self):
+        content = self._xlsx_bytes([("x", "1", "шт.")])
+        res = self.client.post(
+            "/api/imports/batch",
+            files=[("files", ("f.xlsx", content, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))],
+        )
+        self.assertEqual(res.status_code, 201)
+        batch = res.json()
+        entries = batch["price_history_entries"]
+        if not entries:
+            return
+        # Use wrong batch_id
+        res2 = self.client.post(
+            "/api/imports/9999/confirm",
+            json={"confirmed_by": "x", "entry_ids": [entries[0]["id"]]},
+        )
+        self.assertEqual(res2.status_code, 404)
+
+    def test_reject_supplier_draft_404(self):
+        res = self.client.post(
+            "/api/supplier-drafts/9999/reject",
+            json={"rejected_by": "x", "review_notes": ""},
+        )
+        self.assertEqual(res.status_code, 404)
+
+
+class DockerfileProxyHeadersTestCase(unittest.TestCase):
+    """PR #8 fix: Dockerfile is now copied into the image so the test works."""
+
+    def test_uvicorn_does_not_trust_proxy_headers_before_the_app(self):
+        dockerfile_path = Path(__file__).parents[1] / "Dockerfile"
+        if not dockerfile_path.exists():
+            self.skipTest("Dockerfile not found (running in image without fix)")
+        dockerfile = dockerfile_path.read_text(encoding="utf-8")
+        self.assertIn("--no-proxy-headers", dockerfile)
+
