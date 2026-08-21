@@ -129,37 +129,37 @@ from datetime import date as _date
 # ---------------------------------------------------------------------------
 # Cluster detection by region keyword
 # ---------------------------------------------------------------------------
-_REGION_CLUSTER: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r'краснодар|ростов|ставропол|адыге|калмык', re.I), 'cluster_south'),
-    (re.compile(r'москв|подмосков|московск', re.I), 'cluster_moscow'),
-    (re.compile(r'санкт.петербург|ленинград|питер', re.I), 'cluster_spb'),
-    (re.compile(r'екатеринбург|свердлов|урал', re.I), 'cluster_ural'),
-    (re.compile(r'новосибирск|томск|омск|кемеров|алтай', re.I), 'cluster_siberia'),
-    (re.compile(r'красноярск|иркутск|якут|бурят', re.I), 'cluster_east_siberia'),
-    (re.compile(r'владивосток|хабаровск|приморск|сахалин', re.I), 'cluster_far_east'),
-    (re.compile(r'казань|татарстан|башкортостан|самар|уфа|пермь', re.I), 'cluster_volga'),
-    (re.compile(r'воронеж|белгород|курск|орёл|орел|липецк|тамбов', re.I), 'cluster_central_black'),
-]
-
-
 def detect_cluster(region: str) -> tuple[str, str]:
-    """Return (cluster, cluster_status) for a region string."""
-    for pattern, cluster in _REGION_CLUSTER:
-        if pattern.search(region):
-            return cluster, 'confirmed'
-    return '', 'needs_review'
+    """Return (cluster, cluster_status) for a region string.
+
+    Delegates to regions.py as the single source of truth.
+    Only 'cluster_1' / 'cluster_2' are valid output values.
+    Unknown regions return ('', 'needs_review') — no guessing.
+    """
+    from .regions import infer_cluster as _infer_cluster
+    cluster = _infer_cluster(region)
+    return cluster, ('confirmed' if cluster else 'needs_review')
 
 
 # ---------------------------------------------------------------------------
 # Deduplication key
 # ---------------------------------------------------------------------------
 def supplier_dedup_key(tax_id: str, name: str, email: str, phone: str) -> str:
-    raw = '|'.join([
-        tax_id.strip(),
-        re.sub(r'[^а-яa-z0-9]+', ' ', name.casefold()).strip(),
-        email.casefold().strip(),
-        re.sub(r'[^0-9]', '', phone),
-    ])
+    """Stable deduplication key.
+
+    If a valid ИНН is provided the key is INN-only: changing email / phone
+    does NOT create a new supplier (contact updates trigger review, not
+    a duplicate entry).
+
+    Without ИНН: normalized name + first available contact.
+    """
+    normalized_inn = re.sub(r'[^0-9]', '', tax_id)
+    if normalized_inn:
+        raw = normalized_inn
+    else:
+        normalized_name = re.sub(r'[^а-яa-z0-9]+', ' ', name.casefold()).strip()
+        contact = email.casefold().strip() or re.sub(r'[^0-9]', '', phone)
+        raw = normalized_name + '|' + contact
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
@@ -206,7 +206,25 @@ def extract_date(text: str) -> str | None:
         return None
 
 
+def price_validity_state(valid_until: str | None) -> str:
+    """Tristate validity for a price entry.
+
+    * 'active'  — valid_until is today or in the future; may be used as current price
+    * 'expired' — valid_until is in the past
+    * 'unknown' — valid_until is None or unparseable; NOT treated as active
+    """
+    if not valid_until:
+        return 'unknown'
+    try:
+        if _date.fromisoformat(valid_until) >= _date.today():
+            return 'active'
+        return 'expired'
+    except ValueError:
+        return 'unknown'
+
+
 def is_price_expired(valid_until: str | None) -> bool:
+    """Legacy helper kept for backward-compat tests. Use price_validity_state instead."""
     if not valid_until:
         return False
     try:

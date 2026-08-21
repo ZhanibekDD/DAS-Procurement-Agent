@@ -271,7 +271,7 @@ CREATE TABLE IF NOT EXISTS price_history_entries (
     vat_included       INTEGER NOT NULL DEFAULT 1,
     document_date      TEXT,
     valid_until        TEXT,
-    is_expired         INTEGER NOT NULL DEFAULT 0,
+    validity_state     TEXT    NOT NULL DEFAULT 'unknown',
     source_page        INTEGER,
     source_sheet       TEXT    NOT NULL DEFAULT '',
     source_row         INTEGER,

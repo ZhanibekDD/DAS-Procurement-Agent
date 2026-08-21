@@ -594,15 +594,17 @@ class BatchImportTestCase(unittest.TestCase):
 
     def test_detect_cluster_south(self):
         from procurement.imports import detect_cluster
+        # Краснодарский край → cluster_2 (same cluster as production Воронежская обл.)
         cluster, status = detect_cluster("Краснодарский край")
-        self.assertEqual(cluster, "cluster_south")
+        self.assertEqual(cluster, "cluster_2")
         self.assertEqual(status, "confirmed")
 
     def test_detect_cluster_moscow(self):
         from procurement.imports import detect_cluster
+        # Moscow is not mapped to any cluster → needs_review (no guessing)
         cluster, status = detect_cluster("г. Москва и Московская область")
-        self.assertEqual(cluster, "cluster_moscow")
-        self.assertEqual(status, "confirmed")
+        self.assertEqual(cluster, "")
+        self.assertEqual(status, "needs_review")
 
     def test_detect_cluster_unknown(self):
         from procurement.imports import detect_cluster
@@ -785,6 +787,113 @@ class BatchImportTestCase(unittest.TestCase):
         from procurement.service import NotFoundError
         with self.assertRaises(NotFoundError):
             self.service.get_import_batch(9999)
+
+
+    # ── New tests for PR #8 blocking-issue fix ─────────────────────────────
+
+    def test_voronezh_infers_cluster_2(self):
+        """Воронежская область (production project region) → cluster_2."""
+        from procurement.regions import infer_cluster
+        self.assertEqual(infer_cluster("Воронежская область"), "cluster_2")
+
+    def test_krasnodar_infers_cluster_2(self):
+        """Краснодарский край must be in cluster_2 per spec."""
+        from procurement.regions import infer_cluster
+        self.assertEqual(infer_cluster("Краснодарский край"), "cluster_2")
+
+    def test_unknown_region_needs_review(self):
+        """Completely unknown region → empty cluster + needs_review."""
+        from procurement.imports import detect_cluster
+        cluster, status = detect_cluster("Неизвестная Республика XYZ-999")
+        self.assertEqual(cluster, "")
+        self.assertEqual(status, "needs_review")
+
+    def test_supplier_cluster_scoped_match(self):
+        """Supplier of lot's cluster appears in matches; foreign cluster excluded."""
+        sup1 = self.service.create_supplier(
+            SupplierCreate(
+                name="ООО Южный",
+                region="Краснодарский край",
+                cluster="cluster_2",
+                categories=[],
+            )
+        )
+        sup2 = self.service.create_supplier(
+            SupplierCreate(
+                name="ООО Уральский",
+                region="Свердловская область",
+                cluster="cluster_1",
+                categories=[],
+            )
+        )
+        project = self.service.create_project(
+            ProjectCreate(
+                name="Проект Юг",
+                region="Краснодарский край",
+                delivery_address="г. Краснодар, ул. Красная, 1",
+            )
+        )
+        lot = self.service.create_lot(
+            LotCreate(
+                project_id=project["id"],
+                title="Труба стальная",
+                region="Краснодарский край",
+                cluster="cluster_2",
+                delivery_address="г. Краснодар, ул. Красная, 1",
+                response_deadline=date.today() + timedelta(days=7),
+                items=[
+                    LotItemCreate(
+                        name="Труба 57x4",
+                        quantity=Decimal("100"),
+                        unit="м",
+                    )
+                ],
+            )
+        )
+        matches = self.service.match_suppliers(lot["id"])
+        match_ids = [m["id"] for m in matches]
+        self.assertIn(sup1["id"], match_ids, "cluster_2 supplier must appear in matches")
+        self.assertNotIn(sup2["id"], match_ids, "cluster_1 supplier must be excluded")
+
+    def test_same_inn_different_contact_no_duplicate_key(self):
+        """INN-primary dedup: same INN + different email/phone → same dedup key."""
+        from procurement.imports import supplier_dedup_key
+        k1 = supplier_dedup_key("7700000001", "ООО Тест", "old@example.com", "+7 900 000-00-01")
+        k2 = supplier_dedup_key("7700000001", "ООО Тест", "new@example.com", "+7 900 000-00-02")
+        self.assertEqual(k1, k2, "Same INN must produce same dedup key regardless of contact")
+
+    def test_reimport_same_sha256_no_new_entries(self):
+        """Re-importing the same file must not create new price_history_entries."""
+        content = self._xlsx_price_list([("Болт М8", "10.00", "100", "шт.")])
+        self.service.create_import_batch([("same.xlsx", content)])
+        self.service.create_import_batch([("same.xlsx", content)])
+        rows = self.db.all("SELECT COUNT(*) AS n FROM price_history_entries")
+        self.assertEqual(rows[0]["n"], 1, "Second SHA256 import must not add entries")
+
+    def test_reimport_same_sha256_no_new_source_doc(self):
+        """Re-importing the same file must not create a second source_document row."""
+        content = self._xlsx_price_list([("Гайка М8", "5.00", "200", "шт.")])
+        self.service.create_import_batch([("f.xlsx", content)])
+        self.service.create_import_batch([("f.xlsx", content)])
+        docs = self.db.all("SELECT sha256 FROM source_documents WHERE sha256 IS NOT NULL")
+        sha256_vals = [d["sha256"] for d in docs]
+        self.assertEqual(
+            len(sha256_vals), len(set(sha256_vals)),
+            "SHA256 dedup failed — duplicate source_documents found",
+        )
+
+    def test_price_validity_state_none_is_unknown(self):
+        """valid_until=None must yield 'unknown', NOT treated as active."""
+        from procurement.imports import price_validity_state
+        self.assertEqual(price_validity_state(None), "unknown")
+
+    def test_price_validity_state_past_is_expired(self):
+        from procurement.imports import price_validity_state
+        self.assertEqual(price_validity_state("2020-01-01"), "expired")
+
+    def test_price_validity_state_future_is_active(self):
+        from procurement.imports import price_validity_state
+        self.assertEqual(price_validity_state("2099-12-31"), "active")
 
 
 class BatchImportApiTestCase(unittest.TestCase):

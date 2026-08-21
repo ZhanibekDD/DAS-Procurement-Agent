@@ -1304,7 +1304,7 @@ class ProcurementService:
             extract_document,
             detect_cluster,
             supplier_dedup_key,
-            is_price_expired,
+            price_validity_state,
         )
         from datetime import date
 
@@ -1432,48 +1432,65 @@ class ProcurementService:
                             )
                             draft_id = c.lastrowid
 
-                # Store price history entries
-                for item in result.items:
-                    expired = is_price_expired(result.valid_until)
-                    with self.db.connection() as conn:
-                        conn.execute(
-                            """
+                # Store price history entries — skip if already imported (SHA256 dedup)
+                existing_entry_count = self.db.one(
+                    "SELECT COUNT(*) AS n FROM price_history_entries"
+                    " WHERE source_document_id = ?",
+                    (doc_id,),
+                )
+                entries_already_exist = (
+                    existing_entry_count and existing_entry_count["n"] > 0
+                )
+                if entries_already_exist:
+                    # Re-import: reuse existing entries, no duplicates
+                    existing_for_doc = self.db.all(
+                        "SELECT item_name, unit_price FROM price_history_entries"
+                        " WHERE source_document_id = ?",
+                        (doc_id,),
+                    )
+                    all_items.extend(existing_for_doc)
+                else:
+                    v_state = price_validity_state(result.valid_until)
+                    for item in result.items:
+                        with self.db.connection() as conn:
+                            conn.execute(
+                                """
                             INSERT INTO price_history_entries(
                                 import_batch_id, source_document_id, supplier_draft_id,
                                 item_name, brand, normalized_name,
                                 quantity, unit, unit_price, total_price,
                                 currency, vat_included,
-                                document_date, valid_until, is_expired,
+                                document_date, valid_until, validity_state,
                                 source_page, source_sheet, source_row, source_cell, source_text,
                                 status, created_at
                             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """,
-                            (
-                                batch_id,
-                                doc_id,
-                                draft_id,
-                                item.item_name,
-                                item.brand,
-                                item.normalized_name,
-                                item.quantity,
-                                item.unit,
-                                item.unit_price,
-                                item.total_price,
-                                item.currency,
-                                int(item.vat_included),
-                                result.document_date,
-                                result.valid_until,
-                                int(expired),
-                                item.source_page,
-                                item.source_sheet,
-                                item.source_row,
-                                item.source_cell,
-                                item.source_text,
-                                "draft",
-                                utcnow(),
-                            ),
-                        )
-                    all_items.append({"item_name": item.item_name, "unit_price": item.unit_price})
+                                """,
+                                (
+                                    batch_id,
+                                    doc_id,
+                                    draft_id,
+                                    item.item_name,
+                                    item.brand,
+                                    item.normalized_name,
+                                    item.quantity,
+                                    item.unit,
+                                    item.unit_price,
+                                    item.total_price,
+                                    item.currency,
+                                    int(item.vat_included),
+                                    result.document_date,
+                                    result.valid_until,
+                                    v_state,
+                                    item.source_page,
+                                    item.source_sheet,
+                                    item.source_row,
+                                    item.source_cell,
+                                    item.source_text,
+                                    "draft",
+                                    utcnow(),
+                                ),
+                            )
+                        all_items.append({"item_name": item.item_name, "unit_price": item.unit_price})
 
                 if result.errors:
                     errors.extend(f"{filename}: {e}" for e in result.errors)
