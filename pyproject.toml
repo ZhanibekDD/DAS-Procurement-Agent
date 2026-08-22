@@ -14,6 +14,7 @@ dependencies = [
   "python-multipart>=0.0.9,<1",
   "openpyxl>=3.1,<4",
   "pypdf>=6,<7",
+  "pdfplumber>=0.11,<1",
 ]
 
 [project.optional-dependencies]

@@ -238,7 +238,7 @@ def is_price_expired(valid_until: str | None) -> bool:
 # ---------------------------------------------------------------------------
 _PRICE_COL_NAMES: set[str] = {
     'price', 'цена', 'стоимость', 'цена с ндс', 'цена без ндс',
-    'прайс', 'ед', 'за ед', 'unit price', 'unit_price', 'цена ед', 'цена/ед',
+    'прайс', 'за ед', 'unit price', 'unit_price', 'цена ед', 'цена/ед',
 }
 _NAME_COL_NAMES: set[str] = {
     'наименование', 'название', 'товар', 'позиция', 'item', 'name', 'description',
@@ -343,12 +343,122 @@ def _extract_pdf_text(content: bytes) -> tuple[list[str], list[str]]:
         return [], [f'PDF parse error: {exc}']
 
 
+def _extract_items_from_pdf_tables(
+    content: bytes, currency: str, vat_included: bool
+) -> tuple[list[ExtractedItem], bool]:
+    """Returns (items, has_structured_tables).
+    has_structured_tables=True means pdfplumber found at least one table,
+    even if no price column was present.  Caller uses this to suppress the
+    text-regex fallback for structural docs (engineering specs, drawings).
+    """
+    """Primary PDF item extractor — uses pdfplumber structured table API.
+
+    Extracts rows only from tables that have a recognisable header with both
+    a name column (_NAME_COL_NAMES) and a price column (_PRICE_COL_NAMES).
+    Engineering specs (Масса ед., кг — no price column) correctly return [].
+    Falls back silently to [] if pdfplumber is not installed.
+    """
+    items: list[ExtractedItem] = []
+    has_tables = False  # True once pdfplumber finds any non-trivial table
+    try:
+        import pdfplumber
+        import io as _io_plumb
+        with pdfplumber.open(_io_plumb.BytesIO(content)) as pdf:
+            for page_num, page in enumerate(pdf.pages, start=1):
+                tables = page.extract_tables()
+                for table in tables:
+                    if not table or len(table) < 2:
+                        continue
+                    has_tables = True  # at least one real table found
+                    # Search first 3 rows for a header row with name + price cols
+                    name_col = qty_col = price_col = unit_col = None
+                    header_row_idx = None
+                    for ri, row in enumerate(table[:3]):
+                        if row is None:
+                            continue
+                        headers = [str(c or '').strip() for c in row]
+                        nc = _col_index(headers, _NAME_COL_NAMES)
+                        pc = _col_index(headers, _PRICE_COL_NAMES)
+                        qc = _col_index(headers, _QTY_COL_NAMES)
+                        uc = _col_index(headers, _UNIT_COL_NAMES)
+                        if nc is not None and pc is not None:
+                            name_col, price_col = nc, pc
+                            qty_col, unit_col = qc, uc
+                            header_row_idx = ri
+                            break
+                    if header_row_idx is None:
+                        continue  # no recognised price-table header
+                    for row_num, row in enumerate(
+                        table[header_row_idx + 1:], start=header_row_idx + 2
+                    ):
+                        if row is None:
+                            continue
+                        raw_name = (
+                            str(row[name_col] or '').strip()
+                            if name_col < len(row) else ''
+                        )
+                        raw_price = (
+                            str(row[price_col] or '').strip()
+                            if price_col < len(row) else ''
+                        )
+                        if not raw_name or not raw_price:
+                            continue
+                        # Skip numbering rows (e.g. "1 2 3 4 5 6 7" row in Russian invoices)
+                        if raw_name.isdigit():
+                            continue
+                        # Normalise price — remove thousands separators, convert comma to dot
+                        price_clean = (
+                            raw_price
+                            .replace(' ', '')
+                            .replace(' ', '')
+                            .replace(' ', '')
+                            .replace(',', '.')
+                        )
+                        try:
+                            float(price_clean)
+                        except ValueError:
+                            continue  # not a parseable decimal — skip row
+                        raw_qty = ''
+                        if qty_col is not None and qty_col < len(row):
+                            raw_qty = str(row[qty_col] or '').strip()
+                        raw_unit = 'шт.'  # шт.
+                        if unit_col is not None and unit_col < len(row):
+                            u = str(row[unit_col] or '').strip()
+                            if u:
+                                raw_unit = u
+                        item_name = raw_name.replace(chr(10), ' ').strip()[:200]
+                        norm = re.sub(r'[^а-яa-z0-9 ]+', ' ', item_name.casefold()).strip()
+                        source_text = ' | '.join(str(c or '') for c in row if c)[:300]
+                        items.append(ExtractedItem(
+                            item_name=item_name,
+                            normalized_name=norm,
+                            brand='',
+                            quantity=raw_qty,
+                            unit=raw_unit,
+                            unit_price=price_clean,
+                            total_price='',
+                            currency=currency,
+                            vat_included=vat_included,
+                            source_page=page_num,
+                            source_sheet='',
+                            source_row=row_num,
+                            source_cell='',
+                            source_text=source_text,
+                        ))
+    except ImportError:
+        pass  # pdfplumber not available — caller falls back to text method
+    return items, has_tables
+
+
 def _extract_items_from_pdf_text(
     pages: list[str], currency: str, vat_included: bool
 ) -> list[ExtractedItem]:
+    """Fallback PDF extractor — line-by-line regex for unstructured text PDFs."""
     items: list[ExtractedItem] = []
-    # Heuristic: lines with item name + qty + price at end
-    price_re = re.compile(r'^(.{5,80?})\s+(\d[\d\s.,]{0,14})\s+(\d[\d\s.,]*[.,]\d{2})\s*$')
+    # Matches: <name 5-80 chars> <qty digits> <price with 2 decimal places>
+    price_re = re.compile(
+        r'^(.{5,80})\s+(\d[\d\s.,]{0,14})\s+(\d[\d\s.,]*[.,]\d{2})\s*$'
+    )
     for page_num, text in enumerate(pages, start=1):
         for row_num, line in enumerate(text.splitlines(), start=1):
             line = line.strip()
@@ -359,7 +469,12 @@ def _extract_items_from_pdf_text(
                 continue
             name_raw = m.group(1).strip()
             qty_raw = m.group(2).strip()
-            price_raw = m.group(3).replace('\xa0', '').replace(' ', '')
+            price_raw = (
+                m.group(3)
+                .replace(' ', '')
+                .replace(' ', '')
+                .replace(',', '.')
+            )
             norm = re.sub(r'[^а-яa-z0-9 ]+', ' ', name_raw.casefold()).strip()
             items.append(ExtractedItem(
                 item_name=name_raw,
@@ -406,7 +521,13 @@ def extract_from_pdf(content: bytes, filename: str) -> DocumentExtractResult:
     org_m = _ORG_RE.search(header_text)
     supplier_name = org_m.group(0).strip()[:120] if org_m else ''
 
-    items = _extract_items_from_pdf_text(pages, currency, vat_included)
+    # Primary: structured table extraction (pdfplumber) — handles invoices, КП, price-lists
+    items, _has_tables = _extract_items_from_pdf_tables(content, currency, vat_included)
+    # Fallback: line-by-line regex — ONLY for PDFs with no tables at all.
+    # If pdfplumber found tables but no price column → structural doc (engineering specs,
+    # drawings) → return 0 items; do NOT mine masses/quantities as fake prices.
+    if not items and not _has_tables:
+        items = _extract_items_from_pdf_text(pages, currency, vat_included)
 
     return DocumentExtractResult(
         filename=filename,
