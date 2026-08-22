@@ -68,6 +68,7 @@
       <button data-view="pricebook"><svg class="icon"><use href="#i-price"/></svg>Память цен</button>
       <button data-view="documents"><svg class="icon"><use href="#i-docs"/></svg>Документы</button>
       <button data-view="templates"><svg class="icon"><use href="#i-templates"/></svg>Шаблоны</button>
+      <button data-view="archive"><svg class="icon"><use href="#i-docs"/></svg>Архив КП</button>
       <div class="nav-label">Дополнительные контуры</div>
       <button data-view="services"><svg class="icon"><use href="#i-box"/></svg>Услуги</button>
       <button data-view="certificates"><svg class="icon"><use href="#i-shield"/></svg>Сертификаты</button>
@@ -76,23 +77,23 @@
   </aside>
   <main>
     <header class="topbar"><div><div class="eyebrow">Закупки под контролем</div><h1 id="pageTitle">Центр снабжения</h1><p id="pageSubtitle">От заявки до проверяемого решения комиссии.</p></div><div class="top-actions"><button class="btn secondary" id="refreshBtn"><svg class="icon"><use href="#i-refresh"/></svg>Обновить</button><button class="btn" data-open="lot"><svg class="icon"><use href="#i-plus"/></svg>Новая заявка</button></div></header>
-    <section id="overview" class="view active"></section><section id="projects" class="view"></section><section id="lots" class="view"></section><section id="tender" class="view"></section><section id="suppliers" class="view"></section><section id="rfq" class="view"></section><section id="comparison" class="view"></section><section id="pricebook" class="view"></section><section id="documents" class="view"></section><section id="templates" class="view"></section><section id="services" class="view"></section><section id="certificates" class="view"></section>
+    <section id="overview" class="view active"></section><section id="projects" class="view"></section><section id="lots" class="view"></section><section id="tender" class="view"></section><section id="suppliers" class="view"></section><section id="rfq" class="view"></section><section id="comparison" class="view"></section><section id="pricebook" class="view"></section><section id="documents" class="view"></section><section id="templates" class="view"></section><section id="services" class="view"></section><section id="certificates" class="view"></section><section id="archive" class="view"></section>
   </main>
 </div>
 <dialog id="modal"><form method="dialog"><div class="dialog-head"><h2 id="modalTitle"></h2><button class="close" value="cancel">×</button></div><div class="dialog-body" id="modalBody"></div><div class="dialog-actions"><button class="btn secondary" value="cancel">Отмена</button><button class="btn" type="button" id="modalSubmit">Сохранить</button></div></form></dialog><div class="toast" id="toast"></div>
 <script>
-const state={demo:false,view:'overview',dashboard:{},projects:[],lots:[],suppliers:[],outbox:[],documents:[],suggestions:[],templates:[],audit:[],priceHistory:[],comparison:null,matches:[],selectedLot:null,tenderLot:null,tenderMatches:[],tenderComparison:null,tenderLoading:false,documentFlow:{suggestion:null,missingFields:[],referenceCheck:null,referenceDocumentId:null,lot:null,matches:[],campaign:null,requirements:{}}};
-const pages={overview:['Центр снабжения','От заявки до проверяемого решения комиссии.'],projects:['Проекты','Объекты, разделы и история закупок.'],lots:['Заявки и лоты','Спецификации, сроки ответа и адреса доставки.'],tender:['Карточка тендера','Спецификация, поставщики, запросы и решение в одном месте.'],suppliers:['Поставщики','Проверенные контрагенты и новые кандидаты.'],rfq:['Запросы коммерческих предложений','Подбор получателей, черновики и ручное согласование.'],comparison:['Тендерное сравнение','Полная стоимость, сроки, НДС и прозрачный рейтинг.'],pricebook:['Память цен','Сравнение новых предложений с фактически оплаченными счетами.'],documents:['Документы','Проекты, счета, тендерные таблицы и коммерческие предложения.'],templates:['Шаблоны','Единые формулировки запросов для разных каналов.'],services:['Услуги','Расчёт покраски отводов и изготовления металлических изделий.'],certificates:['Сертификаты','Формирование, учёт и связь сертификатов с заказами.']};
+const state={demo:false,view:'overview',dashboard:{},projects:[],lots:[],suppliers:[],outbox:[],documents:[],suggestions:[],templates:[],audit:[],priceHistory:[],comparison:null,matches:[],selectedLot:null,tenderLot:null,tenderMatches:[],tenderComparison:null,tenderLoading:false,importBatches:[],supplierDrafts:[],priceEntries:[],documentFlow:{suggestion:null,missingFields:[],referenceCheck:null,referenceDocumentId:null,lot:null,matches:[],campaign:null,requirements:{}}};
+const pages={overview:['Центр снабжения','От заявки до проверяемого решения комиссии.'],projects:['Проекты','Объекты, разделы и история закупок.'],lots:['Заявки и лоты','Спецификации, сроки ответа и адреса доставки.'],tender:['Карточка тендера','Спецификация, поставщики, запросы и решение в одном месте.'],suppliers:['Поставщики','Проверенные контрагенты и новые кандидаты.'],rfq:['Запросы коммерческих предложений','Подбор получателей, черновики и ручное согласование.'],comparison:['Тендерное сравнение','Полная стоимость, сроки, НДС и прозрачный рейтинг.'],pricebook:['Память цен','Сравнение новых предложений с фактически оплаченными счетами.'],documents:['Документы','Проекты, счета, тендерные таблицы и коммерческие предложения.'],templates:['Шаблоны','Единые формулировки запросов для разных каналов.'],services:['Услуги','Расчёт покраски отводов и изготовления металлических изделий.'],certificates:['Сертификаты','Формирование, учёт и связь сертификатов с заказами.'],archive:['Архив КП и счетов','Пакетный импорт коммерческих предложений, черновики поставщиков и история цен.']};
 const DEMO_DATA={dashboard:{projects:3,suppliers:48,active_lots:6,draft_messages:14,received_quotes:9,historical_prices:128,pending_documents:4},projects:[{id:1,name:'ЖК Северный квартал',region:'Воронежская область',delivery_address:'г. Воронеж, ул. Загородная, 18',status:'active',created_at:'2026-08-02T09:20:00Z'},{id:2,name:'Логистический комплекс Рамонь',region:'Воронежская область',delivery_address:'Рамонский район, промзона 4',status:'active',created_at:'2026-08-05T12:00:00Z'},{id:3,name:'Реконструкция административного здания',region:'Липецкая область',delivery_address:'г. Липецк, ул. Строителей, 7',status:'draft',created_at:'2026-08-10T10:10:00Z'}],lots:[{id:1,project_id:1,project_name:'ЖК Северный квартал',title:'Окна ПВХ для секций 1–3',region:'Воронеж',delivery_address:'г. Воронеж, ул. Загородная, 18',response_deadline:'2026-08-21',desired_delivery_date:'2026-09-15',currency:'RUB',status:'quotes_received',created_at:'2026-08-12T08:00:00Z',items:[{id:11,name:'Окно ПВХ 1400×1200',quantity:'84',unit:'шт.',specification:'двухкамерный стеклопакет, белый профиль'}]},{id:2,project_id:1,project_name:'ЖК Северный квартал',title:'Кирпич керамический М150',region:'Воронеж',delivery_address:'г. Воронеж, ул. Загородная, 18',response_deadline:'2026-08-23',currency:'RUB',status:'rfq_draft',created_at:'2026-08-13T11:00:00Z',items:[{id:21,name:'Кирпич керамический М150',quantity:'120000',unit:'шт.',specification:'полнотелый'}]},{id:3,project_id:2,project_name:'Логистический комплекс Рамонь',title:'Песок строительный',region:'Воронежская область',delivery_address:'Рамонский район, промзона 4',response_deadline:'2026-08-20',currency:'RUB',status:'rfq_draft',created_at:'2026-08-14T09:30:00Z',items:[{id:31,name:'Песок строительный мытый',quantity:'450',unit:'т',specification:'модуль крупности 2.0–2.5'}]},{id:4,project_id:3,project_name:'Реконструкция административного здания',title:'Кабель силовой',region:'Липецк',delivery_address:'г. Липецк, ул. Строителей, 7',response_deadline:'2026-08-25',currency:'RUB',status:'draft',created_at:'2026-08-15T14:00:00Z',items:[{id:41,name:'Кабель ВВГнг 3×2.5',quantity:'3200',unit:'м',specification:'ГОСТ'}]}],suppliers:[{id:1,name:'Окна Регион',tax_id:'3666000001',region:'Воронеж',email:'tender@okna-region.example',phone:'+7 900 000-11-22',telegram:'',categories:['окна','фасады'],rating:4.8,verified:true,active:true,source:'existing'},{id:2,name:'Строй Комплект',tax_id:'3666000002',region:'Воронежская область',email:'sales@stroykom.example',phone:'+7 900 000-22-33',telegram:'',categories:['окна','двери','кирпич'],rating:4.4,verified:true,active:true,source:'existing'},{id:3,name:'Дон Карьер',tax_id:'3666000003',region:'Рамонь',email:'kp@don-karier.example',phone:'+7 900 000-33-44',telegram:'',categories:['песок','щебень'],rating:4.6,verified:true,active:true,source:'existing'},{id:4,name:'Вектор Снаб',tax_id:'3666000004',region:'Липецк',email:'info@vector.example',phone:'+7 900 000-44-55',telegram:'',categories:['электрика','кабель'],rating:4.1,verified:false,active:true,source:'internet_candidate'},{id:5,name:'Черноземье Строй',tax_id:'3666000005',region:'Воронеж',email:'zakupki@ch-stroy.example',phone:'+7 900 000-55-66',telegram:'',categories:['кирпич','бетон'],rating:4.3,verified:true,active:true,source:'existing'}],outbox:[{id:1,lot_id:2,lot_title:'Кирпич керамический М150',supplier_name:'Строй Комплект',channel:'email',recipient:'sales@stroykom.example',subject:'Запрос КП: кирпич М150 — ответ до 23.08.2026',status:'draft'},{id:2,lot_id:2,lot_title:'Кирпич керамический М150',supplier_name:'Черноземье Строй',channel:'email',recipient:'zakupki@ch-stroy.example',subject:'Запрос КП: кирпич М150 — ответ до 23.08.2026',status:'draft'},{id:3,lot_id:3,lot_title:'Песок строительный',supplier_name:'Дон Карьер',channel:'email',recipient:'kp@don-karier.example',subject:'Запрос КП: песок — объект Рамонь',status:'approved'}],documents:[{id:1,filename:'проект_секции_1-3.pdf',document_type:'project_section',size_bytes:2480000,sha256:'b7f850e55780f4dc92870e11bfcf55d326616173d8207fbccbb0bf5a24109336',extraction_status:'pending_ai_extraction',created_at:'2026-08-15T10:00:00Z'},{id:2,filename:'оплаченные_счета_2025.xlsx',document_type:'paid_invoice',size_bytes:186000,sha256:'50d858e0985ecc7f92ff7845fce030053b5fe2ccdd85f793256fe55397ebaa13',extraction_status:'approved',created_at:'2026-08-14T12:00:00Z'},{id:3,filename:'КП_Окна_Регион.pdf',document_type:'commercial_offer',size_bytes:920000,sha256:'335495054ea762893e7bec022f35a9d5d2259f0f3a8f5e9cf1de472b4df68cf1',extraction_status:'approved',created_at:'2026-08-14T15:30:00Z'},{id:4,filename:'тендерная_таблица_окна.xlsx',document_type:'tender_table',size_bytes:74000,sha256:'db614cb1ee79990ab26ba2c4ca47e1b0c47284486ce18c5c7ffae96b243e253b',extraction_status:'pending_ai_extraction',created_at:'2026-08-16T08:00:00Z'}],templates:[{code:'rfq-email',name:'Запрос коммерческого предложения — email',subject:'Запрос КП: {lot_title} — ответ до {response_deadline}',body:'Здравствуйте, {supplier_name}!\n\nПросим предоставить коммерческое предложение по заявке «{lot_title}».\n\nОбъект: {project_name}\nРегион: {region}\nАдрес поставки: {delivery_address}\n\nПросим указать цену с НДС, доставку, сроки и условия оплаты.',version:2},{code:'rfq-messenger',name:'Короткий запрос КП — мессенджер',subject:'Запрос КП: {lot_title}',body:'Здравствуйте! Запрашиваем КП по позиции «{lot_title}» для объекта {project_name}. Нужны цена, доставка, срок и условия оплаты.',version:1}],audit:[{id:1,action:'received',entity_type:'quote',entity_id:'9',actor:'system',created_at:'2026-08-16T09:32:00Z'},{id:2,action:'confirmed',entity_type:'purchase_history',entity_id:'128',actor:'Руководитель снабжения',created_at:'2026-08-16T09:05:00Z'},{id:3,action:'approved',entity_type:'outbox_message',entity_id:'3',actor:'Начальник отдела',created_at:'2026-08-15T17:40:00Z'},{id:4,action:'created',entity_type:'campaign',entity_id:'6',actor:'system',created_at:'2026-08-15T15:20:00Z'},{id:5,action:'uploaded',entity_type:'source_document',entity_id:'4',actor:'system',created_at:'2026-08-15T14:50:00Z'}],priceHistory:[{id:1,supplier_id:1,supplier_name:'Окна Регион',item_name:'Окно ПВХ 1400×1200',normalized_name:'окно пвх 1400 1200',quantity:'60',unit:'шт.',unit_price:'12000',currency:'RUB',region:'Воронеж',project_name:'ЖК Приозёрный',invoice_number:'СЧ-284',purchased_on:'2026-05-18',confirmed_by:'Руководитель снабжения'},{id:2,supplier_id:2,supplier_name:'Строй Комплект',item_name:'Окно ПВХ 1400×1200',normalized_name:'окно пвх 1400 1200',quantity:'42',unit:'шт.',unit_price:'12450',currency:'RUB',region:'Воронеж',project_name:'Офисный центр',invoice_number:'СК-778',purchased_on:'2026-03-11',confirmed_by:'Бухгалтерия'},{id:3,supplier_id:5,supplier_name:'Черноземье Строй',item_name:'Кирпич керамический М150',normalized_name:'кирпич керамический м150',quantity:'80000',unit:'шт.',unit_price:'34.8',currency:'RUB',region:'Воронеж',project_name:'Склад №2',invoice_number:'ЧС-1055',purchased_on:'2026-06-20',confirmed_by:'Бухгалтерия'},{id:4,supplier_id:3,supplier_name:'Дон Карьер',item_name:'Песок строительный мытый',normalized_name:'песок строительный мытый',quantity:'300',unit:'т',unit_price:'820',currency:'RUB',region:'Рамонь',project_name:'Логистический комплекс',invoice_number:'ДК-331',purchased_on:'2026-07-02',confirmed_by:'Руководитель снабжения'},{id:5,supplier_id:4,supplier_name:'Вектор Снаб',item_name:'Кабель ВВГнг 3×2.5',normalized_name:'кабель ввгнг 3 2 5',quantity:'1800',unit:'м',unit_price:'92.5',currency:'RUB',region:'Липецк',project_name:'Административное здание',invoice_number:'ВС-912',purchased_on:'2026-04-17',confirmed_by:'Бухгалтерия'}],matches:[],comparison:{lot:{id:1,title:'Окна ПВХ для секций 1–3'},price_benchmark:{matched_items:1,total_items:1},quotes:[{quote_id:1,supplier_id:1,supplier_name:'Окна Регион',supplier_rating:4.8,currency:'RUB',total_cost:1090000,lead_days:14,payment_terms:'50% аванс, 50% после поставки',compliant:true,coverage:'1/1',history_coverage:'1/1',history_variance_pct:4.2,potential_saving:42000,price_signal:'near_history',score:96.4,rank:1},{quote_id:2,supplier_id:2,supplier_name:'Строй Комплект',supplier_rating:4.4,currency:'RUB',total_cost:1075200,lead_days:25,payment_terms:'100% предоплата',compliant:true,coverage:'1/1',history_coverage:'1/1',history_variance_pct:6.7,potential_saving:67200,price_signal:'near_history',score:91.8,rank:2}],decision:'human_approval_required'}};
 const DEMO_SUGGESTIONS=[{id:101,source_document_id:1,source_filename:'проект_секции_1-3.pdf',project_id:1,project_name:'ЖК Северный квартал',section_code:'АР',section_name:'Архитектурные решения',lot_title:'Оконные и дверные блоки',confidence:.96,status:'needs_review',items:[{name:'Окно ПВХ 1400×1200',quantity:'84',unit:'шт.',specification:'двухкамерный стеклопакет, профиль белый'},{name:'Дверь балконная ПВХ',quantity:'28',unit:'шт.',specification:'усиленный профиль'}],evidence:['АР-12 · Ведомость заполнения проёмов','АР-18 · Фасады']},{id:102,source_document_id:1,source_filename:'проект_секции_1-3.pdf',project_id:1,project_name:'ЖК Северный квартал',section_code:'КР',section_name:'Конструктивные решения',lot_title:'Арматура и закладные детали',confidence:.91,status:'needs_review',items:[{name:'Арматура А500С Ø12',quantity:'18.4',unit:'т',specification:'ГОСТ 34028-2016'},{name:'Закладная деталь МН-1',quantity:'64',unit:'шт.',specification:'сталь С255'}],evidence:['КР-07 · Спецификация армирования','КР-22 · Ведомость деталей']},{id:103,source_document_id:1,source_filename:'проект_секции_1-3.pdf',project_id:1,project_name:'ЖК Северный квартал',section_code:'ОВ',section_name:'Отопление и вентиляция',lot_title:'Вентиляционное оборудование',confidence:.86,status:'approved',lot_id:5,items:[{name:'Вентилятор канальный',quantity:'12',unit:'шт.',specification:'производительность 850 м³/ч'}],evidence:['ОВ-09 · Спецификация оборудования']}];
 const $=s=>document.querySelector(s);const esc=v=>String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));const money=(v,c='RUB')=>new Intl.NumberFormat('ru-RU',{maximumFractionDigits:0}).format(Number(v||0))+' '+c;const date=v=>v?new Intl.DateTimeFormat('ru-RU').format(new Date(v)):'—';
 function toast(message,error=false){const el=$('#toast');el.textContent=message;el.className='toast show'+(error?' error':'');clearTimeout(toast.t);toast.t=setTimeout(()=>el.className='toast',3200)}
 async function api(path,options={}){if(state.demo)return demoApi(path,options);const headers={...(options.headers||{})};if(options.body&&!(options.body instanceof FormData))headers['Content-Type']='application/json';const res=await fetch(path,{...options,headers,credentials:'same-origin'});if(!res.ok){let detail=`HTTP ${res.status}`;try{const j=await res.json();detail=j.detail||detail}catch{}throw new Error(detail)}return res.status===204?null:res.json()}
 function demoApi(path,options={}){const method=options.method||'GET';if(method!=='GET')throw new Error('В демонстрации изменения не сохраняются');if(path.match(/^\/api\/lots\/\d+\/supplier-matches/))return state.suppliers.map((s,i)=>({...s,match_score:96-i*7}));if(path.match(/^\/api\/lots\/\d+\/comparison/)){const id=Number(path.split('/')[3]);return state.comparison?.lot?.id===id?state.comparison:{lot:state.lots.find(l=>l.id===id),price_benchmark:{matched_items:0,total_items:state.lots.find(l=>l.id===id)?.items?.length||0},quotes:[],decision:'human_approval_required'}}if(path.match(/^\/api\/lots\/\d+$/)){const id=Number(path.split('/').pop());return state.lots.find(l=>l.id===id)}const routes={'/api/dashboard':state.dashboard,'/api/projects':state.projects,'/api/lots':state.lots,'/api/suppliers':state.suppliers,'/api/outbox':state.outbox,'/api/documents':state.documents,'/api/procurement-suggestions':state.suggestions,'/api/templates':state.templates};return routes[path]||[]}
-function loadDemo(){state.demo=true;Object.assign(state,JSON.parse(JSON.stringify(DEMO_DATA)),{suggestions:JSON.parse(JSON.stringify(DEMO_SUGGESTIONS)),selectedLot:1,view:'overview'});setConnection(true,'Демо-режим · тестовые данные');render();showView('overview');toast('Демонстрация открыта — данные тестовые')}
+function loadDemo(){state.demo=true;Object.assign(state,JSON.parse(JSON.stringify(DEMO_DATA)),{suggestions:JSON.parse(JSON.stringify(DEMO_SUGGESTIONS)),selectedLot:1,view:'overview'});setConnection(true,'Демо-режим · тестовые данные');loadArchive().catch(()=>{}).then(()=>render());showView('overview');toast('Демонстрация открыта — данные тестовые')}
 function badge(status){const map={draft:['Черновик','amber'],rfq_draft:['Запрос КП','blue'],approved:['Одобрено','green'],needs_review:['Требует проверки','amber'],rejected:['Отклонено','red'],quotes_received:['Получены КП','green'],pending_ai_extraction:['Ожидает разбора','amber'],awarded:['Победитель выбран','green'],cancelled:['Отменён','red']};const [text,color]=map[status]||[status||'—',''];return `<span class="badge ${color}">${esc(text)}</span>`}
 function empty(title,text,action=''){return `<div class="empty"><b>${esc(title)}</b><span>${esc(text)}</span>${action}</div>`}
-async function loadAll(){setConnection(false,'Подключение…');try{const [dashboard,projects,lots,suppliers,outbox,documents,suggestions,templates,audit,priceHistory]=await Promise.all([api('/api/dashboard'),api('/api/projects'),api('/api/lots'),api('/api/suppliers'),api('/api/outbox'),api('/api/documents'),api('/api/procurement-suggestions'),api('/api/templates'),api('/api/audit?limit=12'),api('/api/price-history?limit=200')]);Object.assign(state,{dashboard,projects,lots,suppliers,outbox,documents,suggestions,templates,audit,priceHistory});setConnection(true,'Подключено');render()}catch(e){setConnection(false,'Ошибка доступа');toast(e.message,true)}}
+async function loadAll(){setConnection(false,'Подключение…');try{const [dashboard,projects,lots,suppliers,outbox,documents,suggestions,templates,audit,priceHistory]=await Promise.all([api('/api/dashboard'),api('/api/projects'),api('/api/lots'),api('/api/suppliers'),api('/api/outbox'),api('/api/documents'),api('/api/procurement-suggestions'),api('/api/templates'),api('/api/audit?limit=12'),api('/api/price-history?limit=200')]);Object.assign(state,{dashboard,projects,lots,suppliers,outbox,documents,suggestions,templates,audit,priceHistory});setConnection(true,'Подключено');loadArchive().catch(()=>{}).then(()=>render())}catch(e){setConnection(false,'Ошибка доступа');toast(e.message,true)}}
 function setConnection(ok,text){$('#statusDot').className='status-dot'+(ok?' ok':'');$('#connectionLabel').textContent=text}function showView(name){state.view=name;document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===name));document.querySelectorAll('#nav button').forEach(b=>b.classList.toggle('active',b.dataset.view===name));$('#pageTitle').textContent=pages[name][0];$('#pageSubtitle').textContent=pages[name][1];render()}
 function icon(name){return `<svg class="icon" aria-hidden="true"><use href="#i-${name}"/></svg>`}
 function initials(value){return String(value||'—').split(/\s+/).filter(Boolean).slice(0,2).map(x=>x[0]).join('').toUpperCase()}
@@ -198,6 +199,7 @@ async function approveSuggestion(id){return continueDocumentSuggestion(id)}
 async function rejectSuggestion(id){const suggestion=state.suggestions.find(s=>s.id===id);if(!suggestion)return;const reason=prompt('Почему предложение не нужно создавать?','Позиция не относится к закупке');if(!reason)return;if(state.demo){suggestion.status='rejected';renderDocuments();return toast('Демо: предложение отклонено')}const reviewed_by=prompt('Кто проверил предложение?','Технический эксперт');if(!reviewed_by)return;try{await api(`/api/procurement-suggestions/${id}/reject`,{method:'POST',body:JSON.stringify({reviewed_by,reason})});toast('Предложение отклонено');await loadAll();showView('documents')}catch(e){toast(e.message,true)}}
 function renderTemplates(){$('#templates').innerHTML=`<div class="layout">${state.templates.map(t=>`<section class="panel template-card"><div class="template-accent"></div><div class="template-body"><div class="panel-title"><div><h2>${esc(t.name)}</h2><p>${esc(t.code)} · версия ${t.version}</p></div><span class="card-icon gold" style="margin:0">${icon('templates')}</span></div><div class="field"><label>Тема сообщения</label><div class="template-preview">${esc(t.subject)}</div></div><div class="field" style="margin-top:13px"><label>Текст шаблона</label><pre class="template-copy">${esc(t.body)}</pre></div></div></section>`).join('')}</div>`}
 function renderSpecializedViews(){
+  renderArchive();
   document.querySelector('#services').innerHTML='<section class="panel"><div class="panel-title"><div><h2>Услуги — отдельный контур</h2><p>Запрос данных → проверка полноты → расчёт → согласование стоимости.</p></div><span class="badge amber">Следующий этап</span></div><div class="pipeline"><div class="pipe-step"><b>01</b><span>Вопросник</span><small>Покраска отводов или металлоизделия</small></div><div class="pipe-step"><b>02</b><span>Проверка</span><small>Размеры, покрытие, объём и сроки</small></div><div class="pipe-step"><b>03</b><span>Расчёт</span><small>Материалы, работа и логистика</small></div><div class="pipe-step"><b>04</b><span>Согласование</span><small>Ответственный подтверждает цену</small></div><div class="pipe-step"><b>05</b><span>Черновик</span><small>Email или MAX без автоотправки</small></div></div><div class="guard">Процесс услуг не смешивается с закупочным рейтингом поставщиков.</div></section>';
   document.querySelector('#certificates').innerHTML='<section class="panel"><div class="panel-title"><div><h2>Реестр сертификатов</h2><p>Сертификат связывается с заказом, изделием, партией и исходным запросом.</p></div><span class="badge amber">Следующий этап</span></div><div class="document-callout"><div><h2>Генератор станет управляемым реестром</h2><p>Формирование, нумерация, версии, поиск и контроль выданных документов.</p></div></div><div class="guard">Перед интеграцией потребуется схема полей действующего генератора сертификатов.</div></section>';
 }
@@ -209,6 +211,174 @@ const createProject=()=>modalAction(()=>api('/api/projects',{method:'POST',body:
 async function previewSupplierImport(){const file=$('#supplierFile').files[0];if(!file)return toast('Выберите файл',true);const fd=new FormData();fd.append('file',file);try{const result=await api('/api/suppliers/import?commit=false',{method:'POST',body:fd});$('#importPreview').innerHTML=`<div class="guard">Распознано строк: <b>${result.valid_rows}</b>, ошибок: <b>${result.errors.length}</b></div><div class="table-wrap" style="margin-top:12px"><table><thead><tr><th>Название</th><th>Регион</th><th>Email</th></tr></thead><tbody>${result.rows.slice(0,15).map(r=>`<tr><td>${esc(r.name)}</td><td>${esc(r.region)}</td><td>${esc(r.email)}</td></tr>`).join('')}</tbody></table></div>`;$('#modalSubmit').textContent='Импортировать';$('#modalSubmit').onclick=()=>commitSupplierImport(file)}catch(e){toast(e.message,true)}}
 const commitSupplierImport=file=>modalAction(()=>{const fd=new FormData();fd.append('file',file);return api('/api/suppliers/import?commit=true',{method:'POST',body:fd})},'Поставщики импортированы');const uploadDocument=()=>modalAction(()=>{const file=$('#dFile').files[0];if(!file)throw new Error('Выберите файл');const fd=new FormData();fd.append('file',file);const project=$('#dProject').value;return api(`/api/documents?document_type=${encodeURIComponent($('#dType').value)}${project?'&project_id='+project:''}`,{method:'POST',body:fd})},'Документ принят в очередь разбора');const createPriceHistory=()=>modalAction(()=>api('/api/price-history',{method:'POST',body:JSON.stringify({supplier_id:$('#hSupplier').value?Number($('#hSupplier').value):null,item_name:$('#hItem').value,quantity:$('#hQuantity').value,unit:$('#hUnit').value,unit_price:$('#hPrice').value,currency:$('#hCurrency').value,vat_included:true,purchased_on:$('#hDate').value,invoice_number:$('#hInvoice').value,project_name:$('#hProject').value,region:$('#hRegion').value,confirmed_by:$('#hConfirmed').value})}),'Историческая цена подтверждена');const createQuote=()=>modalAction(()=>api(`/api/lots/${state.selectedLot}/quotes`,{method:'POST',body:JSON.stringify({supplier_id:Number($('#qSupplier').value),currency:'RUB',vat_included:true,delivery_cost:$('#qDelivery').value||0,lead_days:Number($('#qDays').value||0),payment_terms:$('#qTerms').value,items:[...document.querySelectorAll('[data-quote-item]')].map(x=>({lot_item_id:Number(x.dataset.quoteItem),unit_price:x.value,compliant:true}))})}),'Коммерческое предложение добавлено').then(loadComparison);async function openLot(id){state.selectedLot=id;state.tenderLot=state.lots.find(l=>Number(l.id)===Number(id))||null;state.tenderMatches=[];state.tenderComparison=null;state.tenderLoading=true;showView('tender');try{const lot=await api(`/api/lots/${id}`),[matchesResult,comparisonResult]=await Promise.allSettled([api(`/api/lots/${id}/supplier-matches`),api(`/api/lots/${id}/comparison`)]);state.tenderLot={...state.tenderLot,...lot};state.tenderMatches=matchesResult.status==='fulfilled'?matchesResult.value:[];state.tenderComparison=comparisonResult.status==='fulfilled'?comparisonResult.value:null;state.comparison=state.tenderComparison;renderTender()}catch(e){toast(e.message,true)}finally{state.tenderLoading=false}}
 $('#demoBtn').onclick=loadDemo;$('#refreshBtn').onclick=()=>state.demo?loadDemo():loadAll();$('#nav').onclick=e=>{const b=e.target.closest('[data-view]');if(b)showView(b.dataset.view)};bindOpeners();loadAll();
+
+function renderArchive(){
+  const batches=state.importBatches||[];
+  const drafts=state.supplierDrafts||[];
+  const entries=state.priceEntries||[];
+  const statusLabel={pending:'В очереди',processing:'Обрабатывается',needs_review:'На проверке',done:'Готово',failed:'Ошибка'};
+  const docTypeLabel={price_list:'Прайс-лист',invoice:'Счёт',commercial_offer:'КП',unknown:'Неизвестно'};
+  $('#archive').innerHTML=`
+  <section class="panel" style="margin-bottom:18px">
+    <div class="panel-title">
+      <div><h2>Пакетный импорт КП и счетов</h2>
+        <p>До 20 файлов PDF или XLSX за раз. Извлекаются поставщик, позиции, цены, трассировка до строки.</p></div>
+      <button class="btn" onclick="openBatchImport()">${icon('upload')}Загрузить пакет</button>
+    </div>
+    ${batches.length?`<div class="table-wrap"><table><thead><tr>
+      <th>ID</th><th>Файлов</th><th>Статус</th><th>Черновики</th><th>Позиции</th><th>Создан</th>
+    </tr></thead><tbody>
+    ${batches.map(b=>`<tr>
+      <td><button class="btn secondary small" onclick="openBatch(${b.id})">#${b.id}</button></td>
+      <td>${(b.filenames||[]).length}</td>
+      <td>${badge(b.status)}</td>
+      <td>${(b.supplier_drafts||[]).length}</td>
+      <td>${(b.price_history_entries||[]).length}</td>
+      <td>${date(b.created_at)}</td>
+    </tr>`).join('')}
+    </tbody></table></div>`
+    :empty('Пакеты не созданы','Загрузите КП или прайс-листы для разбора')}
+  </section>
+  <section class="panel" style="margin-bottom:18px">
+    <div class="panel-title">
+      <div><h2>Черновики поставщиков</h2>
+        <p>Поставщики, извлечённые из документов. Подтвердите или отклоните перед добавлением в базу.</p></div>
+    </div>
+    ${drafts.length?`<div class="table-wrap"><table><thead><tr>
+      <th>Наименование</th><th>ИНН</th><th>Регион</th><th>Кластер</th><th>Статус</th><th>Действия</th>
+    </tr></thead><tbody>
+    ${drafts.map(d=>`<tr>
+      <td><b>${esc(d.name)}</b><br><small class="muted">${esc(d.email)}</small></td>
+      <td>${esc(d.tax_id)||'—'}</td>
+      <td>${esc(d.region)||'—'}</td>
+      <td>${d.cluster?esc(d.cluster):'<span class="badge" style="background:#b45309">нет кластера</span>'}</td>
+      <td>${badge(d.status)}</td>
+      <td>
+        ${d.status==='needs_review'?`
+        <button class="btn small" onclick="confirmDraft(${d.id})">${icon('check')}Подтвердить</button>
+        <button class="btn secondary small" onclick="rejectDraft(${d.id})">Отклонить</button>
+        `:''}
+      </td>
+    </tr>`).join('')}
+    </tbody></table></div>`
+    :empty('Черновики поставщиков отсутствуют','Загрузите КП или прайс-листы для автоматического извлечения')}
+  </section>
+  <section class="panel">
+    <div class="panel-title">
+      <div><h2>Позиции истории цен</h2>
+        <p>Извлечённые позиции с трассировкой до документа, страницы и строки.</p></div>
+    </div>
+    ${entries.length?`<div class="table-wrap"><table><thead><tr>
+      <th>Позиция</th><th>Ед.</th><th>Цена</th><th>Вал.</th><th>НДС</th><th>Документ</th><th>Статус</th>
+    </tr></thead><tbody>
+    ${entries.map(e=>`<tr>
+      <td><b>${esc(e.item_name)}</b>${e.is_expired?'<span class="badge" style="background:#dc2626;margin-left:4px">истёк</span>':''}</td>
+      <td>${esc(e.unit)}</td>
+      <td style="font-variant-numeric:tabular-nums">${esc(e.unit_price)}</td>
+      <td>${esc(e.currency)}</td>
+      <td>${e.vat_included?'с НДС':'без НДС'}</td>
+      <td><small>${esc(e.source_sheet||'')}${e.source_page?' стр.'+e.source_page:''}${e.source_row?' стр.'+e.source_row:''}</small></td>
+      <td>${badge(e.status)}</td>
+    </tr>`).join('')}
+    </tbody></table></div>`
+    :empty('Позиции отсутствуют','Подтвердите пакет импорта для появления позиций в истории цен')}
+  </section>`;
+}
+
+function openBatchImport(){
+  $('#modalTitle').textContent='Пакетный импорт КП / счетов';
+  $('#modalBody').innerHTML=`
+    <p style="margin-bottom:12px">Выберите от 1 до 20 файлов PDF или XLSX (КП, прайс-листы, счета). Максимум 25 МБ на файл.</p>
+    <label class="field-label">Файлы</label>
+    <input type="file" id="batchFiles" multiple accept=".pdf,.xlsx,.xls" style="margin-bottom:12px">
+    <label class="field-label">Создал</label>
+    <input type="text" id="batchCreatedBy" value="Сотрудник снабжения" style="margin-bottom:4px">
+  `;
+  $('#modalSubmit').onclick=submitBatchImport;
+  $('#modal').showModal();
+}
+
+async function submitBatchImport(){
+  const files=$('#batchFiles').files;
+  if(!files||!files.length){toast('Выберите хотя бы один файл',true);return;}
+  if(files.length>20){toast('Максимум 20 файлов',true);return;}
+  const createdBy=$('#batchCreatedBy').value||'system';
+  const fd=new FormData();
+  for(const f of files) fd.append('files',f);
+  try{
+    const result=await api(`/api/imports/batch?created_by=${encodeURIComponent(createdBy)}`,{method:'POST',body:fd});
+    toast(`Пакет #${result.id} создан: ${(result.price_history_entries||[]).length} позиций`);
+    $('#modal').close();
+    await loadArchive();
+    renderArchive();
+  }catch(e){toast(e.message,true)}
+}
+
+async function openBatch(id){
+  try{
+    const b=await api(`/api/imports/${id}`);
+    const entries=b.price_history_entries||[];
+    const draftEntries=entries.filter(e=>e.status==='draft');
+    $('#modalTitle').textContent=`Пакет #${id} — проверка позиций`;
+    $('#modalBody').innerHTML=`
+      <p>${b.filenames.join(', ')}</p>
+      <p>Позиций на проверке: <b>${draftEntries.length}</b> из <b>${entries.length}</b></p>
+      <label class="field-label">Подтверждает</label>
+      <input type="text" id="batchConfirmBy" value="Сотрудник снабжения" style="margin-bottom:12px">
+      ${draftEntries.length?`<p>Нажмите «Подтвердить выбранное» чтобы принять все позиции в историю цен.</p>`:'<p>Все позиции уже обработаны.</p>'}
+    `;
+    $('#modalSubmit').textContent='Подтвердить все позиции';
+    $('#modalSubmit').onclick=async()=>{
+      if(!draftEntries.length){$('#modal').close();return;}
+      const confirmedBy=$('#batchConfirmBy').value||'system';
+      try{
+        await api(`/api/imports/${id}/confirm`,{method:'POST',body:JSON.stringify({confirmed_by:confirmedBy,entry_ids:draftEntries.map(e=>e.id)})});
+        toast('Позиции подтверждены');
+        $('#modal').close();
+        await loadArchive();
+        renderArchive();
+      }catch(e){toast(e.message,true)}
+    };
+    $('#modal').showModal();
+  }catch(e){toast(e.message,true)}
+}
+
+async function confirmDraft(id){
+  const cluster=prompt('Введите кластер (например: cluster_south, cluster_moscow):');
+  if(!cluster)return;
+  const region=prompt('Введите регион:');
+  if(!region)return;
+  const confirmedBy=prompt('Подтверждает (ФИО/роль):','Сотрудник снабжения');
+  if(!confirmedBy)return;
+  try{
+    await api(`/api/supplier-drafts/${id}/confirm`,{method:'POST',body:JSON.stringify({confirmed_by:confirmedBy,cluster,region})});
+    toast('Поставщик добавлен в базу');
+    await loadArchive();
+    renderArchive();
+  }catch(e){toast(e.message,true)}
+}
+
+async function rejectDraft(id){
+  const notes=prompt('Причина отклонения:');
+  try{
+    await api(`/api/supplier-drafts/${id}/reject`,{method:'POST',body:JSON.stringify({rejected_by:'Сотрудник снабжения',review_notes:notes||''})});
+    toast('Черновик отклонён');
+    await loadArchive();
+    renderArchive();
+  }catch(e){toast(e.message,true)}
+}
+
+async function loadArchive(){
+  const [batches,drafts,entries]=await Promise.allSettled([
+    api('/api/imports'),
+    api('/api/supplier-drafts?status=needs_review'),
+    api('/api/price-history-entries?status=draft&limit=100'),
+  ]);
+  state.importBatches=batches.status==='fulfilled'?batches.value:[];
+  state.supplierDrafts=drafts.status==='fulfilled'?drafts.value:[];
+  state.priceEntries=entries.status==='fulfilled'?entries.value:[];
+}
+
 </script>
 </body>
 </html>

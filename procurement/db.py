@@ -219,6 +219,78 @@ CREATE TABLE IF NOT EXISTS audit_log (
     details_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS import_batches (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    status          TEXT    NOT NULL DEFAULT 'pending',
+    filenames_json  TEXT    NOT NULL DEFAULT '[]',
+    total_files     INTEGER NOT NULL DEFAULT 0,
+    processed_files INTEGER NOT NULL DEFAULT 0,
+    sha256_json     TEXT    NOT NULL DEFAULT '{}',
+    created_by      TEXT    NOT NULL DEFAULT 'system',
+    created_at      TEXT    NOT NULL,
+    reviewed_at     TEXT
+);
+
+CREATE TABLE IF NOT EXISTS supplier_drafts (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_batch_id    INTEGER REFERENCES import_batches(id) ON DELETE SET NULL,
+    source_document_id INTEGER REFERENCES source_documents(id) ON DELETE SET NULL,
+    name               TEXT    NOT NULL,
+    tax_id             TEXT    NOT NULL DEFAULT '',
+    region             TEXT    NOT NULL DEFAULT '',
+    cluster            TEXT    NOT NULL DEFAULT '',
+    email              TEXT    NOT NULL DEFAULT '',
+    phone              TEXT    NOT NULL DEFAULT '',
+    contact_person     TEXT    NOT NULL DEFAULT '',
+    raw_json           TEXT    NOT NULL DEFAULT '{}',
+    dedup_key          TEXT    NOT NULL DEFAULT '',
+    status             TEXT    NOT NULL DEFAULT 'needs_review',
+    cluster_status     TEXT    NOT NULL DEFAULT 'pending',
+    review_notes       TEXT    NOT NULL DEFAULT '',
+    confirmed_by       TEXT    NOT NULL DEFAULT '',
+    confirmed_at       TEXT,
+    created_at         TEXT    NOT NULL,
+    UNIQUE(dedup_key)
+);
+
+CREATE TABLE IF NOT EXISTS price_history_entries (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_batch_id    INTEGER REFERENCES import_batches(id) ON DELETE SET NULL,
+    source_document_id INTEGER REFERENCES source_documents(id) ON DELETE SET NULL,
+    supplier_draft_id  INTEGER REFERENCES supplier_drafts(id) ON DELETE SET NULL,
+    supplier_id        INTEGER REFERENCES suppliers(id) ON DELETE SET NULL,
+    item_name          TEXT    NOT NULL,
+    brand              TEXT    NOT NULL DEFAULT '',
+    normalized_name    TEXT    NOT NULL,
+    quantity           TEXT    NOT NULL DEFAULT '',
+    unit               TEXT    NOT NULL DEFAULT '',
+    unit_price         TEXT    NOT NULL,
+    total_price        TEXT    NOT NULL DEFAULT '',
+    currency           TEXT    NOT NULL DEFAULT 'RUB',
+    vat_included       INTEGER NOT NULL DEFAULT 1,
+    document_date      TEXT,
+    valid_until        TEXT,
+    validity_state     TEXT    NOT NULL DEFAULT 'unknown',
+    source_page        INTEGER,
+    source_sheet       TEXT    NOT NULL DEFAULT '',
+    source_row         INTEGER,
+    source_cell        TEXT    NOT NULL DEFAULT '',
+    source_text        TEXT    NOT NULL DEFAULT '',
+    status             TEXT    NOT NULL DEFAULT 'draft',
+    confirmed_by       TEXT    NOT NULL DEFAULT '',
+    confirmed_at       TEXT,
+    created_at         TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_phe_lookup
+    ON price_history_entries(normalized_name, unit, currency, document_date DESC);
+
+CREATE INDEX IF NOT EXISTS ix_phe_status
+    ON price_history_entries(status, supplier_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS ix_supplier_drafts_status
+    ON supplier_drafts(status, import_batch_id);
 """
 
 

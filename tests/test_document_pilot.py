@@ -222,9 +222,9 @@ class ClusterAndApprovalTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(lot["cluster"], "cluster_2")
-        self.assertEqual(same["cluster"], "cluster_2")
-        self.assertEqual(other["cluster"], "cluster_1")
+        self.assertEqual(lot["cluster"], "cluster_1")
+        self.assertEqual(same["cluster"], "cluster_1")
+        self.assertEqual(other["cluster"], "cluster_2")
         self.assertEqual(
             [row["id"] for row in self.service.match_suppliers(lot["id"])],
             [same["id"]],
@@ -331,11 +331,11 @@ class ClusterAndApprovalTests(unittest.TestCase):
         self.assertIn("указать оба варианта", body)
 
     def test_region_helpers_cover_two_non_crossing_clusters(self):
-        self.assertEqual(infer_cluster("Тамбовская область"), "cluster_1")
-        self.assertEqual(infer_cluster("ЯНАО"), "cluster_2")
-        self.assertEqual(infer_cluster("ХМАО — Югра"), "cluster_2")
+        self.assertEqual(infer_cluster("Тамбовская область"), "cluster_2")
+        self.assertEqual(infer_cluster("ЯНАО"), "cluster_1")
+        self.assertEqual(infer_cluster("ХМАО — Югра"), "cluster_1")
         with self.assertRaisesRegex(ValueError, "conflicts"):
-            resolve_cluster("Омская область", "cluster_1")
+            resolve_cluster("Омская область", "cluster_2")
 
 
 class RankingPolicyTests(unittest.TestCase):
