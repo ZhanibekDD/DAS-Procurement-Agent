@@ -547,6 +547,14 @@ class StaticPreviewTests(unittest.TestCase):
             "const DEMO_SUGGESTIONS=",
             "function approveSuggestion(id)",
             "function rejectSuggestion(id)",
+            'data-view="mail"',
+            'id="mail"',
+            "function renderMail()",
+            "function syncMailbox()",
+            "function createMailDraft()",
+            "function sendMail(id)",
+            "/api/mail/messages",
+            "RFQ-",
         ):
             self.assertIn(marker, html)
 

@@ -40,6 +40,11 @@ class StandaloneAuthHttpFlowTests(unittest.TestCase):
             admin_username=ADMIN_USERNAME,
             admin_password_hash=ADMIN_HASH,
             session_ttl_seconds=3600,
+            mail_address="snab@stroydnepr.ru",
+            mail_username="snab@stroydnepr.ru",
+            mail_password="test-only-password",
+            mail_receive_enabled=False,
+            mail_send_enabled=False,
         )
         app_module.db = Database(self.path)
         app_module.db.initialize()
@@ -185,4 +190,59 @@ class StandaloneAuthHttpFlowTests(unittest.TestCase):
         self.assertEqual(
             self.client.post("/auth/sso", data={"token": "x" * 32}).status_code,
             404,
+        )
+
+    def test_mail_draft_requires_login_approval_and_enabled_smtp(self):
+        unauthenticated = self.client.post(
+            "/api/mail/drafts",
+            json={
+                "recipient": "supplier@example.org",
+                "subject": "Запрос цены",
+                "body": "Просим направить коммерческое предложение",
+            },
+        )
+        self.assertEqual(unauthenticated.status_code, 403)
+
+        self.client.post(
+            "/auth/login",
+            data={"username": ADMIN_USERNAME, "password": ADMIN_PASSWORD},
+        )
+        status = self.client.get("/api/mail/status")
+        self.assertEqual(status.status_code, 200)
+        self.assertTrue(status.json()["configured"])
+        self.assertFalse(status.json()["send_enabled"])
+
+        created = self.client.post(
+            "/api/mail/drafts",
+            json={
+                "recipient": "supplier@example.org",
+                "subject": "Запрос цены",
+                "body": "Просим направить коммерческое предложение",
+            },
+        )
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(created.json()["status"], "draft")
+        message_id = created.json()["id"]
+
+        premature = self.client.post(
+            f"/api/mail/messages/{message_id}/send",
+            json={"approved_by": "Руководитель снабжения"},
+        )
+        self.assertEqual(premature.status_code, 409)
+
+        approved = self.client.post(
+            f"/api/mail/messages/{message_id}/approve",
+            json={"approved_by": "Руководитель снабжения"},
+        )
+        self.assertEqual(approved.status_code, 200)
+        self.assertEqual(approved.json()["status"], "approved")
+
+        disabled = self.client.post(
+            f"/api/mail/messages/{message_id}/send",
+            json={"approved_by": "Руководитель снабжения"},
+        )
+        self.assertEqual(disabled.status_code, 409)
+        self.assertEqual(
+            self.client.get(f"/api/mail/messages/{message_id}").json()["status"],
+            "approved",
         )
