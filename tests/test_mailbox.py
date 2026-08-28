@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
 from datetime import date, timedelta
 from email.message import EmailMessage
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from procurement.config import Settings
 from procurement.db import Database
-from procurement.mailbox import SmtpMailbox, parse_inbound_mail
+from procurement.mailbox import ImapMailbox, SmtpMailbox, parse_inbound_mail
 from procurement.models import (
     CampaignCreate,
     LotCreate,
@@ -110,6 +111,24 @@ class MailboxWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(len(self.service.list_mail_messages(direction="inbound")), 1)
 
+    def test_inexact_rfq_text_does_not_link_lot(self):
+        message = EmailMessage()
+        message["From"] = "Поставщик <sales@supplier.example>"
+        message["To"] = "snab@stroydnepr.ru"
+        message["Subject"] = f"Счёт-фактура по RFQ документу {self.lot['id']}"
+        message["Message-ID"] = "<unstructured-rfq@example>"
+        message.set_content("Предложение без системного идентификатора")
+
+        stored = self.service.ingest_inbound_mail(
+            parse_inbound_mail(message.as_bytes()),
+            mailbox_address="snab@stroydnepr.ru",
+            imap_uid=43,
+            imap_uidvalidity="777",
+        )
+
+        self.assertIsNone(stored["lot_id"])
+        self.assertIsNone(stored["project_id"])
+
     def test_draft_requires_approval_before_delivery(self):
         document = self.service.register_source_document(
             filename="запрос.docx",
@@ -147,6 +166,36 @@ class MailboxWorkflowTests(unittest.TestCase):
         self.assertEqual(sent["status"], "sent")
         with self.assertRaisesRegex(ConflictError, "approved"):
             self.service.mark_mail_sent(sent["id"], actor="Руководитель снабжения")
+
+    def test_delivery_rejects_multiple_to_or_cc_recipients(self):
+        for recipients, cc in (
+            (["sales@supplier.example", "copy@supplier.example"], []),
+            (["sales@supplier.example"], ["copy@supplier.example"]),
+        ):
+            with self.subTest(recipients=recipients, cc=cc):
+                draft = self.service.create_mail_draft(
+                    MailDraftCreate(
+                        recipient="sales@supplier.example",
+                        subject="Запрос коммерческого предложения",
+                        body="Просим направить коммерческое предложение",
+                    ),
+                    mailbox_address="snab@stroydnepr.ru",
+                    actor="Снабженец",
+                )
+                approved = self.service.approve_mail_draft(
+                    draft["id"], approved_by="Руководитель снабжения"
+                )
+                with self.db.connection() as conn:
+                    conn.execute(
+                        "UPDATE mail_messages SET recipients_json=?, cc_json=? WHERE id=?",
+                        (
+                            json.dumps(recipients),
+                            json.dumps(cc),
+                            approved["id"],
+                        ),
+                    )
+                with self.assertRaisesRegex(ConflictError, "exactly one"):
+                    self.service.mail_delivery_payload(approved["id"])
 
     def test_draft_rejects_missing_attachment_file(self):
         document = self.service.register_source_document(
@@ -249,6 +298,44 @@ class MailSettingsTests(unittest.TestCase):
 
 
 class MailTransportTests(unittest.TestCase):
+    @patch("procurement.mailbox.imaplib.IMAP4_SSL")
+    def test_imap_searches_only_uids_after_checkpoint(self, imap_ssl):
+        client = imap_ssl.return_value
+        client.select.return_value = ("OK", [b""])
+        client.response.return_value = ("UIDVALIDITY", [b"777"])
+        client.uid.return_value = ("OK", [b""])
+        mailbox = ImapMailbox(
+            host="imap.timeweb.ru",
+            port=993,
+            username="snab@stroydnepr.ru",
+            password="test-only-password",
+        )
+
+        fetched = mailbox.fetch_since(41)
+
+        self.assertEqual(fetched.highest_uid, 41)
+        self.assertEqual(
+            client.uid.call_args_list,
+            [call("search", None, "UID 42:*")],
+        )
+
+    @patch("procurement.mailbox.imaplib.IMAP4_SSL")
+    def test_imap_initial_sync_searches_all(self, imap_ssl):
+        client = imap_ssl.return_value
+        client.select.return_value = ("OK", [b""])
+        client.response.return_value = ("UIDVALIDITY", [b"777"])
+        client.uid.return_value = ("OK", [b""])
+        mailbox = ImapMailbox(
+            host="imap.timeweb.ru",
+            port=993,
+            username="snab@stroydnepr.ru",
+            password="test-only-password",
+        )
+
+        mailbox.fetch_since(0)
+
+        self.assertEqual(client.uid.call_args_list, [call("search", None, "ALL")])
+
     @patch("procurement.mailbox.smtplib.SMTP_SSL")
     def test_smtp_uses_tls_login_thread_headers_and_attachment(self, smtp_ssl):
         client = smtp_ssl.return_value.__enter__.return_value

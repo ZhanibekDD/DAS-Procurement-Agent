@@ -1270,7 +1270,7 @@ class ProcurementService:
 
     @staticmethod
     def _mail_lot_id(subject: str) -> int | None:
-        match = re.search(r"(?:\[)?RFQ[\s:#-]*(\d+)", subject, flags=re.IGNORECASE)
+        match = re.search(r"\[RFQ-(\d+)\]", subject, flags=re.IGNORECASE)
         return int(match.group(1)) if match else None
 
     @staticmethod
@@ -1769,6 +1769,10 @@ class ProcurementService:
         message = self.get_mail_message(message_id)
         if message["direction"] != "outbound" or message["status"] != "approved":
             raise ConflictError("only approved outbound messages can be sent")
+        if len(message["recipients"]) != 1 or message["cc"]:
+            raise ConflictError(
+                "mail delivery supports exactly one To recipient and no CC"
+            )
         attachments = []
         for attachment in message["attachments"]:
             if attachment["blocked_reason"]:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import logging
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -51,6 +52,7 @@ from .service import ConflictError, NotFoundError, ProcurementService
 settings = Settings.from_env()
 db = Database(settings.db_path)
 service = ProcurementService(db)
+logger = logging.getLogger(__name__)
 
 
 def _imap_client() -> ImapMailbox:
@@ -115,7 +117,7 @@ async def _mail_sync_loop() -> None:
             await asyncio.to_thread(_sync_mail_once)
         except Exception:
             # _sync_mail_once persists the failure; keep the periodic worker alive.
-            pass
+            logger.exception("mail synchronization failed")
         await asyncio.sleep(settings.mail_sync_interval_seconds)
 
 

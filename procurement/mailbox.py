@@ -204,10 +204,15 @@ class ImapMailbox:
                 if uidvalidity_response
                 else ""
             )
-            status, data = client.uid("search", None, "ALL")
+            search_criterion = (
+                f"UID {last_uid + 1}:*" if last_uid > 0 else "ALL"
+            )
+            status, data = client.uid("search", None, search_criterion)
             if status != "OK":
                 raise MailboxError("cannot search INBOX")
             all_uids = [int(value) for value in (data[0] or b"").split()]
+            # Keep the local guard because IMAP sequence ranges can still return
+            # the highest existing UID when the requested start is above it.
             selected = [uid for uid in all_uids if uid > last_uid][:limit]
             messages: list[tuple[int, InboundMail]] = []
             for uid in selected:
