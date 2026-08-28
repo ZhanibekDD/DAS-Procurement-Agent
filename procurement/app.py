@@ -50,7 +50,12 @@ from .service import ConflictError, NotFoundError, ProcurementService
 
 settings = Settings.from_env()
 db = Database(settings.db_path)
-service = ProcurementService(db)
+service = ProcurementService(
+    db,
+    ingest_binary=settings.ingest_binary,
+    ingest_timeout_seconds=settings.ingest_timeout_seconds,
+)
+logger = logging.getLogger(__name__)
 
 
 def _imap_client() -> ImapMailbox:
@@ -481,6 +486,17 @@ async def upload_source_document(
 def list_source_documents(extraction_status: str = Query(default="")):
     rows = service.list_source_documents(extraction_status)
     return [{**row, "storage_path": "internal"} for row in rows]
+
+
+@app.post(
+    "/api/documents/{document_id}/extract/spreadsheet-preview",
+    dependencies=[Depends(require_access)],
+)
+def extract_spreadsheet_preview(document_id: int):
+    try:
+        return service.preview_spreadsheet(document_id)
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
 
 
 @app.post(

@@ -25,3 +25,24 @@ jobs:
       - name: Compile Python sources
         run: python -m compileall -q procurement tests
 
+  rust-ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install Rust 1.88
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Test Rust parser
+        run: cargo +1.88.0 test --manifest-path rust/das-ingest/Cargo.toml
+      - name: Build Rust parser
+        run: cargo +1.88.0 build --release --manifest-path rust/das-ingest/Cargo.toml
+      - name: Install Python fixture dependency
+        run: python -m pip install --upgrade pip && python -m pip install -e .
+      - name: Run XLSX and CSV acceptance tests
+        env:
+          DAS_INGEST_TEST_BINARY: rust/das-ingest/target/release/das-ingest
+        run: python -m unittest tests/rust_ingest_acceptance.py -v

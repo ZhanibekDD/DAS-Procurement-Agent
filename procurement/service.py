@@ -37,6 +37,7 @@ from .models import (
 from .mailbox import InboundMail
 from .ranking import rank_quotes
 from .regions import resolve_cluster
+from .rust_ingest import run_spreadsheet_ingest
 from .templates import render_template
 
 
@@ -49,8 +50,16 @@ class ConflictError(ValueError):
 
 
 class ProcurementService:
-    def __init__(self, db: Database):
+    def __init__(
+        self,
+        db: Database,
+        *,
+        ingest_binary: str = "/usr/local/bin/das-ingest",
+        ingest_timeout_seconds: int = 20,
+    ):
         self.db = db
+        self.ingest_binary = ingest_binary
+        self.ingest_timeout_seconds = ingest_timeout_seconds
 
     def create_project(self, data: ProjectCreate) -> dict[str, Any]:
         cluster = resolve_cluster(data.region, data.cluster)
@@ -889,6 +898,37 @@ class ProcurementService:
                 conn=conn,
             )
         return self.db.one("SELECT * FROM source_documents WHERE id = ?", (document_id,)) or {}
+
+    def preview_spreadsheet(self, document_id: int) -> dict[str, Any]:
+        document = self.db.one(
+            "SELECT * FROM source_documents WHERE id = ?", (document_id,)
+        )
+        if not document:
+            raise NotFoundError("source document not found")
+        if document["document_type"] not in {
+            "commercial_offer",
+            "tender_table",
+            "mail_attachment",
+        }:
+            raise ValueError(
+                "spreadsheet preview requires a commercial offer or tender table"
+            )
+        suffix = Path(document["filename"]).suffix.casefold()
+        if suffix not in {".xlsx", ".csv"}:
+            raise ValueError("spreadsheet preview supports only .xlsx and .csv")
+
+        result = run_spreadsheet_ingest(
+            storage_path=document["storage_path"],
+            filename=document["filename"],
+            binary=self.ingest_binary,
+            timeout_seconds=self.ingest_timeout_seconds,
+        )
+        return {
+            **result,
+            "document_id": document_id,
+            "decision": "human_review_required",
+            "persisted": False,
+        }
 
     def analyze_fence_schedule(
         self, document_id: int, *, page_number: int

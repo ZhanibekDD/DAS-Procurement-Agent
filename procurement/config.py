@@ -57,6 +57,8 @@ class Settings:
     mail_send_enabled: bool = False
     mail_sync_interval_seconds: int = 120
     mail_sync_batch_size: int = 100
+    ingest_binary: str = "/usr/local/bin/das-ingest"
+    ingest_timeout_seconds: int = 20
 
     @property
     def mail_credentials_configured(self) -> bool:
@@ -124,6 +126,12 @@ class Settings:
             mail_sync_batch_size=int(
                 os.getenv("PROCUREMENT_MAIL_SYNC_BATCH_SIZE", "100").strip()
             ),
+            ingest_binary=os.getenv(
+                "PROCUREMENT_INGEST_BINARY", "/usr/local/bin/das-ingest"
+            ).strip(),
+            ingest_timeout_seconds=int(
+                os.getenv("PROCUREMENT_INGEST_TIMEOUT_SECONDS", "20").strip()
+            ),
         )
         if settings.environment == "production" and not settings.api_key:
             raise RuntimeError("PROCUREMENT_API_KEY is required in production")
@@ -186,5 +194,11 @@ class Settings:
         if not 1 <= settings.mail_sync_batch_size <= 500:
             raise RuntimeError(
                 "PROCUREMENT_MAIL_SYNC_BATCH_SIZE must be between 1 and 500"
+            )
+        if not settings.ingest_binary:
+            raise RuntimeError("PROCUREMENT_INGEST_BINARY must not be empty")
+        if not 1 <= settings.ingest_timeout_seconds <= 120:
+            raise RuntimeError(
+                "PROCUREMENT_INGEST_TIMEOUT_SECONDS must be between 1 and 120"
             )
         return settings
