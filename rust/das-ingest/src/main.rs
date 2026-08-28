@@ -92,8 +92,19 @@ struct LineItem {
     quantity: Option<f64>,
     unit_price: Option<f64>,
     total: Option<f64>,
+    offers: Vec<SupplierOffer>,
     source_row: usize,
     confidence: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SupplierOffer {
+    supplier: String,
+    category: String,
+    unit_price: Option<f64>,
+    total: Option<f64>,
+    source_unit_price_column: Option<usize>,
+    source_total_column: Option<usize>,
 }
 
 #[derive(Default)]
@@ -213,11 +224,18 @@ fn parse_xlsx(path: &Path) -> Result<ParsedWorkbook, Box<dyn Error>> {
     let mut parsed = ParsedWorkbook::default();
     for sheet_name in sheet_names {
         let range = workbook.worksheet_range(&sheet_name)?;
+        let (row_offset, column_offset) = range.start().unwrap_or((0, 0));
         let rows = range
             .rows()
             .map(|row| row.iter().map(cell_text).collect())
             .collect();
-        consume_sheet(&mut parsed, &sheet_name, rows);
+        consume_sheet(
+            &mut parsed,
+            &sheet_name,
+            rows,
+            row_offset as usize,
+            column_offset as usize,
+        );
     }
     add_empty_result_warning(&mut parsed);
     Ok(parsed)
@@ -238,7 +256,7 @@ fn parse_csv(bytes: &[u8]) -> Result<ParsedWorkbook, Box<dyn Error>> {
         rows.push(record?.iter().map(str::to_owned).collect());
     }
     let mut parsed = ParsedWorkbook::default();
-    consume_sheet(&mut parsed, "CSV", rows);
+    consume_sheet(&mut parsed, "CSV", rows, 0, 0);
     add_empty_result_warning(&mut parsed);
     Ok(parsed)
 }
@@ -252,7 +270,13 @@ fn add_empty_result_warning(parsed: &mut ParsedWorkbook) {
     }
 }
 
-fn consume_sheet(parsed: &mut ParsedWorkbook, sheet_name: &str, rows: Vec<Vec<String>>) {
+fn consume_sheet(
+    parsed: &mut ParsedWorkbook,
+    sheet_name: &str,
+    rows: Vec<Vec<String>>,
+    row_offset: usize,
+    column_offset: usize,
+) {
     let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
     let non_empty_cells = rows
         .iter()
@@ -266,11 +290,16 @@ fn consume_sheet(parsed: &mut ParsedWorkbook, sheet_name: &str, rows: Vec<Vec<St
         columns,
         non_empty_cells,
     });
-    parse_summary_tables(parsed, sheet_name, &rows);
-    parse_line_item_table(parsed, sheet_name, &rows);
+    parse_summary_tables(parsed, sheet_name, &rows, row_offset);
+    parse_line_item_table(parsed, sheet_name, &rows, row_offset, column_offset);
 }
 
-fn parse_summary_tables(parsed: &mut ParsedWorkbook, sheet_name: &str, rows: &[Vec<String>]) {
+fn parse_summary_tables(
+    parsed: &mut ParsedWorkbook,
+    sheet_name: &str,
+    rows: &[Vec<String>],
+    row_offset: usize,
+) {
     for (row_index, row) in rows.iter().enumerate() {
         let first = normalize(row.first().map(String::as_str).unwrap_or(""));
         if first != "подрядчик" && first != "поставщик" {
@@ -306,7 +335,7 @@ fn parse_summary_tables(parsed: &mut ParsedWorkbook, sheet_name: &str, rows: &[V
                 total: None,
                 vat: String::new(),
                 notes: Vec::new(),
-                source_row: row_index + 1,
+                source_row: row_offset + row_index + 1,
             })
             .collect();
 
@@ -364,7 +393,13 @@ fn parse_summary_tables(parsed: &mut ParsedWorkbook, sheet_name: &str, rows: &[V
     }
 }
 
-fn parse_line_item_table(parsed: &mut ParsedWorkbook, sheet_name: &str, rows: &[Vec<String>]) {
+fn parse_line_item_table(
+    parsed: &mut ParsedWorkbook,
+    sheet_name: &str,
+    rows: &[Vec<String>],
+    row_offset: usize,
+    column_offset: usize,
+) {
     let Some(header) = detect_item_header(rows) else {
         return;
     };
@@ -372,9 +407,14 @@ fn parse_line_item_table(parsed: &mut ParsedWorkbook, sheet_name: &str, rows: &[
     if let Some(value) = &supplier {
         register_supplier(parsed, value);
     }
-    if header.matrix_prices {
+    let supplier_anchors = detect_supplier_anchors(parsed, rows, header.row_index);
+    for anchor in &supplier_anchors {
+        register_supplier(parsed, &anchor.supplier);
+    }
+    let offer_columns = map_supplier_offer_columns(rows, &header, &supplier_anchors);
+    if header.matrix_prices && offer_columns.is_empty() {
         parsed.warnings.push(format!(
-            "sheet '{sheet_name}' contains a multi-supplier price matrix; positions were extracted without assigning ambiguous prices"
+            "sheet '{sheet_name}' contains a price matrix whose supplier columns could not be mapped; human header mapping is required"
         ));
     }
 
@@ -397,7 +437,7 @@ fn parse_line_item_table(parsed: &mut ParsedWorkbook, sheet_name: &str, rows: &[
             continue;
         }
         consecutive_empty = 0;
-        if normalize(name).starts_with("итого") {
+        if looks_like_aggregate_row(name) {
             continue;
         }
         let quantity = header
@@ -414,7 +454,8 @@ fn parse_line_item_table(parsed: &mut ParsedWorkbook, sheet_name: &str, rows: &[
             .flatten()
             .and_then(|column| row.get(column))
             .and_then(|value| parse_number(value));
-        if quantity.is_none() && unit_price.is_none() && total.is_none() {
+        let offers = extract_supplier_offers(row, &offer_columns, column_offset);
+        if quantity.is_none() && unit_price.is_none() && total.is_none() && offers.is_empty() {
             if looks_like_section(name) {
                 section = name.to_owned();
             }
@@ -440,10 +481,207 @@ fn parse_line_item_table(parsed: &mut ParsedWorkbook, sheet_name: &str, rows: &[
             quantity,
             unit_price,
             total,
-            source_row: row_index + 1,
-            confidence: if header.matrix_prices { 0.78 } else { 0.9 },
+            offers,
+            source_row: row_offset + row_index + 1,
+            confidence: if header.matrix_prices && offer_columns.is_empty() {
+                0.78
+            } else if header.matrix_prices {
+                0.95
+            } else {
+                0.9
+            },
         });
     }
+}
+
+#[derive(Debug, Clone)]
+struct SupplierAnchor {
+    column: usize,
+    supplier: String,
+}
+
+#[derive(Debug, Clone)]
+struct SupplierOfferColumns {
+    supplier: String,
+    category: String,
+    unit_price_column: Option<usize>,
+    total_column: Option<usize>,
+}
+
+fn detect_supplier_anchors(
+    parsed: &ParsedWorkbook,
+    rows: &[Vec<String>],
+    header_row: usize,
+) -> Vec<SupplierAnchor> {
+    let start = header_row.saturating_sub(4);
+    let mut anchors = Vec::new();
+    for row in &rows[start..header_row] {
+        for (column, value) in row.iter().enumerate() {
+            let Some(supplier) = canonical_supplier_name(parsed, value) else {
+                continue;
+            };
+            anchors.push(SupplierAnchor { column, supplier });
+        }
+    }
+    anchors.sort_by_key(|anchor| anchor.column);
+    anchors.dedup_by(|left, right| left.column == right.column);
+    anchors
+}
+
+fn canonical_supplier_name(parsed: &ParsedWorkbook, value: &str) -> Option<String> {
+    let cleaned = clean_supplier_name(value);
+    let normalized = normalize(&cleaned);
+    if normalized.is_empty() {
+        return None;
+    }
+    if let Some(supplier) = parsed.suppliers.get(&normalized) {
+        return Some(supplier.name.clone());
+    }
+    let mut suffix_matches = parsed
+        .suppliers
+        .values()
+        .filter(|supplier| {
+            supplier.normalized_name == normalized
+                || supplier
+                    .normalized_name
+                    .strip_prefix("ооо ")
+                    .is_some_and(|name| name == normalized)
+                || supplier
+                    .normalized_name
+                    .strip_prefix("тоо ")
+                    .is_some_and(|name| name == normalized)
+        })
+        .map(|supplier| supplier.name.clone());
+    let first = suffix_matches.next();
+    if first.is_some() && suffix_matches.next().is_none() {
+        return first;
+    }
+    let raw_normalized = normalize(value);
+    let explicitly_labeled =
+        raw_normalized.starts_with("подрядчик ") || raw_normalized.starts_with("поставщик ");
+    let organization_prefix = ["ооо ", "тоо ", "ип ", "ао "]
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix));
+    if explicitly_labeled || organization_prefix {
+        Some(cleaned)
+    } else {
+        None
+    }
+}
+
+fn map_supplier_offer_columns(
+    rows: &[Vec<String>],
+    header: &ItemHeader,
+    anchors: &[SupplierAnchor],
+) -> Vec<SupplierOfferColumns> {
+    if anchors.is_empty() {
+        return Vec::new();
+    }
+    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let mut mapped: Vec<SupplierOfferColumns> = Vec::new();
+    for (anchor_index, anchor) in anchors.iter().enumerate() {
+        let end = anchors
+            .get(anchor_index + 1)
+            .map(|next| next.column)
+            .unwrap_or(columns);
+        let mut last_category: Option<String> = None;
+        for column in anchor.column..end {
+            let combined = normalize(
+                &(header.row_index..header.data_row_index)
+                    .filter_map(|row| rows.get(row).and_then(|values| values.get(column)))
+                    .map(String::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+            if combined.is_empty() {
+                continue;
+            }
+            let explicit_category = price_category(&combined).map(str::to_owned);
+            if explicit_category.is_some() {
+                last_category = explicit_category.clone();
+            }
+            let is_unit_price = combined.contains("цена за ед")
+                || combined.contains("стоимость ед")
+                || combined.contains("ст ть единицы")
+                || combined.contains("за ед");
+            let is_total = combined.contains("сумма") || combined.contains("итого");
+            if !is_unit_price && !is_total {
+                continue;
+            }
+            let category = explicit_category
+                .or_else(|| last_category.clone())
+                .unwrap_or_else(|| "price".into());
+            let entry = if let Some(existing) = mapped
+                .iter_mut()
+                .find(|entry| entry.supplier == anchor.supplier && entry.category == category)
+            {
+                existing
+            } else {
+                mapped.push(SupplierOfferColumns {
+                    supplier: anchor.supplier.clone(),
+                    category: category.clone(),
+                    unit_price_column: None,
+                    total_column: None,
+                });
+                mapped.last_mut().expect("offer column was just inserted")
+            };
+            if is_unit_price && entry.unit_price_column.is_none() {
+                entry.unit_price_column = Some(column);
+            }
+            if is_total && entry.total_column.is_none() {
+                entry.total_column = Some(column);
+            }
+        }
+    }
+    mapped.retain(|entry| entry.unit_price_column.is_some() || entry.total_column.is_some());
+    mapped
+}
+
+fn price_category(header: &str) -> Option<&'static str> {
+    if header.contains("материал") {
+        if header.contains("аналог") {
+            Some("materials_analogue")
+        } else {
+            Some("materials_project")
+        }
+    } else if header.contains("работ") {
+        Some("work")
+    } else {
+        None
+    }
+}
+
+fn extract_supplier_offers(
+    row: &[String],
+    columns: &[SupplierOfferColumns],
+    column_offset: usize,
+) -> Vec<SupplierOffer> {
+    columns
+        .iter()
+        .filter_map(|mapping| {
+            let unit_price = mapping
+                .unit_price_column
+                .and_then(|column| row.get(column))
+                .and_then(|value| parse_number(value));
+            let total = mapping
+                .total_column
+                .and_then(|column| row.get(column))
+                .and_then(|value| parse_number(value));
+            (unit_price.is_some() || total.is_some()).then(|| SupplierOffer {
+                supplier: mapping.supplier.clone(),
+                category: mapping.category.clone(),
+                unit_price,
+                total,
+                source_unit_price_column: mapping
+                    .unit_price_column
+                    .map(|column| column_offset + column + 1),
+                source_total_column: mapping
+                    .total_column
+                    .map(|column| column_offset + column + 1),
+            })
+        })
+        .collect()
 }
 
 struct ItemHeader {
@@ -460,6 +698,16 @@ struct ItemHeader {
 
 fn detect_item_header(rows: &[Vec<String>]) -> Option<ItemHeader> {
     for row_index in 0..usize::min(rows.len(), 35) {
+        let first_header_row: Vec<String> = rows[row_index]
+            .iter()
+            .map(|value| normalize(value))
+            .collect();
+        let name_column = first_header_row
+            .iter()
+            .position(|value| value.contains("наименование") || value.contains("название позиции"));
+        if name_column.is_none() {
+            continue;
+        }
         let columns = rows[row_index..usize::min(rows.len(), row_index + 3)]
             .iter()
             .map(Vec::len)
@@ -476,16 +724,13 @@ fn detect_item_header(rows: &[Vec<String>]) -> Option<ItemHeader> {
                 )
             })
             .collect();
-        let name_column = headers
-            .iter()
-            .position(|value| value.contains("наименование") || value.contains("название позиции"));
         let unit_column = headers.iter().position(|value| {
             value == "ед" || value.contains("ед изм") || value.contains("единица измер")
         });
         let quantity_column = headers.iter().position(|value| {
             value.contains("кол во") || value.contains("количество") || value.contains("объем")
         });
-        if name_column.is_none() || (unit_column.is_none() && quantity_column.is_none()) {
+        if unit_column.is_none() && quantity_column.is_none() {
             continue;
         }
         let price_columns: Vec<usize> = headers
@@ -543,8 +788,10 @@ fn detect_header_end(rows: &[Vec<String>], row_index: usize) -> usize {
             "видов работ",
             "изм",
             "единицы",
+            "кол",
             "стоимость",
             "цена",
+            "за ед",
             "сумма",
             "итого",
         ];
@@ -693,6 +940,13 @@ fn looks_like_section(value: &str) -> bool {
         || normalized.contains("сигнализация")
 }
 
+fn looks_like_aggregate_row(value: &str) -> bool {
+    let normalized = normalize(value);
+    normalized.starts_with("итого")
+        || normalized.starts_with("всего")
+        || normalized.starts_with("экономия")
+}
+
 fn collect_currency_markers(parsed: &mut ParsedWorkbook, rows: &[Vec<String>]) {
     for value in rows.iter().flat_map(|row| row.iter()) {
         let normalized = normalize(value);
@@ -768,7 +1022,7 @@ mod tests {
             vec!["Итого по проекту".into(), "350000".into(), "330000".into()],
         ];
         let mut parsed = ParsedWorkbook::default();
-        consume_sheet(&mut parsed, "Сводная", rows);
+        consume_sheet(&mut parsed, "Сводная", rows, 0, 0);
         assert_eq!(parsed.suppliers.len(), 2);
         assert_eq!(parsed.summaries.len(), 2);
         assert_eq!(parsed.summaries[0].total_project, Some(350_000.0));
@@ -799,7 +1053,7 @@ mod tests {
             ],
         ];
         let mut parsed = ParsedWorkbook::default();
-        consume_sheet(&mut parsed, "Кровля", rows);
+        consume_sheet(&mut parsed, "Кровля", rows, 0, 0);
         assert_eq!(parsed.line_items.len(), 1);
         assert_eq!(
             parsed.line_items[0].supplier.as_deref(),
@@ -807,5 +1061,123 @@ mod tests {
         );
         assert_eq!(parsed.line_items[0].source_row, 5);
         assert_eq!(parsed.line_items[0].quantity, Some(1134.26));
+        assert_eq!(parsed.line_items[0].offers.len(), 1);
+        assert_eq!(parsed.line_items[0].offers[0].supplier, "ООО ГрандСтрой");
+        assert_eq!(parsed.line_items[0].offers[0].category, "price");
+    }
+
+    #[test]
+    fn matrix_parser_maps_supplier_price_blocks() {
+        let rows = vec![
+            vec![
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                "ООО Первый".into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                "ТОО Второй".into(),
+                String::new(),
+            ],
+            vec![
+                "Наименование".into(),
+                "Ед. изм.".into(),
+                "Количество".into(),
+                String::new(),
+                "Работы".into(),
+                String::new(),
+                "Материалы".into(),
+                String::new(),
+                "Работы".into(),
+                String::new(),
+            ],
+            vec![
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                "Цена за ед.".into(),
+                "Сумма".into(),
+                "Цена за ед.".into(),
+                "Сумма".into(),
+                "Цена за ед.".into(),
+                "Сумма".into(),
+            ],
+            vec![
+                "Кабель".into(),
+                "м".into(),
+                "100".into(),
+                String::new(),
+                "25".into(),
+                "2500".into(),
+                "12".into(),
+                "1200".into(),
+                "23".into(),
+                "2300".into(),
+            ],
+            vec![
+                "Всего с НДС".into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                "2500".into(),
+                String::new(),
+                "1200".into(),
+                String::new(),
+                "2300".into(),
+            ],
+        ];
+        let mut parsed = ParsedWorkbook::default();
+        register_supplier(&mut parsed, "ООО Первый");
+        register_supplier(&mut parsed, "ТОО Второй");
+        consume_sheet(&mut parsed, "Электрика", rows, 0, 0);
+
+        assert_eq!(parsed.line_items.len(), 1);
+        let item = &parsed.line_items[0];
+        assert_eq!(item.quantity, Some(100.0));
+        assert_eq!(item.offers.len(), 3);
+        assert_eq!(item.offers[0].supplier, "ООО Первый");
+        assert_eq!(item.offers[0].category, "work");
+        assert_eq!(item.offers[0].unit_price, Some(25.0));
+        assert_eq!(item.offers[0].total, Some(2500.0));
+        assert_eq!(item.offers[0].source_unit_price_column, Some(5));
+        assert_eq!(item.offers[1].category, "materials_project");
+        assert_eq!(item.offers[2].supplier, "ТОО Второй");
+        assert_eq!(item.confidence, 0.95);
+        assert!(parsed.warnings.is_empty());
+    }
+
+    #[test]
+    fn matrix_without_supplier_headers_stays_fail_closed() {
+        let rows = vec![
+            vec![
+                "Наименование".into(),
+                "Ед. изм.".into(),
+                "Количество".into(),
+                "Цена за ед.".into(),
+                "Сумма".into(),
+                "Цена за ед.".into(),
+                "Сумма".into(),
+            ],
+            vec![
+                "Кабель".into(),
+                "м".into(),
+                "100".into(),
+                "25".into(),
+                "2500".into(),
+                "23".into(),
+                "2300".into(),
+            ],
+        ];
+        let mut parsed = ParsedWorkbook::default();
+        consume_sheet(&mut parsed, "Без заголовков", rows, 0, 0);
+
+        assert_eq!(parsed.line_items.len(), 1);
+        assert!(parsed.line_items[0].offers.is_empty());
+        assert_eq!(parsed.line_items[0].confidence, 0.78);
+        assert_eq!(parsed.warnings.len(), 1);
     }
 }

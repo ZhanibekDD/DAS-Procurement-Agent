@@ -92,6 +92,8 @@ print(json.dumps({
         ).read_text(encoding="utf-8")
         self.assertIn("previewSpreadsheet", html)
         self.assertIn("extract/spreadsheet-preview", html)
+        self.assertIn("Цены по позициям", html)
+        self.assertIn("offers.length", html)
         self.assertIn("Без автоматической записи", html)
 
 
