@@ -169,7 +169,9 @@ def _session_claims(session_token: str) -> dict[str, Any] | None:
             issuer=SESSION_ISSUER,
             audience=SESSION_AUDIENCE,
             kind="session",
-            max_ttl_seconds=settings.session_ttl_seconds,
+            max_ttl_seconds=max(
+                settings.session_ttl_seconds, settings.remember_ttl_seconds
+            ),
         )
     except TokenError:
         return None
@@ -304,6 +306,7 @@ def login(
     request: Request,
     username: str = Form(..., min_length=1, max_length=128),
     password: str = Form(..., min_length=1, max_length=256),
+    remember: bool = Form(False),
 ):
     if not settings.local_auth_configured:
         raise HTTPException(
@@ -327,6 +330,9 @@ def login(
         _record_login_failure(keys, now)
         return _login_page(error="invalid", status_code=403)
 
+    ttl_seconds = (
+        settings.remember_ttl_seconds if remember else settings.session_ttl_seconds
+    )
     session_token = issue_token(
         settings.auth_secret,
         issuer=SESSION_ISSUER,
@@ -334,20 +340,20 @@ def login(
         subject=settings.admin_username,
         role="admin",
         kind="session",
-        ttl_seconds=settings.session_ttl_seconds,
+        ttl_seconds=ttl_seconds,
     )
     db.audit(
         "local_login",
         "session",
         settings.admin_username,
         actor=settings.admin_username,
-        details={"role": "admin"},
+        details={"role": "admin", "remembered": remember},
     )
     response = RedirectResponse(url="/", status_code=303)
     response.set_cookie(
         SESSION_COOKIE,
         session_token,
-        max_age=settings.session_ttl_seconds,
+        max_age=ttl_seconds if remember else None,
         httponly=True,
         secure=settings.environment == "production",
         samesite="lax",

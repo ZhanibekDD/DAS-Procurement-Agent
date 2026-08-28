@@ -76,6 +76,23 @@ class SignedSessionTokenTests(unittest.TestCase):
                 now=1_700_000_010,
             )
 
+    def test_30_day_session_is_supported_but_longer_than_policy_is_rejected(self):
+        thirty_days = 30 * 24 * 60 * 60
+        token = self._issue(ttl=thirty_days)
+        claims = verify_token(
+            SECRET,
+            token,
+            issuer="das-procurement-agent",
+            audience="das-procurement-web",
+            kind="session",
+            max_ttl_seconds=thirty_days,
+            now=1_700_000_010,
+        )
+        self.assertEqual(claims["exp"] - claims["iat"], thirty_days)
+
+        with self.assertRaisesRegex(TokenError, "invalid token ttl"):
+            self._issue(ttl=91 * 24 * 60 * 60)
+
 
 class PasswordHashTests(unittest.TestCase):
     def test_scrypt_round_trip(self):
@@ -109,6 +126,7 @@ class StandaloneSettingsTests(unittest.TestCase):
         ):
             settings = Settings.from_env()
         self.assertTrue(settings.local_auth_configured)
+        self.assertEqual(settings.remember_ttl_seconds, 30 * 24 * 60 * 60)
         self.assertEqual(
             settings.trusted_proxy_networks,
             ("127.0.0.1/32", "172.17.0.1/32"),

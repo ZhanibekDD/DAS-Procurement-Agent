@@ -14,6 +14,7 @@ _ID_RE = re.compile(r"^[A-Za-z0-9_.:@-]{1,128}$")
 _JTI_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 _TOKEN_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _ALLOWED_ROLES = {"admin", "staff"}
+_MAX_TOKEN_TTL_SECONDS = 90 * 24 * 60 * 60
 
 
 class TokenError(ValueError):
@@ -54,7 +55,7 @@ def issue_token(
         raise TokenError("invalid role")
     if not _ID_RE.fullmatch(kind):
         raise TokenError("invalid token kind")
-    if not 1 <= ttl_seconds <= 86_400:
+    if not 1 <= ttl_seconds <= _MAX_TOKEN_TTL_SECONDS:
         raise TokenError("invalid token ttl")
 
     issued_at = int(time.time()) if now is None else int(now)

@@ -169,6 +169,7 @@ PROCUREMENT_AUTH_SECRET=<random urlsafe secret, at least 32 characters>
 PROCUREMENT_ADMIN_USERNAME=<standalone administrator login>
 PROCUREMENT_ADMIN_PASSWORD_HASH=<scrypt hash from python -m procurement.passwords>
 PROCUREMENT_SESSION_TTL_SECONDS=28800
+PROCUREMENT_REMEMBER_TTL_SECONDS=2592000
 PROCUREMENT_TRUSTED_PROXY_IPS=<exact nginx peer IP or CIDR>
 ```
 
@@ -178,6 +179,11 @@ production. Неудачные попытки ограничиваются. Па
 `PROCUREMENT_API_KEY` никогда не передаются клиентскому JavaScript и не
 сохраняются в `localStorage`. API-ключ предназначен только для внутренних
 server-to-server вызовов и аварийной диагностики.
+
+Флажок «Запомнить вход на этом устройстве на 30 дней» включён по умолчанию.
+Он сохраняет только подписанную `HttpOnly` cookie, но не пароль. Если флажок
+снять, cookie живёт только до закрытия браузера, а серверная сессия — время из
+`PROCUREMENT_SESSION_TTL_SECONDS`. Кнопка выхода немедленно удаляет cookie.
 
 Правильные учётные данные всегда снимают накопленный лимит, поэтому посторонний
 не может заблокировать администратора серией неверных паролей. Заголовок

@@ -78,10 +78,37 @@ class StandaloneAuthHttpFlowTests(unittest.TestCase):
         self.assertIn("HttpOnly", cookie)
         self.assertIn("SameSite=lax", cookie)
         self.assertIn("Secure", cookie)
+        self.assertNotIn("Max-Age", cookie)
         self.assertEqual(response.headers["cache-control"], "no-store")
 
         dashboard = self.client.get("/api/dashboard")
         self.assertEqual(dashboard.status_code, 200)
+
+    def test_login_page_offers_checked_30_day_remember_option(self):
+        response = self.client.get("/login")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('name="remember"', response.text)
+        self.assertIn('value="true" checked', response.text)
+        self.assertIn("Запомнить вход на этом устройстве на 30 дней", response.text)
+
+    def test_remembered_login_uses_persistent_30_day_cookie(self):
+        response = self.client.post(
+            "/auth/login",
+            data={
+                "username": ADMIN_USERNAME,
+                "password": ADMIN_PASSWORD,
+                "remember": "true",
+            },
+            follow_redirects=False,
+        )
+
+        self.assertEqual(response.status_code, 303)
+        cookie = response.headers["set-cookie"]
+        self.assertIn("Max-Age=2592000", cookie)
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("Secure", cookie)
+        self.assertEqual(self.client.get("/api/dashboard").status_code, 200)
 
     def test_unauthenticated_browser_is_redirected_to_login_and_api_fails_closed(self):
         root = self.client.get("/", follow_redirects=False)

@@ -45,6 +45,7 @@ class Settings:
     admin_username: str
     admin_password_hash: str
     session_ttl_seconds: int
+    remember_ttl_seconds: int = 30 * 24 * 60 * 60
     trusted_proxy_networks: tuple[str, ...] = ()
     mail_address: str = ""
     mail_username: str = ""
@@ -98,6 +99,11 @@ class Settings:
             ).strip(),
             session_ttl_seconds=int(
                 os.getenv("PROCUREMENT_SESSION_TTL_SECONDS", "28800").strip()
+            ),
+            remember_ttl_seconds=int(
+                os.getenv(
+                    "PROCUREMENT_REMEMBER_TTL_SECONDS", str(30 * 24 * 60 * 60)
+                ).strip()
             ),
             trusted_proxy_networks=trusted_proxy_networks,
             mail_address=os.getenv("PROCUREMENT_MAIL_ADDRESS", "").strip().lower(),
@@ -170,6 +176,15 @@ class Settings:
         if not 300 <= settings.session_ttl_seconds <= 86_400:
             raise RuntimeError(
                 "PROCUREMENT_SESSION_TTL_SECONDS must be between 300 and 86400"
+            )
+        if not (
+            settings.session_ttl_seconds
+            <= settings.remember_ttl_seconds
+            <= 7_776_000
+        ):
+            raise RuntimeError(
+                "PROCUREMENT_REMEMBER_TTL_SECONDS must be between the session TTL "
+                "and 7776000"
             )
         if settings.mail_address and (
             "@" not in settings.mail_address
