@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import logging
 import threading
 import time
 from contextlib import asynccontextmanager
