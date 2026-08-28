@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hmac
 import threading
 import time
@@ -20,16 +21,19 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 
 from .auth import TokenError, issue_token, verify_token
 from .config import Settings
 from .db import Database
 from .imports import parse_supplier_table
+from .mailbox import ImapMailbox, MailboxError, SmtpMailbox
 from .models import (
     ApprovalDecision,
     CampaignCreate,
     LotCreate,
+    MailDraftCreate,
+    MailLinkUpdate,
     ProcurementSuggestionApproval,
     ProcurementSuggestionBatch,
     ProcurementSuggestionRejection,
@@ -49,15 +53,92 @@ db = Database(settings.db_path)
 service = ProcurementService(db)
 
 
+def _imap_client() -> ImapMailbox:
+    return ImapMailbox(
+        host=settings.mail_imap_host,
+        port=settings.mail_imap_port,
+        username=settings.mail_username,
+        password=settings.mail_password,
+    )
+
+
+def _smtp_client() -> SmtpMailbox:
+    return SmtpMailbox(
+        host=settings.mail_smtp_host,
+        port=settings.mail_smtp_port,
+        username=settings.mail_username,
+        password=settings.mail_password,
+    )
+
+
+def _sync_mail_once() -> dict[str, Any]:
+    if not settings.mail_receive_enabled or not settings.mail_credentials_configured:
+        raise ConflictError("mail receiving is disabled")
+    sync_state = service.mailbox_sync_state(settings.mail_address)
+    try:
+        mailbox = _imap_client()
+        fetched = mailbox.fetch_since(
+            int(sync_state["last_uid"]), limit=settings.mail_sync_batch_size
+        )
+        if (
+            sync_state["uidvalidity"]
+            and fetched.uidvalidity
+            and sync_state["uidvalidity"] != fetched.uidvalidity
+        ):
+            fetched = mailbox.fetch_since(0, limit=settings.mail_sync_batch_size)
+        for uid, message in fetched.messages:
+            service.ingest_inbound_mail(
+                message,
+                mailbox_address=settings.mail_address,
+                imap_uid=uid,
+                imap_uidvalidity=fetched.uidvalidity,
+            )
+        service.record_mail_sync_success(
+            settings.mail_address,
+            uidvalidity=fetched.uidvalidity,
+            last_uid=fetched.highest_uid,
+        )
+        return {
+            "status": "ok",
+            "received": len(fetched.messages),
+            "last_uid": fetched.highest_uid,
+            "uidvalidity": fetched.uidvalidity,
+        }
+    except Exception as exc:
+        service.record_mail_sync_failure(settings.mail_address, str(exc))
+        raise
+
+
+async def _mail_sync_loop() -> None:
+    while True:
+        try:
+            await asyncio.to_thread(_sync_mail_once)
+        except Exception:
+            # _sync_mail_once persists the failure; keep the periodic worker alive.
+            pass
+        await asyncio.sleep(settings.mail_sync_interval_seconds)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     db.initialize()
-    yield
+    task = None
+    if settings.mail_receive_enabled:
+        task = asyncio.create_task(_mail_sync_loop())
+    try:
+        yield
+    finally:
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(
     title="DAS Снабжение",
-    version="0.7.0",
+    version="0.8.0",
     description="Internal supplier RFQ and tender comparison workflow",
     lifespan=lifespan,
 )
@@ -543,6 +624,163 @@ def list_outbox(
 def approve_message(message_id: int, decision: ApprovalDecision):
     try:
         return service.approve_message(message_id, decision.approved_by, decision.comment)
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
+@app.post(
+    "/api/outbox/{message_id}/mail-message",
+    dependencies=[Depends(require_access)],
+    status_code=201,
+)
+def create_mail_from_outbox(message_id: int):
+    try:
+        if not settings.mail_address:
+            raise ConflictError("mailbox address is not configured")
+        return service.create_mail_from_outbox(
+            message_id,
+            mailbox_address=settings.mail_address,
+            actor=settings.admin_username or "api-user",
+        )
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
+@app.get("/api/mail/status", dependencies=[Depends(require_access)])
+def mail_status():
+    state = service.mailbox_sync_state(settings.mail_address or "unconfigured")
+    return {
+        "address": settings.mail_address,
+        "configured": settings.mail_credentials_configured,
+        "receive_enabled": settings.mail_receive_enabled,
+        "send_enabled": settings.mail_send_enabled,
+        "last_synced_at": state["last_synced_at"],
+        "last_error": state["last_error"],
+    }
+
+
+@app.post("/api/mail/sync", dependencies=[Depends(require_access)])
+def sync_mail():
+    try:
+        return _sync_mail_once()
+    except MailboxError as exc:
+        raise HTTPException(status_code=502, detail="IMAP synchronization failed") from exc
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
+@app.get("/api/mail/messages", dependencies=[Depends(require_access)])
+def list_mail_messages(
+    direction: str = Query(default=""),
+    status: str = Query(default=""),
+    limit: int = Query(default=200, ge=1, le=500),
+):
+    try:
+        return service.list_mail_messages(
+            direction=direction, status=status, limit=limit
+        )
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
+@app.get("/api/mail/messages/{message_id}", dependencies=[Depends(require_access)])
+def get_mail_message(message_id: int):
+    try:
+        return service.get_mail_message(message_id)
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
+@app.get(
+    "/api/mail/attachments/{attachment_id}",
+    dependencies=[Depends(require_access)],
+    response_class=FileResponse,
+)
+def download_mail_attachment(attachment_id: int):
+    try:
+        attachment = service.get_mail_attachment(attachment_id)
+        response = FileResponse(
+            attachment["storage_path"],
+            media_type=attachment["content_type"],
+            filename=attachment["filename"],
+        )
+        response.headers["Cache-Control"] = "private, no-store"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
+@app.post(
+    "/api/mail/messages/{message_id}/link", dependencies=[Depends(require_access)]
+)
+def link_mail_message(message_id: int, data: MailLinkUpdate):
+    try:
+        return service.link_mail_message(
+            message_id,
+            data,
+            actor=settings.admin_username or "api-user",
+        )
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
+@app.post(
+    "/api/mail/drafts", dependencies=[Depends(require_access)], status_code=201
+)
+def create_mail_draft(data: MailDraftCreate):
+    try:
+        if not settings.mail_address:
+            raise ConflictError("mailbox address is not configured")
+        return service.create_mail_draft(
+            data,
+            mailbox_address=settings.mail_address,
+            actor=settings.admin_username or "api-user",
+        )
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
+@app.post(
+    "/api/mail/messages/{message_id}/approve",
+    dependencies=[Depends(require_access)],
+)
+def approve_mail_message(message_id: int, decision: ApprovalDecision):
+    try:
+        return service.approve_mail_draft(
+            message_id,
+            approved_by=decision.approved_by,
+            comment=decision.comment,
+        )
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
+@app.post(
+    "/api/mail/messages/{message_id}/send",
+    dependencies=[Depends(require_access)],
+)
+def send_mail_message(message_id: int, decision: ApprovalDecision):
+    if not settings.mail_send_enabled or not settings.mail_credentials_configured:
+        raise HTTPException(status_code=409, detail="mail sending is disabled")
+    try:
+        payload = service.mail_delivery_payload(message_id)
+        _smtp_client().send(
+            sender=settings.mail_address,
+            recipient=payload["recipients"][0],
+            subject=payload["subject"],
+            body=payload["body_text"],
+            message_id=payload["message_id"],
+            in_reply_to=payload["in_reply_to"],
+            references=payload["references"],
+            attachments=payload["delivery_attachments"],
+        )
+        return service.mark_mail_sent(message_id, actor=decision.approved_by)
+    except MailboxError as exc:
+        service.mark_mail_failed(
+            message_id, "SMTP delivery failed", actor=decision.approved_by
+        )
+        raise HTTPException(status_code=502, detail="SMTP delivery failed") from exc
     except Exception as exc:
         raise handle_domain_error(exc) from exc
 

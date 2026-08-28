@@ -157,3 +157,29 @@ class TemplateUpsert(StrictModel):
 class ApprovalDecision(StrictModel):
     approved_by: str = Field(min_length=2, max_length=160)
     comment: str = Field(default="", max_length=1000)
+
+
+class MailLinkUpdate(StrictModel):
+    supplier_id: int | None = Field(default=None, gt=0)
+    project_id: int | None = Field(default=None, gt=0)
+    lot_id: int | None = Field(default=None, gt=0)
+
+
+class MailDraftCreate(StrictModel):
+    recipient: str = Field(min_length=3, max_length=320)
+    subject: str = Field(min_length=2, max_length=500)
+    body: str = Field(min_length=1, max_length=50000)
+    supplier_id: int | None = Field(default=None, gt=0)
+    project_id: int | None = Field(default=None, gt=0)
+    lot_id: int | None = Field(default=None, gt=0)
+    reply_to_message_id: int | None = Field(default=None, gt=0)
+    source_document_ids: list[int] = Field(default_factory=list, max_length=20)
+
+    @field_validator("recipient")
+    @classmethod
+    def validate_recipient(cls, value: str) -> str:
+        if "\n" in value or "\r" in value:
+            raise ValueError("invalid email recipient")
+        if "@" not in value or value.startswith("@") or value.endswith("@"):
+            raise ValueError("invalid email recipient")
+        return value.lower()

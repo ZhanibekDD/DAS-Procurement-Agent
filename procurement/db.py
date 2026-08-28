@@ -179,6 +179,63 @@ CREATE TABLE IF NOT EXISTS source_documents (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS mail_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id TEXT NOT NULL UNIQUE,
+    mailbox_address TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    sender TEXT NOT NULL,
+    recipients_json TEXT NOT NULL DEFAULT '[]',
+    cc_json TEXT NOT NULL DEFAULT '[]',
+    subject TEXT NOT NULL DEFAULT '',
+    body_text TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL,
+    thread_key TEXT NOT NULL,
+    in_reply_to TEXT NOT NULL DEFAULT '',
+    references_json TEXT NOT NULL DEFAULT '[]',
+    imap_uid INTEGER,
+    imap_uidvalidity TEXT NOT NULL DEFAULT '',
+    supplier_id INTEGER REFERENCES suppliers(id) ON DELETE SET NULL,
+    project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+    lot_id INTEGER REFERENCES lots(id) ON DELETE SET NULL,
+    outbox_message_id INTEGER UNIQUE REFERENCES outbox_messages(id) ON DELETE SET NULL,
+    reply_to_message_id INTEGER REFERENCES mail_messages(id) ON DELETE SET NULL,
+    approved_by TEXT NOT NULL DEFAULT '',
+    approved_at TEXT,
+    sent_at TEXT,
+    received_at TEXT,
+    last_error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_mail_messages_folder
+ON mail_messages(direction, status, received_at DESC, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS ix_mail_messages_links
+ON mail_messages(lot_id, supplier_id, project_id);
+
+CREATE TABLE IF NOT EXISTS mail_attachments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mail_message_id INTEGER NOT NULL REFERENCES mail_messages(id) ON DELETE CASCADE,
+    source_document_id INTEGER REFERENCES source_documents(id) ON DELETE SET NULL,
+    filename TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    blocked_reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    UNIQUE(mail_message_id, sha256, filename)
+);
+
+CREATE TABLE IF NOT EXISTS mailbox_sync_state (
+    mailbox_address TEXT PRIMARY KEY,
+    uidvalidity TEXT NOT NULL DEFAULT '',
+    last_uid INTEGER NOT NULL DEFAULT 0,
+    last_synced_at TEXT,
+    last_error TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS procurement_suggestions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     source_document_id INTEGER NOT NULL REFERENCES source_documents(id) ON DELETE CASCADE,
