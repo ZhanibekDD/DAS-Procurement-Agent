@@ -32,7 +32,7 @@ from .models import (
     TemplateUpsert,
 )
 from .ranking import rank_quotes
-from .regions import resolve_cluster
+from .regions import infer_cluster, infer_region, resolve_cluster
 from .templates import render_template
 
 
@@ -1385,7 +1385,10 @@ class ProcurementService:
                         result.supplier_email,
                         result.supplier_phone,
                     )
-                    cluster, cluster_status = detect_cluster(result.supplier_region)
+                    supplier_region = result.supplier_region or infer_region(
+                        result.supplier_name, result.supplier_tax_id
+                    )
+                    cluster, cluster_status = detect_cluster(supplier_region)
                     raw_data = {
                         "name": result.supplier_name,
                         "tax_id": result.supplier_tax_id,
@@ -1418,7 +1421,7 @@ class ProcurementService:
                                     doc_id,
                                     result.supplier_name,
                                     result.supplier_tax_id,
-                                    result.supplier_region,
+                                    supplier_region,
                                     cluster,
                                     result.supplier_email,
                                     result.supplier_phone,
@@ -1591,10 +1594,56 @@ class ProcurementService:
             clauses.append("import_batch_id = ?")
             params.append(batch_id)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-        return self.db.all(
+        drafts = self.db.all(
             f"SELECT * FROM supplier_drafts {where} ORDER BY id DESC",
             tuple(params),
         )
+        suppliers = self.db.all(
+            "SELECT id, name, tax_id, region, cluster, email "
+            "FROM suppliers WHERE active = 1"
+        )
+        for draft in drafts:
+            matched = self._match_existing_supplier(draft, suppliers)
+            draft["matched_supplier_id"] = matched["id"] if matched else None
+            draft["matched_supplier_name"] = matched["name"] if matched else ""
+            draft["suggested_region"] = draft["region"] or (
+                matched["region"]
+                if matched
+                else infer_region(draft["name"], draft["tax_id"])
+            )
+            draft["suggested_cluster"] = (
+                draft["cluster"]
+                or (matched["cluster"] if matched else "")
+                or infer_cluster(draft["suggested_region"])
+            )
+        return drafts
+
+    @staticmethod
+    def _match_existing_supplier(
+        draft: dict[str, Any], suppliers: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        """Match deterministically: tax id, then email, then exact normalised name."""
+        draft_tax_id = re.sub(r"\D", "", str(draft.get("tax_id", "")))
+        if draft_tax_id:
+            for supplier in suppliers:
+                if re.sub(r"\D", "", str(supplier.get("tax_id", ""))) == draft_tax_id:
+                    return supplier
+
+        draft_email = str(draft.get("email", "")).strip().casefold()
+        if draft_email:
+            for supplier in suppliers:
+                if str(supplier.get("email", "")).strip().casefold() == draft_email:
+                    return supplier
+
+        normalise_name = lambda value: " ".join(
+            re.findall(r"[0-9a-zа-я]+", str(value).casefold().replace("ё", "е"))
+        )
+        draft_name = normalise_name(draft.get("name", ""))
+        if draft_name:
+            for supplier in suppliers:
+                if normalise_name(supplier.get("name", "")) == draft_name:
+                    return supplier
+        return None
 
     def confirm_supplier_draft(
         self,
@@ -1613,22 +1662,50 @@ class ProcurementService:
         phone = data.phone or draft["phone"]
         contact = data.contact_person or draft["contact_person"]
         region = data.region or draft["region"]
-        cluster = data.cluster or draft["cluster"]
+        if not region:
+            raise ValueError("supplier region is required before confirmation")
+        cluster = resolve_cluster(region, data.cluster or draft["cluster"])
+        if not cluster:
+            raise ValueError("supplier cluster is required before confirmation")
 
-        # Create confirmed supplier
-        supplier_data = SupplierCreate(
-            name=name,
-            region=region,
-            email=email,
-            phone=phone,
-            categories=[],
+        matched = self._match_existing_supplier(
+            {
+                "name": name,
+                "tax_id": draft["tax_id"],
+                "email": email,
+            },
+            self.db.all(
+                "SELECT id, name, tax_id, region, cluster, email "
+                "FROM suppliers WHERE active = 1"
+            ),
         )
-        try:
+        if matched and matched["cluster"] and matched["cluster"] != cluster:
+            raise ConflictError("existing supplier belongs to another cluster")
+
+        if matched:
+            supplier_id = int(matched["id"])
+            with self.db.connection() as conn:
+                conn.execute(
+                    """
+                    UPDATE suppliers
+                    SET region=CASE WHEN region='' THEN ? ELSE region END,
+                        cluster=CASE WHEN cluster='' THEN ? ELSE cluster END
+                    WHERE id=?
+                    """,
+                    (region, cluster, supplier_id),
+                )
+            supplier = self.get_supplier(supplier_id)
+        else:
+            supplier_data = SupplierCreate(
+                name=name,
+                tax_id=draft["tax_id"],
+                region=region,
+                email=email,
+                phone=phone,
+                cluster=cluster,
+                categories=[],
+            )
             supplier = self.create_supplier(supplier_data, source="import_batch")
-        except Exception as exc:
-            if "UNIQUE" in str(exc) or "already exists" in str(exc):
-                raise ConflictError(f"supplier already exists: {exc}") from exc
-            raise
 
         now = utcnow()
         with self.db.connection() as conn:
@@ -1636,10 +1713,19 @@ class ProcurementService:
                 """
                 UPDATE supplier_drafts
                 SET status='approved', confirmed_by=?, confirmed_at=?,
-                    review_notes=?, cluster=?
+                    review_notes=?, name=?, region=?, cluster=?,
+                    cluster_status='confirmed'
                 WHERE id=?
                 """,
-                (data.confirmed_by, now, data.review_notes, cluster, draft_id),
+                (
+                    data.confirmed_by,
+                    now,
+                    data.review_notes,
+                    name,
+                    region,
+                    cluster,
+                    draft_id,
+                ),
             )
             # Attach confirmed supplier to price history entries
             conn.execute(
@@ -1651,7 +1737,11 @@ class ProcurementService:
                 "supplier_draft",
                 draft_id,
                 actor=data.confirmed_by,
-                details={"supplier_id": supplier["id"]},
+                details={
+                    "supplier_id": supplier["id"],
+                    "reused_existing_supplier": bool(matched),
+                    "cluster": cluster,
+                },
                 conn=conn,
             )
         return supplier
@@ -1699,4 +1789,3 @@ class ProcurementService:
             f"SELECT * FROM price_history_entries {where} ORDER BY created_at DESC LIMIT ?",
             tuple(params),
         )
-

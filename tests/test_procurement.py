@@ -26,6 +26,7 @@ from procurement.models import (
     QuoteCreate,
     QuoteItemCreate,
     SupplierCreate,
+    SupplierDraftConfirm,
 )
 from procurement.service import ConflictError, ProcurementService
 from procurement.templates import render_template
@@ -774,6 +775,161 @@ class BatchImportTestCase(unittest.TestCase):
         result = self.service.reject_supplier_draft(drafts[0]["id"], RejectData())
         self.assertEqual(result["status"], "rejected")
 
+    def test_supplier_draft_reuses_existing_supplier_and_suggests_cluster(self):
+        existing = self.service.create_supplier(
+            SupplierCreate(
+                name="ПАО СБЕРБАНК",
+                tax_id="6678062559",
+                region="Свердловская область",
+                cluster="cluster_1",
+                email="bank@example.ru",
+            )
+        )
+        with self.db.connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO supplier_drafts(
+                    name, tax_id, email, dedup_key, status, cluster_status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "ПАО СБЕРБАНК г.",
+                    "6678062559",
+                    "m7@zavod3d.com",
+                    "sber-draft",
+                    "needs_review",
+                    "needs_review",
+                    "2026-08-29T00:00:00",
+                ),
+            )
+            draft_id = int(cursor.lastrowid)
+
+        draft = self.service.list_supplier_drafts(status="needs_review")[0]
+        self.assertEqual(draft["matched_supplier_id"], existing["id"])
+        self.assertEqual(draft["suggested_region"], "Свердловская область")
+        self.assertEqual(draft["suggested_cluster"], "cluster_1")
+
+        confirmed = self.service.confirm_supplier_draft(
+            draft_id,
+            SupplierDraftConfirm(
+                confirmed_by="Сотрудник снабжения",
+                region=draft["suggested_region"],
+                cluster=draft["suggested_cluster"],
+            ),
+        )
+        self.assertEqual(confirmed["id"], existing["id"])
+        self.assertEqual(len(self.service.list_suppliers()), 1)
+
+    def test_supplier_draft_confirmation_persists_tax_id_and_manual_cluster(self):
+        with self.db.connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO supplier_drafts(
+                    name, tax_id, dedup_key, status, cluster_status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "АО ГАЗПРОМНЕФТЬ НОЯБРЬСКНЕФТЕГАЗ",
+                    "8905000428",
+                    "gazprom-draft",
+                    "needs_review",
+                    "needs_review",
+                    "2026-08-29T00:00:00",
+                ),
+            )
+            draft_id = int(cursor.lastrowid)
+
+        confirmed = self.service.confirm_supplier_draft(
+            draft_id,
+            SupplierDraftConfirm(
+                confirmed_by="Сотрудник снабжения",
+                region="ЯНАО г Ноябрьск",
+                cluster="cluster_1",
+            ),
+        )
+        self.assertEqual(confirmed["tax_id"], "8905000428")
+        self.assertEqual(confirmed["region"], "ЯНАО г Ноябрьск")
+        self.assertEqual(confirmed["cluster"], "cluster_1")
+
+    def test_supplier_draft_suggests_region_and_cluster_from_inn(self):
+        with self.db.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO supplier_drafts(
+                    name, tax_id, dedup_key, status, cluster_status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "ПАО СБЕРБАНК г.",
+                    "6678062559",
+                    "sber-without-existing",
+                    "needs_review",
+                    "needs_review",
+                    "2026-08-29T00:00:00",
+                ),
+            )
+        draft = self.service.list_supplier_drafts(status="needs_review")[0]
+        self.assertEqual(draft["suggested_region"], "Свердловская область")
+        self.assertEqual(draft["suggested_cluster"], "cluster_1")
+
+    def test_supplier_draft_suggests_region_and_cluster_from_explicit_city_name(self):
+        with self.db.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO supplier_drafts(
+                    name, dedup_key, status, cluster_status, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    "АО ГАЗПРОМНЕФТЬ НОЯБРЬСКНЕФТЕГАЗ",
+                    "gazprom-name-region",
+                    "needs_review",
+                    "needs_review",
+                    "2026-08-29T00:00:00",
+                ),
+            )
+        draft = self.service.list_supplier_drafts(status="needs_review")[0]
+        self.assertEqual(draft["suggested_region"], "ЯНАО г Ноябрьск")
+        self.assertEqual(draft["suggested_cluster"], "cluster_1")
+
+    def test_supplier_draft_confirmation_requires_cluster(self):
+        with self.db.connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO supplier_drafts(
+                    name, dedup_key, status, cluster_status, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    "ООО Без региона",
+                    "no-cluster-draft",
+                    "needs_review",
+                    "needs_review",
+                    "2026-08-29T00:00:00",
+                ),
+            )
+
+        class IncompleteConfirmation:
+            confirmed_by = "Сотрудник снабжения"
+            region = "Неизвестный регион"
+            cluster = ""
+            name = email = phone = contact_person = None
+            review_notes = ""
+
+        with self.assertRaisesRegex(ValueError, "cluster is required"):
+            self.service.confirm_supplier_draft(
+                int(cursor.lastrowid), IncompleteConfirmation()
+            )
+
+    def test_supplier_draft_ui_uses_inline_region_and_cluster_fields(self):
+        html = (
+            Path(__file__).parents[1] / "procurement" / "static" / "index.html"
+        ).read_text(encoding="utf-8")
+        self.assertIn('class="draft-field draft-region"', html)
+        self.assertIn('class="draft-field draft-cluster"', html)
+        self.assertIn("Сначала укажите регион и кластер", html)
+        self.assertNotIn("cluster_south, cluster_moscow", html)
+
     def test_list_price_history_entries(self):
         content = self._xlsx_price_list([("Труба", "500", "10", "м")])
         batch = self.service.create_import_batch([("p.xlsx", content)])
@@ -1048,4 +1204,3 @@ class DockerfileProxyHeadersTestCase(unittest.TestCase):
             self.skipTest("Dockerfile not found (running in image without fix)")
         dockerfile = dockerfile_path.read_text(encoding="utf-8")
         self.assertIn("--no-proxy-headers", dockerfile)
-

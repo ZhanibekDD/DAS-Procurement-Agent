@@ -163,9 +163,9 @@ class ApprovalDecision(StrictModel):
 
 
 class SupplierDraftConfirm(StrictModel):
-    confirmed_by: str
-    cluster: str
-    region: str
+    confirmed_by: str = Field(min_length=2, max_length=160)
+    cluster: Literal["cluster_1", "cluster_2"]
+    region: str = Field(min_length=2, max_length=120)
     name: str | None = None
     email: str | None = None
     phone: str | None = None
