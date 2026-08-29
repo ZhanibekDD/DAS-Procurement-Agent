@@ -22,6 +22,7 @@ test = ["pytest>=8,<10", "httpx>=0.27,<1"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+python_files = ["test_*.py", "rust_ingest_acceptance.py"]
 
 [tool.setuptools.package-data]
 procurement = ["static/*.html"]
