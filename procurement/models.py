@@ -157,3 +157,27 @@ class TemplateUpsert(StrictModel):
 class ApprovalDecision(StrictModel):
     approved_by: str = Field(min_length=2, max_length=160)
     comment: str = Field(default="", max_length=1000)
+
+
+# ── PR #8: batch import & price-history models ───────────────────────────────
+
+
+class SupplierDraftConfirm(StrictModel):
+    confirmed_by: str = Field(min_length=2, max_length=160)
+    cluster: Literal["cluster_1", "cluster_2"]
+    region: str = Field(min_length=2, max_length=120)
+    name: str | None = None
+    email: str | None = None
+    phone: str | None = None
+    contact_person: str | None = None
+    review_notes: str = ''
+
+
+class SupplierDraftReject(StrictModel):
+    rejected_by: str
+    review_notes: str = ''
+
+
+class BatchImportConfirm(StrictModel):
+    confirmed_by: str
+    entry_ids: list[int]

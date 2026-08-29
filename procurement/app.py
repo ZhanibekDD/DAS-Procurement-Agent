@@ -39,6 +39,10 @@ from .models import (
     SectionCreate,
     SupplierCreate,
     TemplateUpsert,
+
+    BatchImportConfirm,
+    SupplierDraftConfirm,
+    SupplierDraftReject,
 )
 from .passwords import verify_password
 from .service import ConflictError, NotFoundError, ProcurementService
@@ -57,7 +61,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="DAS Снабжение",
-    version="0.7.0",
+    version="0.8.0",
     description="Internal supplier RFQ and tender comparison workflow",
     lifespan=lifespan,
 )
@@ -618,3 +622,100 @@ def list_audit(limit: int = Query(default=50, ge=1, le=200)):
         return service.list_audit(limit)
     except Exception as exc:
         raise handle_domain_error(exc) from exc
+
+
+# ── PR #8: batch import & supplier-drafts endpoints ──────────────────────────
+
+
+@app.post("/api/imports/batch", dependencies=[Depends(require_access)], status_code=201)
+async def batch_import(
+    files: list[UploadFile] = File(...),
+    created_by: str = Query(default="system"),
+):
+    """Upload 1-20 КП/счёт/прайс-лист files; returns batch record with drafts & entries."""
+    if not files:
+        raise HTTPException(status_code=422, detail="at least one file is required")
+    if len(files) > 20:
+        raise HTTPException(status_code=422, detail="maximum 20 files per batch")
+    file_pairs: list[tuple[str, bytes]] = []
+    for f in files:
+        content = await f.read(25 * 1024 * 1024 + 1)
+        if len(content) > 25 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail=f"file {f.filename!r} exceeds 25 MB")
+        file_pairs.append((f.filename or "unnamed", content))
+    try:
+        return service.create_import_batch(file_pairs, created_by=created_by)
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
+@app.get("/api/imports", dependencies=[Depends(require_access)])
+def list_import_batches():
+    try:
+        return service.list_import_batches()
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
+@app.get("/api/imports/{batch_id}", dependencies=[Depends(require_access)])
+def get_import_batch(batch_id: int):
+    try:
+        return service.get_import_batch(batch_id)
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
+@app.post("/api/imports/{batch_id}/confirm", dependencies=[Depends(require_access)])
+def confirm_batch(batch_id: int, data: BatchImportConfirm):
+    try:
+        return service.confirm_batch_entries(batch_id, data.entry_ids, data.confirmed_by)
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
+@app.get("/api/supplier-drafts", dependencies=[Depends(require_access)])
+def list_supplier_drafts(
+    status: str = Query(default="needs_review"),
+    batch_id: int | None = Query(default=None),
+):
+    try:
+        return service.list_supplier_drafts(status=status, batch_id=batch_id)
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
+@app.post("/api/supplier-drafts/{draft_id}/confirm", dependencies=[Depends(require_access)])
+def confirm_supplier_draft(draft_id: int, data: SupplierDraftConfirm):
+    try:
+        return service.confirm_supplier_draft(draft_id, data)
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
+@app.post("/api/supplier-drafts/{draft_id}/reject", dependencies=[Depends(require_access)])
+def reject_supplier_draft(draft_id: int, data: SupplierDraftReject):
+    try:
+        return service.reject_supplier_draft(draft_id, data)
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
+@app.get("/api/price-history-entries", dependencies=[Depends(require_access)])
+def list_price_history_entries(
+    search: str = Query(default=""),
+    status: str = Query(default="confirmed"),
+    supplier_id: int | None = Query(default=None),
+    batch_id: int | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=500),
+):
+    try:
+        return service.list_price_history_entries(
+            search=search,
+            status=status,
+            supplier_id=supplier_id,
+            batch_id=batch_id,
+            limit=limit,
+        )
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+

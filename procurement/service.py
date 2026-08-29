@@ -32,7 +32,7 @@ from .models import (
     TemplateUpsert,
 )
 from .ranking import rank_quotes
-from .regions import resolve_cluster
+from .regions import infer_cluster, infer_region, resolve_cluster
 from .templates import render_template
 
 
@@ -1290,3 +1290,502 @@ class ProcurementService:
                 )["n"]
             ),
         }
+
+    # ── PR #8: batch import & price-history service ───────────────────────────
+
+    def create_import_batch(
+        self,
+        files: list[tuple[str, bytes]],
+        *,
+        created_by: str = "system",
+    ) -> dict[str, Any]:
+        """Create a batch import job and process all files synchronously."""
+        from .imports import (
+            extract_document,
+            detect_cluster,
+            supplier_dedup_key,
+            price_validity_state,
+        )
+        from datetime import date
+
+        filenames = [fn for fn, _ in files]
+        sha256_map: dict[str, str] = {}
+        errors: list[str] = []
+        all_items: list[dict[str, Any]] = []
+
+        with self.db.connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO import_batches(
+                    status, filenames_json, total_files, processed_files,
+                    sha256_json, created_by, created_at
+                ) VALUES (?, ?, ?, 0, ?, ?, ?)
+                """,
+                (
+                    "processing",
+                    json.dumps(filenames, ensure_ascii=False),
+                    len(files),
+                    json.dumps({}, ensure_ascii=False),
+                    created_by,
+                    utcnow(),
+                ),
+            )
+            batch_id = cursor.lastrowid
+            self.db.audit(
+                "created",
+                "import_batch",
+                batch_id,
+                actor=created_by,
+                details={"total_files": len(files)},
+                conn=conn,
+            )
+
+        processed = 0
+        for filename, content in files:
+            try:
+                result = extract_document(content, filename)
+                sha256_map[filename] = result.sha256
+
+                # Register source document (dedup by sha256)
+                existing_doc = self.db.one(
+                    "SELECT id FROM source_documents WHERE sha256 = ?",
+                    (result.sha256,),
+                )
+                if existing_doc:
+                    doc_id: int = existing_doc["id"]
+                else:
+                    with self.db.connection() as conn:
+                        c = conn.execute(
+                            """
+                            INSERT INTO source_documents(
+                                filename, content_type, size_bytes, sha256,
+                                document_type, storage_path, extraction_status, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                filename,
+                                "application/pdf" if filename.endswith(".pdf") else
+                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                len(content),
+                                result.sha256,
+                                'internal',
+                                result.document_type,
+                                "extracted",
+                                utcnow(),
+                            ),
+                        )
+                        doc_id = c.lastrowid
+
+                # Create supplier draft (dedup by dedup_key)
+                draft_id: int | None = None
+                if result.supplier_name or result.supplier_tax_id:
+                    dedup_key = supplier_dedup_key(
+                        result.supplier_tax_id,
+                        result.supplier_name,
+                        result.supplier_email,
+                        result.supplier_phone,
+                    )
+                    supplier_region = result.supplier_region or infer_region(
+                        result.supplier_name, result.supplier_tax_id
+                    )
+                    cluster, cluster_status = detect_cluster(supplier_region)
+                    raw_data = {
+                        "name": result.supplier_name,
+                        "tax_id": result.supplier_tax_id,
+                        "region": result.supplier_region,
+                        "email": result.supplier_email,
+                        "phone": result.supplier_phone,
+                        "contact_person": result.supplier_contact,
+                        "document_date": result.document_date,
+                    }
+                    existing_draft = self.db.one(
+                        "SELECT id FROM supplier_drafts WHERE dedup_key = ?",
+                        (dedup_key,),
+                    )
+                    if existing_draft:
+                        draft_id = existing_draft["id"]
+                    else:
+                        with self.db.connection() as conn:
+                            c = conn.execute(
+                                """
+                                INSERT INTO supplier_drafts(
+                                    import_batch_id, source_document_id,
+                                    name, tax_id, region, cluster,
+                                    email, phone, contact_person,
+                                    raw_json, dedup_key,
+                                    status, cluster_status, created_at
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    batch_id,
+                                    doc_id,
+                                    result.supplier_name,
+                                    result.supplier_tax_id,
+                                    supplier_region,
+                                    cluster,
+                                    result.supplier_email,
+                                    result.supplier_phone,
+                                    result.supplier_contact,
+                                    json.dumps(raw_data, ensure_ascii=False),
+                                    dedup_key,
+                                    "needs_review",
+                                    cluster_status,
+                                    utcnow(),
+                                ),
+                            )
+                            draft_id = c.lastrowid
+
+                # Store price history entries — skip if already imported (SHA256 dedup)
+                existing_entry_count = self.db.one(
+                    "SELECT COUNT(*) AS n FROM price_history_entries"
+                    " WHERE source_document_id = ?",
+                    (doc_id,),
+                )
+                entries_already_exist = (
+                    existing_entry_count and existing_entry_count["n"] > 0
+                )
+                if entries_already_exist:
+                    # Re-import: reuse existing entries, no duplicates
+                    existing_for_doc = self.db.all(
+                        "SELECT item_name, unit_price FROM price_history_entries"
+                        " WHERE source_document_id = ?",
+                        (doc_id,),
+                    )
+                    all_items.extend(existing_for_doc)
+                else:
+                    v_state = price_validity_state(result.valid_until)
+                    for item in result.items:
+                        with self.db.connection() as conn:
+                            conn.execute(
+                                """
+                            INSERT INTO price_history_entries(
+                                import_batch_id, source_document_id, supplier_draft_id,
+                                item_name, brand, normalized_name,
+                                quantity, unit, unit_price, total_price,
+                                currency, vat_included,
+                                document_date, valid_until, validity_state,
+                                source_page, source_sheet, source_row, source_cell, source_text,
+                                status, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    batch_id,
+                                    doc_id,
+                                    draft_id,
+                                    item.item_name,
+                                    item.brand,
+                                    item.normalized_name,
+                                    item.quantity,
+                                    item.unit,
+                                    item.unit_price,
+                                    item.total_price,
+                                    item.currency,
+                                    int(item.vat_included),
+                                    result.document_date,
+                                    result.valid_until,
+                                    v_state,
+                                    item.source_page,
+                                    item.source_sheet,
+                                    item.source_row,
+                                    item.source_cell,
+                                    item.source_text,
+                                    "draft",
+                                    utcnow(),
+                                ),
+                            )
+                        all_items.append({"item_name": item.item_name, "unit_price": item.unit_price})
+
+                if result.errors:
+                    errors.extend(f"{filename}: {e}" for e in result.errors)
+
+            except Exception as exc:
+                errors.append(f"{filename}: extraction failed — {exc}")
+
+            processed += 1
+
+        # Update batch status
+        final_status = "needs_review" if (all_items or errors) else "done"
+        with self.db.connection() as conn:
+            conn.execute(
+                """
+                UPDATE import_batches
+                SET status = ?, processed_files = ?, sha256_json = ?
+                WHERE id = ?
+                """,
+                (
+                    final_status,
+                    processed,
+                    json.dumps(sha256_map, ensure_ascii=False),
+                    batch_id,
+                ),
+            )
+
+        return self.get_import_batch(batch_id)
+
+    def get_import_batch(self, batch_id: int) -> dict[str, Any]:
+        row = self.db.one("SELECT * FROM import_batches WHERE id = ?", (batch_id,))
+        if not row:
+            raise NotFoundError("import batch not found")
+        row["filenames"] = json.loads(row.pop("filenames_json"))
+        row["sha256"] = json.loads(row.pop("sha256_json"))
+        row["supplier_drafts"] = self.db.all(
+            "SELECT * FROM supplier_drafts WHERE import_batch_id = ? ORDER BY id",
+            (batch_id,),
+        )
+        row["price_history_entries"] = self.db.all(
+            "SELECT * FROM price_history_entries WHERE import_batch_id = ? ORDER BY id",
+            (batch_id,),
+        )
+        return row
+
+    def list_import_batches(self) -> list[dict[str, Any]]:
+        rows = self.db.all("SELECT * FROM import_batches ORDER BY id DESC")
+        for row in rows:
+            row["filenames"] = json.loads(row.pop("filenames_json"))
+            row["sha256"] = json.loads(row.pop("sha256_json"))
+        return rows
+
+    def confirm_batch_entries(
+        self,
+        batch_id: int,
+        entry_ids: list[int],
+        confirmed_by: str,
+    ) -> dict[str, Any]:
+        self.get_import_batch(batch_id)
+        now = utcnow()
+        confirmed = 0
+        for eid in entry_ids:
+            row = self.db.one(
+                "SELECT id FROM price_history_entries WHERE id = ? AND import_batch_id = ?",
+                (eid, batch_id),
+            )
+            if not row:
+                raise NotFoundError(f"price_history_entry {eid} not in batch {batch_id}")
+            with self.db.connection() as conn:
+                conn.execute(
+                    "UPDATE price_history_entries SET status='confirmed', confirmed_by=?, confirmed_at=? WHERE id=?",
+                    (confirmed_by, now, eid),
+                )
+            confirmed += 1
+        # Mark batch done if all entries reviewed
+        remaining = self.db.one(
+            "SELECT COUNT(*) AS n FROM price_history_entries WHERE import_batch_id=? AND status='draft'",
+            (batch_id,),
+        )
+        if remaining and remaining["n"] == 0:
+            with self.db.connection() as conn:
+                conn.execute(
+                    "UPDATE import_batches SET status='done', reviewed_at=? WHERE id=?",
+                    (now, batch_id),
+                )
+            self.db.audit("completed", "import_batch", batch_id, actor=confirmed_by,
+                          details={"confirmed": confirmed})
+        return {"confirmed": confirmed}
+
+    def list_supplier_drafts(
+        self, status: str = "", batch_id: int | None = None
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if batch_id is not None:
+            clauses.append("import_batch_id = ?")
+            params.append(batch_id)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        drafts = self.db.all(
+            f"SELECT * FROM supplier_drafts {where} ORDER BY id DESC",
+            tuple(params),
+        )
+        suppliers = self.db.all(
+            "SELECT id, name, tax_id, region, cluster, email "
+            "FROM suppliers WHERE active = 1"
+        )
+        for draft in drafts:
+            matched = self._match_existing_supplier(draft, suppliers)
+            draft["matched_supplier_id"] = matched["id"] if matched else None
+            draft["matched_supplier_name"] = matched["name"] if matched else ""
+            draft["suggested_region"] = draft["region"] or (
+                matched["region"]
+                if matched
+                else infer_region(draft["name"], draft["tax_id"])
+            )
+            draft["suggested_cluster"] = (
+                draft["cluster"]
+                or (matched["cluster"] if matched else "")
+                or infer_cluster(draft["suggested_region"])
+            )
+        return drafts
+
+    @staticmethod
+    def _match_existing_supplier(
+        draft: dict[str, Any], suppliers: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        """Match deterministically: tax id, then email, then exact normalised name."""
+        draft_tax_id = re.sub(r"\D", "", str(draft.get("tax_id", "")))
+        if draft_tax_id:
+            for supplier in suppliers:
+                if re.sub(r"\D", "", str(supplier.get("tax_id", ""))) == draft_tax_id:
+                    return supplier
+
+        draft_email = str(draft.get("email", "")).strip().casefold()
+        if draft_email:
+            for supplier in suppliers:
+                if str(supplier.get("email", "")).strip().casefold() == draft_email:
+                    return supplier
+
+        normalise_name = lambda value: " ".join(
+            re.findall(r"[0-9a-zа-я]+", str(value).casefold().replace("ё", "е"))
+        )
+        draft_name = normalise_name(draft.get("name", ""))
+        if draft_name:
+            for supplier in suppliers:
+                if normalise_name(supplier.get("name", "")) == draft_name:
+                    return supplier
+        return None
+
+    def confirm_supplier_draft(
+        self,
+        draft_id: int,
+        data: Any,
+    ) -> dict[str, Any]:
+        from .models import SupplierCreate
+        draft = self.db.one("SELECT * FROM supplier_drafts WHERE id = ?", (draft_id,))
+        if not draft:
+            raise NotFoundError("supplier draft not found")
+        if draft["status"] not in ("needs_review", "pending"):
+            raise ValueError(f"draft status is {draft['status']!r}, expected needs_review")
+
+        name = data.name or draft["name"]
+        email = data.email or draft["email"]
+        phone = data.phone or draft["phone"]
+        contact = data.contact_person or draft["contact_person"]
+        region = data.region or draft["region"]
+        if not region:
+            raise ValueError("supplier region is required before confirmation")
+        cluster = resolve_cluster(region, data.cluster or draft["cluster"])
+        if not cluster:
+            raise ValueError("supplier cluster is required before confirmation")
+
+        matched = self._match_existing_supplier(
+            {
+                "name": name,
+                "tax_id": draft["tax_id"],
+                "email": email,
+            },
+            self.db.all(
+                "SELECT id, name, tax_id, region, cluster, email "
+                "FROM suppliers WHERE active = 1"
+            ),
+        )
+        if matched and matched["cluster"] and matched["cluster"] != cluster:
+            raise ConflictError("existing supplier belongs to another cluster")
+
+        if matched:
+            supplier_id = int(matched["id"])
+            with self.db.connection() as conn:
+                conn.execute(
+                    """
+                    UPDATE suppliers
+                    SET region=CASE WHEN region='' THEN ? ELSE region END,
+                        cluster=CASE WHEN cluster='' THEN ? ELSE cluster END
+                    WHERE id=?
+                    """,
+                    (region, cluster, supplier_id),
+                )
+            supplier = self.get_supplier(supplier_id)
+        else:
+            supplier_data = SupplierCreate(
+                name=name,
+                tax_id=draft["tax_id"],
+                region=region,
+                email=email,
+                phone=phone,
+                cluster=cluster,
+                categories=[],
+            )
+            supplier = self.create_supplier(supplier_data, source="import_batch")
+
+        now = utcnow()
+        with self.db.connection() as conn:
+            conn.execute(
+                """
+                UPDATE supplier_drafts
+                SET status='approved', confirmed_by=?, confirmed_at=?,
+                    review_notes=?, name=?, region=?, cluster=?,
+                    cluster_status='confirmed'
+                WHERE id=?
+                """,
+                (
+                    data.confirmed_by,
+                    now,
+                    data.review_notes,
+                    name,
+                    region,
+                    cluster,
+                    draft_id,
+                ),
+            )
+            # Attach confirmed supplier to price history entries
+            conn.execute(
+                "UPDATE price_history_entries SET supplier_id=?, status='confirmed' WHERE supplier_draft_id=? AND status='draft'",
+                (supplier["id"], draft_id),
+            )
+            self.db.audit(
+                "approved",
+                "supplier_draft",
+                draft_id,
+                actor=data.confirmed_by,
+                details={
+                    "supplier_id": supplier["id"],
+                    "reused_existing_supplier": bool(matched),
+                    "cluster": cluster,
+                },
+                conn=conn,
+            )
+        return supplier
+
+    def reject_supplier_draft(self, draft_id: int, data: Any) -> dict[str, Any]:
+        draft = self.db.one("SELECT * FROM supplier_drafts WHERE id = ?", (draft_id,))
+        if not draft:
+            raise NotFoundError("supplier draft not found")
+        with self.db.connection() as conn:
+            conn.execute(
+                "UPDATE supplier_drafts SET status='rejected', confirmed_by=?, review_notes=? WHERE id=?",
+                (data.rejected_by, data.review_notes, draft_id),
+            )
+            self.db.audit(
+                "rejected", "supplier_draft", draft_id,
+                actor=data.rejected_by, details={"notes": data.review_notes}, conn=conn,
+            )
+        return self.db.one("SELECT * FROM supplier_drafts WHERE id = ?", (draft_id,)) or {}
+
+    def list_price_history_entries(
+        self,
+        search: str = "",
+        status: str = "confirmed",
+        supplier_id: int | None = None,
+        batch_id: int | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if supplier_id is not None:
+            clauses.append("supplier_id = ?")
+            params.append(supplier_id)
+        if batch_id is not None:
+            clauses.append("import_batch_id = ?")
+            params.append(batch_id)
+        if search:
+            clauses.append("(item_name LIKE ? OR normalized_name LIKE ?)")
+            params.extend([f"%{search}%", f"%{search}%"])
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        return self.db.all(
+            f"SELECT * FROM price_history_entries {where} ORDER BY created_at DESC LIMIT ?",
+            tuple(params),
+        )

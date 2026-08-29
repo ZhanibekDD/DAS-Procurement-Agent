@@ -6,6 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 COPY pyproject.toml ./
 COPY procurement ./procurement
+COPY Dockerfile /app/Dockerfile
 RUN pip install --no-cache-dir .
 
 RUN useradd --create-home --uid 10001 procurement \
