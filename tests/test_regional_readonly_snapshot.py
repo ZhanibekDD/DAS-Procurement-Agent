@@ -1,5 +1,6 @@
 from contextlib import closing
 import hashlib
+import importlib.util
 from pathlib import Path
 import signal
 import sqlite3
@@ -142,3 +143,18 @@ def test_snapshot_size_limit_and_signal_restored(db, monkeypatch):
     with pytest.raises(migration.PreconditionError, match="bounded regular"):
         migration.migrate(db)
     assert signal.getsignal(signal.SIGIO) == old
+
+
+def test_rehearsal_prechecks_do_not_create_wal_sidecars(db):
+    closed_wal(db)
+    module_path = Path(__file__).resolve().parents[1] / "scripts/rehearse_regional_mapping.py"
+    spec = importlib.util.spec_from_file_location("readonly_rehearsal_test", module_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    before = db.read_bytes()
+    module.check_backup(db)
+    assert len(module.business(db)["suppliers"]) == 2
+    assert migration.migrate(db)["business_changes"] == 3
+    assert db.read_bytes() == before
+    assert not Path(str(db) + "-wal").exists()
+    assert not Path(str(db) + "-shm").exists()

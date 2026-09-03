@@ -22,6 +22,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from procurement.migrations.regional_mapping_v1 import MAPPING_SHA256, migrate
+from procurement.migrations.readonly_snapshot import readonly_snapshot
 from procurement.passwords import hash_password
 
 OLD_IMAGE = "sha256:9c2ff106a6fa1d174b1ea286bc3f354bb397096c5f2de91d1d0ef3ac1f2602b9"
@@ -52,14 +53,14 @@ with closing(sqlite3.connect('file:'+os.environ['PROCUREMENT_DB_PATH']+'?mode=ro
  print(json.dumps({t:[dict(r) for r in c.execute('SELECT * FROM '+t+' ORDER BY id')] for t in ('suppliers','projects','lots')}))
 """
         return json.loads(command(["docker", "exec", container, "python3", "-B", "-c", code]))
-    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as c:
+    with readonly_snapshot(path) as (c, _):
         c.row_factory = sqlite3.Row
         return {t: [dict(r) for r in c.execute(f"SELECT * FROM {t} ORDER BY id")]
                 for t in ("suppliers", "projects", "lots")}
 
 
 def check_backup(path):
-    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as c:
+    with readonly_snapshot(path) as (c, _):
         assert c.execute("PRAGMA integrity_check").fetchone()[0] == "ok", "backup integrity"
         assert not c.execute("PRAGMA foreign_key_check").fetchall(), "backup foreign keys"
 
