@@ -1,4 +1,5 @@
 import concurrent.futures
+from contextlib import closing
 import hashlib
 import json
 import sqlite3
@@ -19,7 +20,7 @@ APPROVAL = {"mapping_sha": migration.MAPPING_SHA256, "expected_count": 3, "actor
 @pytest.fixture
 def db(tmp_path):
     path = tmp_path / "production-copy.db"
-    with sqlite3.connect(path) as c:
+    with closing(sqlite3.connect(path)) as c, c:
         c.executescript("""
         CREATE TABLE suppliers(id INTEGER PRIMARY KEY,tax_id TEXT,region TEXT,cluster TEXT,
                                active INTEGER,verified INTEGER,created_at TEXT);
@@ -39,13 +40,13 @@ def db(tmp_path):
 
 
 def rows(db):
-    with sqlite3.connect(db) as c:
+    with closing(sqlite3.connect(db)) as c, c:
         return {t: c.execute(f"SELECT * FROM {t} ORDER BY id").fetchall()
                 for t in ("suppliers", "projects", "lots")}
 
 
 def edit(db, sql, params=()):
-    with sqlite3.connect(db) as c:
+    with closing(sqlite3.connect(db)) as c, c:
         c.execute(sql, params)
 
 
@@ -69,7 +70,7 @@ def test_default_dry_run_is_byte_identical_and_does_not_create_journal(db, capsy
     assert migration.main(["--db", str(db)]) == 0
     assert json.loads(capsys.readouterr().out)["business_changes"] == 3
     assert db.read_bytes() == before
-    with sqlite3.connect(db) as c:
+    with closing(sqlite3.connect(db)) as c, c:
         assert not c.execute("SELECT name FROM sqlite_master WHERE name=?", (migration.JOURNAL,)).fetchall()
 
 
@@ -80,7 +81,7 @@ def test_apply_repeat_rollback_and_repeat(db):
     assert after["suppliers"][0] == before["suppliers"][0]
     assert {r["cluster"] for r in migration.migrate(db)["rows"]} == {"cluster_2"}
     assert migration.migrate(db, mode="apply", **APPROVAL)["business_changes"] == 0
-    with sqlite3.connect(db) as c:
+    with closing(sqlite3.connect(db)) as c, c:
         journal = c.execute(f"SELECT before_json,after_json FROM {migration.JOURNAL}").fetchone()
         assert len(json.loads(journal[0])) == len(json.loads(journal[1])) == 3
         assert c.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0] == 1

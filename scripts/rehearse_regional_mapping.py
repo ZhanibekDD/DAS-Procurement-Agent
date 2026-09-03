@@ -64,7 +64,7 @@ def check_backup(path):
         assert not c.execute("PRAGMA foreign_key_check").fetchall(), "backup foreign keys"
 
 
-def start(name, image, data, auth, work):
+def start(name, image, data, auth, work, retain_env=False):
     fd, envfile = tempfile.mkstemp(prefix=".rehearsal-env-", dir=work)
     try:
         os.fchmod(fd, 0o600)
@@ -74,7 +74,8 @@ def start(name, image, data, auth, work):
                  "--label", "purpose=regional-mapping-rehearsal", "--env-file", envfile,
                  "--mount", f"type=bind,source={data},target=/data", image])
     finally:
-        os.unlink(envfile)
+        if not retain_env:
+            os.unlink(envfile)
     command(["docker", "start", name])
     for _ in range(60):
         p = subprocess.run(["docker", "exec", name, "python3", "-B", "-c",
@@ -99,7 +100,7 @@ def log_counts(name):
             "oom": int(inspect(name)["State"]["OOMKilled"])}
 
 
-def rehearse(work, new_image, revision):
+def rehearse(work, new_image, revision, existing_backup=None):
     work = Path(work)
     if work.parent.resolve() != Path("/home/dnepr/releases").resolve() or work.exists():
         raise ValueError("rehearsal requires a NEW direct child of /home/dnepr/releases")
@@ -115,17 +116,26 @@ def rehearse(work, new_image, revision):
     work.mkdir(mode=0o700)
     evidence = {"source_commit": revision, "old_image": OLD_IMAGE,
                 "new_image": candidate["Id"], "mapping_sha256": MAPPING_SHA256,
-                "source_db_open_mode": "ro", "published_ports": [], "network": "none"}
+                "source_db_open_mode": "not opened" if existing_backup else "ro", "published_ports": [], "network": "none"}
     running = []
     try:
-        prod_before = business(SOURCE_DB, container="procurement")
         backup = work / "production.online-backup.db"
-        with closing(sqlite3.connect(SOURCE_DB.as_uri() + "?mode=ro", uri=True)) as src:
-            with closing(sqlite3.connect(backup)) as dst:
-                src.backup(dst, pages=256, sleep=0.01)
+        if existing_backup is not None:
+            existing = Path(existing_backup).resolve()
+            expected = Path('/home/dnepr/releases/procurement-rm1-rehearsal-c5c5dfcbd091/production.online-backup.db')
+            expected_sha = 'bc3f36230f595f1cda5488b95a7daea6c23d9c86dbedc893f23b9a471e067543'
+            assert existing == expected and sha(existing) == expected_sha, 'archived backup mismatch'
+            shutil.copyfile(existing, backup)
+            evidence.update(source_db_opened=False, fresh_backup_created=False,
+                            source_existing_backup=str(existing), source_existing_backup_sha256=expected_sha)
+        else:
+            prod_before = business(SOURCE_DB, container="procurement")
+            with closing(sqlite3.connect(SOURCE_DB.as_uri() + "?mode=ro", uri=True)) as src:
+                with closing(sqlite3.connect(backup)) as dst:
+                    src.backup(dst, pages=256, sleep=0.01)
         backup.chmod(0o600)
         check_backup(backup)
-        evidence.update(backup_api="sqlite3.Connection.backup", backup_sha256=sha(backup),
+        evidence.update(backup_api="existing verified archive" if existing_backup else "sqlite3.Connection.backup", backup_sha256=sha(backup),
                         backup_integrity="ok", backup_foreign_key_errors=0)
         data = work / "data"
         data.mkdir(mode=0o700)
@@ -153,7 +163,7 @@ def rehearse(work, new_image, revision):
                 "PROCUREMENT_OUTBOX_MODE": "draft_only"}
         # Stop even a partially started rehearsal container on error; never production.
         running.append(names[0])
-        start(names[0], new_image, data, auth, work)
+        start(names[0], new_image, data, auth, work, retain_env=existing_backup is not None)
         api_code = """import os,json,urllib.request
 url='http://127.0.0.1:9200/api/lots/1/supplier-matches'
 r=urllib.request.urlopen(urllib.request.Request(url,headers={'X-API-Key':os.environ['PROCUREMENT_API_KEY']}),timeout=5)
@@ -176,7 +186,7 @@ print(json.dumps({'http':r.status,'matched_supplier_ids':ids}))
         assert business(db) == baseline, "logical rollback mismatch"
         evidence.update(rollback_business_changes=3, rollback_repeat_changes=0, exact_business_rows_restored=True)
         running.append(names[1])
-        start(names[1], OLD_IMAGE, data, auth, work)
+        start(names[1], OLD_IMAGE, data, auth, work, retain_env=existing_backup is not None)
         assert inspect(names[1])["Image"] == OLD_IMAGE
         assert business(db, container=names[1]) == baseline
         evidence["rollback_image_health"] = 200
@@ -193,8 +203,12 @@ print(json.dumps({'http':r.status,'matched_supplier_ids':ids}))
         evidence["excluded_supplier_unchanged"] = True
         end = inspect("procurement")
         evidence["production_identity_unchanged"] = all(production[k] == end[k] for k in ("Id", "Image", "RestartCount")) and production["State"]["StartedAt"] == end["State"]["StartedAt"]
-        evidence["production_business_rows_unchanged"] = business(SOURCE_DB, container="procurement") == prod_before
-        assert evidence["production_identity_unchanged"] and evidence["production_business_rows_unchanged"]
+        if existing_backup is None:
+            evidence["production_business_rows_unchanged"] = business(SOURCE_DB, container="procurement") == prod_before
+            assert evidence["production_business_rows_unchanged"]
+        else:
+            assert sha(existing) == expected_sha, 'archived backup changed'
+        assert evidence["production_identity_unchanged"]
         evidence["status"] = "PASS"
     finally:
         evidence.setdefault("status", "FAIL")
@@ -213,5 +227,6 @@ if __name__ == "__main__":
     p.add_argument("--workdir", required=True)
     p.add_argument("--new-image", required=True)
     p.add_argument("--source-commit", required=True)
+    p.add_argument("--existing-backup", help="Use the pinned, previously verified archive; do not open production DB")
     args = p.parse_args()
-    rehearse(args.workdir, args.new_image, args.source_commit)
+    rehearse(args.workdir, args.new_image, args.source_commit, args.existing_backup)

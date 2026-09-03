@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from procurement import regions
+from procurement.migrations.readonly_snapshot import SnapshotBlocked, readonly_snapshot
 
 MIGRATION_ID = "20260904_regional_mapping_v1"
 MAPPING_SHA256 = "6359d5adc6c5255b4721c378b6849b471881b92bb55f1beb6f69c6147f48aeda"
@@ -125,6 +126,32 @@ def update_targets(conn: sqlite3.Connection, direction: str) -> int:
     return changed
 
 
+def plan(conn: sqlite3.Connection, mode: str = "dry-run") -> dict[str, Any]:
+    """SELECT-only planner, shared by a private RAM reader and guarded writer."""
+    before = snapshot(conn)
+    check_dependencies(conn)
+    journal = read_journal(conn)
+    if journal:
+        status = journal["status"]
+        if status not in {"applied", "rolled_back"}:
+            raise PreconditionError("invalid journal status")
+        expected = json.loads(journal["after_json" if status == "applied" else "before_json"])
+        if before != expected:
+            raise PreconditionError("post-migration row drift; manual review required")
+        if mode == "apply" and status == "rolled_back":
+            raise PreconditionError("rolled-back migration requires a new approved version")
+        changes = 3 if mode == "rollback" and status == "applied" else 0
+    else:
+        if mode == "rollback":
+            raise PreconditionError("rollback requires an applied journal")
+        if any(r["cluster"] != spec["before"] for r, spec in zip(before, TARGETS)):
+            raise PreconditionError("old cluster mismatch; unjournaled/partial changes rejected")
+        status, changes = "ready", 3
+    return {"migration_id": MIGRATION_ID, "mode": mode, "mapping_sha256": MAPPING_SHA256,
+            "plan_sha256": PLAN_SHA256, "status": status,
+            "business_changes": changes, "rows": before}
+
+
 def migrate(db: str | Path, *, mode: str = "dry-run", mapping_sha: str | None = None,
             expected_count: int | None = None, actor: str | None = None) -> dict[str, Any]:
     if mode not in {"dry-run", "apply", "rollback"}:
@@ -136,34 +163,24 @@ def migrate(db: str | Path, *, mode: str = "dry-run", mapping_sha: str | None = 
     path = Path(db)
     if path.is_symlink() or not path.is_file():
         raise PreconditionError("database must be an existing regular non-symlink file")
-    uri = path.resolve().as_uri() + ("?mode=ro" if mode == "dry-run" else "?mode=rw")
+    if mode == "dry-run":
+        try:
+            with readonly_snapshot(path) as (reader, evidence):
+                result = plan(reader)
+                result["reader"] = evidence
+                return result
+        except SnapshotBlocked as exc:
+            raise PreconditionError(str(exc)) from exc
+    uri = path.resolve().as_uri() + "?mode=rw"
     conn = sqlite3.connect(uri, uri=True, timeout=10, isolation_level=None)
     conn.row_factory = sqlite3.Row
     try:
-        conn.execute("BEGIN" if mode == "dry-run" else "BEGIN IMMEDIATE")
-        before = snapshot(conn)
-        check_dependencies(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        result = plan(conn, mode)
+        before = result["rows"]
+        changes = result["business_changes"]
         journal = read_journal(conn)
-        if journal:
-            status = journal["status"]
-            if status not in {"applied", "rolled_back"}:
-                raise PreconditionError("invalid journal status")
-            expected = json.loads(journal["after_json" if status == "applied" else "before_json"])
-            if before != expected:
-                raise PreconditionError("post-migration row drift; manual review required")
-            if mode == "apply" and status == "rolled_back":
-                raise PreconditionError("rolled-back migration requires a new approved version")
-            changes = 3 if mode == "rollback" and status == "applied" else 0
-        else:
-            if mode == "rollback":
-                raise PreconditionError("rollback requires an applied journal")
-            if any(r["cluster"] != spec["before"] for r, spec in zip(before, TARGETS)):
-                raise PreconditionError("old cluster mismatch; unjournaled/partial changes rejected")
-            status, changes = "ready", 3
-        result = {"migration_id": MIGRATION_ID, "mode": mode, "mapping_sha256": MAPPING_SHA256,
-                  "plan_sha256": PLAN_SHA256, "status": status,
-                  "business_changes": changes, "rows": before}
-        if mode == "dry-run" or changes == 0:
+        if changes == 0:
             conn.rollback()
             return result
         now = datetime.now(timezone.utc).isoformat()
@@ -218,6 +235,8 @@ def main(argv: list[str] | None = None) -> int:
     except (PreconditionError, sqlite3.Error, OSError) as exc:
         # Do not dump SQL parameters, complete rows, paths or environment values.
         print(json.dumps({"status": "blocked", "error_type": type(exc).__name__,
+                          "sqlite_errorcode": getattr(exc, "sqlite_errorcode", None),
+                          "sqlite_errorname": getattr(exc, "sqlite_errorname", None),
                           "reason": str(exc) if isinstance(exc, PreconditionError) else "database operation failed"}))
         return 2
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))

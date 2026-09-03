@@ -2,5 +2,6 @@
 !procurement/
 !procurement/**
 !Dockerfile.regional-release
+!Dockerfile.regional-release-v2
 procurement/**/__pycache__/
 procurement/**/*.pyc
