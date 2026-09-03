@@ -6,6 +6,7 @@ mutation targets are a NEW release directory and two no-network containers.
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import hashlib
 import json
 import os
@@ -40,15 +41,25 @@ def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def business(path):
-    with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as c:
+def business(path, container=None):
+    if container is not None:
+        # Read live WAL state with the application's UID/SQLite runtime. Never
+        # leave host-side connections open across a container lifecycle change.
+        code = """import os,sqlite3,json
+from contextlib import closing
+with closing(sqlite3.connect('file:'+os.environ['PROCUREMENT_DB_PATH']+'?mode=ro',uri=True)) as c:
+ c.row_factory=sqlite3.Row
+ print(json.dumps({t:[dict(r) for r in c.execute('SELECT * FROM '+t+' ORDER BY id')] for t in ('suppliers','projects','lots')}))
+"""
+        return json.loads(command(["docker", "exec", container, "python3", "-B", "-c", code]))
+    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as c:
         c.row_factory = sqlite3.Row
         return {t: [dict(r) for r in c.execute(f"SELECT * FROM {t} ORDER BY id")]
                 for t in ("suppliers", "projects", "lots")}
 
 
 def check_backup(path):
-    with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as c:
+    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as c:
         assert c.execute("PRAGMA integrity_check").fetchone()[0] == "ok", "backup integrity"
         assert not c.execute("PRAGMA foreign_key_check").fetchall(), "backup foreign keys"
 
@@ -107,10 +118,10 @@ def rehearse(work, new_image, revision):
                 "source_db_open_mode": "ro", "published_ports": [], "network": "none"}
     running = []
     try:
-        prod_before = business(SOURCE_DB)
+        prod_before = business(SOURCE_DB, container="procurement")
         backup = work / "production.online-backup.db"
-        with sqlite3.connect(SOURCE_DB.as_uri() + "?mode=ro", uri=True) as src:
-            with sqlite3.connect(backup) as dst:
+        with closing(sqlite3.connect(SOURCE_DB.as_uri() + "?mode=ro", uri=True)) as src:
+            with closing(sqlite3.connect(backup)) as dst:
                 src.backup(dst, pages=256, sleep=0.01)
         backup.chmod(0o600)
         check_backup(backup)
@@ -151,7 +162,7 @@ assert 2 in ids and 1 not in ids
 print(json.dumps({'http':r.status,'matched_supplier_ids':ids}))
 """
         evidence["new_image_matches"] = json.loads(command(["docker", "exec", names[0], "python3", "-B", "-c", api_code]))
-        state = business(db)
+        state = business(db, container=names[0])
         assert state["suppliers"][0] == baseline["suppliers"][0], "excluded supplier changed"
         assert state["suppliers"][1]["cluster"] == state["projects"][0]["cluster"] == state["lots"][0]["cluster"] == "cluster_2"
         evidence["new_image_health"] = 200
@@ -167,7 +178,7 @@ print(json.dumps({'http':r.status,'matched_supplier_ids':ids}))
         running.append(names[1])
         start(names[1], OLD_IMAGE, data, auth, work)
         assert inspect(names[1])["Image"] == OLD_IMAGE
-        assert business(db) == baseline
+        assert business(db, container=names[1]) == baseline
         evidence["rollback_image_health"] = 200
         evidence["rollback_image_logs"] = log_counts(names[1])
         assert not any(evidence["rollback_image_logs"].values()), "old image log error"
@@ -182,10 +193,11 @@ print(json.dumps({'http':r.status,'matched_supplier_ids':ids}))
         evidence["excluded_supplier_unchanged"] = True
         end = inspect("procurement")
         evidence["production_identity_unchanged"] = all(production[k] == end[k] for k in ("Id", "Image", "RestartCount")) and production["State"]["StartedAt"] == end["State"]["StartedAt"]
-        evidence["production_business_rows_unchanged"] = business(SOURCE_DB) == prod_before
+        evidence["production_business_rows_unchanged"] = business(SOURCE_DB, container="procurement") == prod_before
         assert evidence["production_identity_unchanged"] and evidence["production_business_rows_unchanged"]
         evidence["status"] = "PASS"
     finally:
+        evidence.setdefault("status", "FAIL")
         for name in running:
             subprocess.run(["docker", "stop", "--time", "20", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         dest = work / "evidence.json"
