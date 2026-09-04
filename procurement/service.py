@@ -466,6 +466,8 @@ class ProcurementService:
 
     def add_quote(self, lot_id: int, data: QuoteCreate) -> dict[str, Any]:
         lot = self.get_lot(lot_id)
+        if data.currency != lot["currency"]:
+            raise ValueError("quote currency must match lot currency; exchange conversion is not configured")
         self.get_supplier(data.supplier_id)
         lot_item_ids = {int(item["id"]) for item in lot["items"]}
         submitted_ids = {item.lot_item_id for item in data.items}
@@ -738,6 +740,8 @@ class ProcurementService:
         )
         rows = []
         for quote in quotes:
+            if quote["currency"] != lot["currency"]:
+                raise ValueError("stored quote currency differs from lot; review is required before ranking")
             items = self.db.all("SELECT * FROM quote_items WHERE quote_id = ?", (quote["id"],))
             subtotal = sum(
                 requested[int(item["lot_item_id"])] * Decimal(item["unit_price"]) for item in items

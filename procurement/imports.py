@@ -124,6 +124,7 @@ import hashlib
 import re
 from dataclasses import dataclass, field
 from datetime import date as _date
+from decimal import Decimal, InvalidOperation
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +171,42 @@ _CURRENCY_MAP = {
     'руб': 'RUB', 'rub': 'RUB', 'rur': 'RUB', 'р.': 'RUB',
     'usd': 'USD', 'доллар': 'USD', '$': 'USD',
     'eur': 'EUR', 'евро': 'EUR', '€': 'EUR',
+    'kzt': 'KZT', 'тенге': 'KZT', '₸': 'KZT',
 }
+
+_CURRENCY_PATTERNS = {
+    'RUB': r'(?<!\w)(?:rub|rur|руб(?:ль|ля|лей)?\.?)(?!\w)|₽',
+    'USD': r'(?<!\w)(?:usd|доллар(?:ов|а)?)(?!\w)|\$',
+    'EUR': r'(?<!\w)(?:eur|евро)(?!\w)|€',
+    'KZT': r'(?<!\w)(?:kzt|тенге)(?!\w)|₸',
+}
+
+
+def _explicit_currencies(text: str) -> set[str]:
+    return {code for code, pattern in _CURRENCY_PATTERNS.items()
+            if re.search(pattern, text, re.I)}
+
+
+def _vat_context(text: str) -> bool | None:
+    without = bool(re.search(r'\bбез\s+ндс\b', text, re.I))
+    included = bool(re.search(r'\b(?:с\s+ндс|включая\s+ндс|ндс\s+включ[её]н)\b', text, re.I))
+    if without and included:
+        raise ValueError('conflicting VAT declarations require review')
+    return False if without else True if included else None
+
+
+def _decimal_price(value: str) -> str:
+    """Keep currency amounts decimal and reject signs/text instead of stripping them."""
+    normalized = re.sub(r'[\s\u00a0\u202f]', '', value)
+    if not re.fullmatch(r'\d+(?:[.,]\d+)?', normalized):
+        raise ValueError('invalid or ambiguous price requires review')
+    try:
+        amount = Decimal(normalized.replace(',', '.'))
+    except InvalidOperation as exc:
+        raise ValueError('invalid price requires review') from exc
+    if not amount.is_finite() or amount <= 0:
+        raise ValueError('price must be positive')
+    return format(amount, 'f')
 
 
 def detect_currency(text: str) -> str:
@@ -571,33 +607,49 @@ def extract_from_xlsx(content: bytes, filename: str) -> DocumentExtractResult:
 
     all_items: list[ExtractedItem] = []
     header_text_parts: list[str] = []
+    sheets: list[tuple[str, list[tuple], int, list[str], str]] = []
+    try:
+        sheet_rows = [(name, list(wb[name].iter_rows(values_only=True)))
+                      for name in wb.sheetnames]
+    finally:
+        wb.close()
 
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        rows = list(ws.iter_rows(values_only=True))
+    # A document title mentioning "price" is not itself a table header.
+    for sheet_name, rows in sheet_rows:
         if not rows:
             continue
-
-        for row in rows[:10]:
-            header_text_parts.append(' '.join(str(c) for c in row if c is not None))
-
         header_idx: int | None = None
         headers: list[str] = []
         for i, row in enumerate(rows):
             row_strs = [str(c).strip() if c is not None else '' for c in row]
-            row_cf = ' '.join(row_strs).casefold()
-            if any(n in row_cf for n in (
-                'наименование',
-                'цена', 'price', 'item', 'name',
-                'количество',
-            )):
+            if (_col_index(row_strs, _NAME_COL_NAMES) is not None
+                    and _col_index(row_strs, _PRICE_COL_NAMES) is not None):
                 header_idx = i
                 headers = row_strs
                 break
-
         if header_idx is None:
-            errors.append(f'Sheet {sheet_name!r}: no header row found')
+            errors.append(f'Sheet {sheet_name!r}: required columns not found')
             continue
+        header_text = ' '.join(str(c) for row in rows[:header_idx + 1]
+                               for c in row if c is not None)
+        header_text_parts.append(header_text)
+        sheets.append((sheet_name, rows, header_idx, headers, header_text))
+
+    workbook_currencies = _explicit_currencies(' '.join(header_text_parts))
+    for sheet_name, rows, header_idx, headers, sheet_header in sheets:
+        sheet_currencies = _explicit_currencies(sheet_header)
+        currencies = sheet_currencies or workbook_currencies or {'RUB'}
+        if len(currencies) != 1:
+            errors.append(f'Sheet {sheet_name!r}: ambiguous currency requires review')
+            continue
+        sheet_currency = next(iter(currencies))
+        try:
+            # Do not inherit VAT across sheets: each price table is its own context.
+            explicit_vat = _vat_context(sheet_header)
+        except ValueError as exc:
+            errors.append(f'Sheet {sheet_name!r}: {exc}')
+            continue
+        sheet_vat = True if explicit_vat is None else explicit_vat
 
         name_col = _col_index(headers, _NAME_COL_NAMES)
         price_col = _col_index(headers, _PRICE_COL_NAMES)
@@ -620,8 +672,14 @@ def extract_from_xlsx(content: bytes, filename: str) -> DocumentExtractResult:
             unit = cells[unit_col] if unit_col is not None and unit_col < len(cells) else ''
             if not name or not price:
                 continue
-            price_clean = re.sub(r'[^\d.,]', '', str(price))
-            if not price_clean:
+            row_currencies = _explicit_currencies(' '.join(cells))
+            if row_currencies and row_currencies != {sheet_currency}:
+                errors.append(f'Sheet {sheet_name!r} row {row_idx}: currency conflicts with header')
+                continue
+            try:
+                price_clean = _decimal_price(str(price))
+            except ValueError as exc:
+                errors.append(f'Sheet {sheet_name!r} row {row_idx}: {exc}')
                 continue
             norm = re.sub(r'[^а-яa-z0-9 ]+', ' ', name.casefold()).strip()
             all_items.append(ExtractedItem(
@@ -632,8 +690,8 @@ def extract_from_xlsx(content: bytes, filename: str) -> DocumentExtractResult:
                 unit=unit,
                 unit_price=price_clean,
                 total_price='',
-                currency='RUB',
-                vat_included=True,
+                currency=sheet_currency,
+                vat_included=sheet_vat,
                 source_page=None,
                 source_sheet=sheet_name,
                 source_row=row_idx,
@@ -643,8 +701,11 @@ def extract_from_xlsx(content: bytes, filename: str) -> DocumentExtractResult:
 
     header_text = ' '.join(header_text_parts)
     doc_type = _classify_document(header_text)
-    currency = detect_currency(header_text)
-    vat_included = 'без ндс' not in header_text.casefold()
+    item_currencies = {item.currency for item in all_items}
+    currency = (next(iter(item_currencies)) if len(item_currencies) == 1
+                else 'MIXED' if len(item_currencies) > 1 else detect_currency(header_text))
+    # Per-item values are authoritative; the document summary is not used for persistence.
+    vat_included = all(item.vat_included for item in all_items) if all_items else False
     doc_date = extract_date(header_text)
 
     tax_id_m = _SUPPLIER_INN_RE.search(header_text)
