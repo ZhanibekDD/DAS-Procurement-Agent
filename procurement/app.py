@@ -136,7 +136,12 @@ async def das_identity_boundary(request: Request, call_next):
         if not getattr(request.state, "sso_logout", False):
             _set_sso_session(response, principal)
         response.headers["Cache-Control"] = "no-store"
-        response.headers["Referrer-Policy"] = "no-referrer"
+        # Form-bearing UI must preserve Origin on POST, including same-site SSO
+        # across ports. Do not permit Origin:null or relax the CSRF boundary.
+        response.headers["Referrer-Policy"] = (
+            "strict-origin" if path == "/" and response.headers.get("content-type", "").split(";")[0] == "text/html"
+            else "no-referrer"
+        )
         return response
     except sso.SSOError as exc:
         return JSONResponse({"detail": str(exc)}, status_code=exc.status,
@@ -283,7 +288,7 @@ def _login_page(*, error: str = "", status_code: int = 200) -> HTMLResponse:
         status_code=status_code,
     )
     response.headers["Cache-Control"] = "no-store"
-    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Referrer-Policy"] = "strict-origin"
     return response
 
 
@@ -447,6 +452,7 @@ def index(
                                   + html.escape(principal["csrf"], quote=True) + '">')
     response = HTMLResponse(content)
     response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "strict-origin"
     return response
 
 

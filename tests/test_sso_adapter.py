@@ -127,7 +127,7 @@ def test_sso_exchange_pkce_secure_namespaced_cookies_and_live_introspection(boun
         sso.authenticate(other, client.cookies.get(session_name))
 
 
-@pytest.mark.parametrize("mutation", ["state", "unicode_state", "signature", "expiry", "verifier", "origin"])
+@pytest.mark.parametrize("mutation", ["state", "unicode_state", "signature", "expiry", "verifier", "origin", "null_origin"])
 def test_state_cookie_pkce_and_origin_tampering_fail_closed(boundary, mutation):
     client, authority, settings, _ = boundary
     response = client.get("/auth/sso", follow_redirects=False)
@@ -143,6 +143,8 @@ def test_state_cookie_pkce_and_origin_tampering_fail_closed(boundary, mutation):
         state = "я" * 43
     elif mutation == "origin":
         request_origin = "https://attacker.invalid"
+    elif mutation == "null_origin":
+        request_origin = "null"
     elif mutation == "signature":
         cookie = cookie[:-1] + ("A" if cookie[-1] != "A" else "B")
     else:
@@ -216,7 +218,7 @@ def test_read_only_denies_writes_and_unclassified_get_without_calling_handler(bo
     assert database.one("SELECT count(*) AS n FROM projects")["n"] == 0
 
 
-@pytest.mark.parametrize("csrf_case", ["missing", "wrong", "wrong_origin", "missing_origin"])
+@pytest.mark.parametrize("csrf_case", ["missing", "wrong", "wrong_origin", "missing_origin", "null_origin"])
 def test_cookie_writes_require_csrf_and_exact_origin(boundary, csrf_case):
     client, authority, _, database = boundary
     identity = login(client, authority)
@@ -227,6 +229,8 @@ def test_cookie_writes_require_csrf_and_exact_origin(boundary, csrf_case):
         request_headers["X-CSRF-Token"] = "forged"
     elif csrf_case == "wrong_origin":
         request_headers["Origin"] = "https://attacker.invalid"
+    elif csrf_case == "null_origin":
+        request_headers["Origin"] = "null"
     else:
         request_headers.pop("Origin")
     result = client.post("/api/projects", json={"name": "Test", "region": "Воронеж", "delivery_address": "Test address"},
@@ -267,6 +271,30 @@ def test_root_renders_sso_csrf_and_logout_does_not_reissue_session(boundary):
     assert result.status_code == 303
     assert client.cookies.get(sso.cookie_names(settings)[0]) is None
     assert client.get("/api/dashboard").status_code == 401
+
+
+def test_form_ui_preserves_origin_but_json_and_sso_redirects_keep_no_referrer(boundary):
+    client, authority, settings, _ = boundary
+    start = client.get("/auth/sso", follow_redirects=False)
+    assert start.headers["referrer-policy"] == "no-referrer"
+    identity = login(client, authority)
+    page = client.get("/")
+    assert page.headers["referrer-policy"] == "strict-origin"
+    assert '<meta name="referrer" content="strict-origin">' in page.text
+    assert '<form method="post" action="/auth/logout">' in page.text
+    assert 'content="no-referrer"' not in page.text
+    assert client.get("/api/auth/session").headers["referrer-policy"] == "no-referrer"
+    assert client.get("/api/dashboard").headers["referrer-policy"] == "no-referrer"
+    cookie = page.headers["set-cookie"]
+    assert "Secure" in cookie and "HttpOnly" in cookie and "SameSite=lax" in cookie
+    # A real form POST must present the module origin; null remains a CSRF failure.
+    denied = client.post("/auth/logout", data={"csrf_token": identity["csrf"]},
+                         headers={"Origin": "null"}, follow_redirects=False)
+    assert denied.status_code == 403 and denied.headers["referrer-policy"] == "no-referrer"
+    accepted = client.post("/auth/logout", data={"csrf_token": identity["csrf"]},
+                           headers={"Origin": BASE}, follow_redirects=False)
+    assert accepted.status_code == 303 and accepted.headers["referrer-policy"] == "no-referrer"
+    assert client.cookies.get(sso.cookie_names(settings)[0]) is None
 
 
 def test_expired_module_cookie_fails_before_backchannel(boundary):
