@@ -32,7 +32,7 @@ from .models import (
     TemplateUpsert,
 )
 from .ranking import rank_quotes
-from .regions import infer_cluster, infer_region, resolve_cluster
+from .regions import infer_cluster, infer_region, normalize_region, resolve_cluster
 from .templates import render_template
 from .identity import trusted_actor
 from .sandbox import payload_sha256, message_fingerprint, sandbox_adapter
@@ -722,7 +722,8 @@ class ProcurementService:
     def get_purchase_history(self, record_id: int) -> dict[str, Any]:
         row = self.db.one(
             """
-            SELECT purchase_history.*, suppliers.name AS supplier_name
+            SELECT purchase_history.*, suppliers.name AS supplier_name,
+                   suppliers.cluster AS supplier_cluster
             FROM purchase_history
             LEFT JOIN suppliers ON suppliers.id = purchase_history.supplier_id
             WHERE purchase_history.id = ?
@@ -754,7 +755,8 @@ class ProcurementService:
         params.append(limit)
         rows = self.db.all(
             f"""
-            SELECT purchase_history.*, suppliers.name AS supplier_name
+            SELECT purchase_history.*, suppliers.name AS supplier_name,
+                   suppliers.cluster AS supplier_cluster
             FROM purchase_history
             LEFT JOIN suppliers ON suppliers.id = purchase_history.supplier_id
             WHERE {' AND '.join(clauses)}
@@ -764,17 +766,30 @@ class ProcurementService:
             tuple(params),
         )
         for row in rows:
-            row["vat_included"] = bool(row["vat_included"])
+            value = row["vat_included"]
+            row["vat_included"] = bool(value) if value in (0, 1) else None
         return rows
 
-    def lot_price_benchmark(self, lot_id: int) -> dict[str, Any]:
+    def lot_price_benchmark(self, lot_id: int, *, vat_included: bool | None = None) -> dict[str, Any]:
         lot = self.get_lot(lot_id)
+        cluster = self._lot_cluster(lot)
+        region = normalize_region(lot["region"])
         history = self.list_purchase_history(limit=500)
         items: list[dict[str, Any]] = []
         for item in lot["items"]:
             candidates = []
             for record in history:
+                # Exact normalized region is intentionally conservative: aliases,
+                # missing regions or cluster drift require explicit human review.
+                if (not region or normalize_region(record["region"]) != region
+                        or infer_cluster(record["region"]) != cluster
+                        or record["supplier_cluster"] != cluster):
+                    continue
                 if record["currency"] != lot["currency"]:
+                    continue
+                if not isinstance(record["vat_included"], bool):
+                    continue
+                if vat_included is not None and record["vat_included"] != vat_included:
                     continue
                 if self._normalized_item_name(record["unit"]) != self._normalized_item_name(
                     item["unit"]
@@ -783,6 +798,10 @@ class ProcurementService:
                 score = self._item_match_score(item["name"], record["item_name"])
                 if score >= 0.75:
                     candidates.append((score, record))
+            bases = {record["vat_included"] for _, record in candidates}
+            ambiguous_vat = vat_included is None and len(bases) > 1
+            if ambiguous_vat:
+                candidates = []
             prices = [Decimal(record["unit_price"]) for _, record in candidates]
             items.append(
                 {
@@ -790,6 +809,11 @@ class ProcurementService:
                     "item_name": item["name"],
                     "unit": item["unit"],
                     "currency": lot["currency"],
+                    "vat_included": vat_included if vat_included is not None else (
+                        next(iter(bases)) if len(bases) == 1 else None),
+                    "basis_status": "ambiguous_vat" if ambiguous_vat else (
+                        "comparable" if prices else "insufficient_comparable_history"),
+                    "source_purchase_ids": [record["id"] for _, record in candidates],
                     "history_count": len(prices),
                     "median_unit_price": float(median(prices)) if prices else None,
                     "min_unit_price": float(min(prices)) if prices else None,
@@ -803,10 +827,13 @@ class ProcurementService:
         return {
             "lot_id": lot_id,
             "currency": lot["currency"],
+            "cluster": cluster,
+            "region": lot["region"],
             "matched_items": sum(1 for item in items if item["history_count"]),
             "total_items": len(items),
             "items": items,
-            "policy": "approved_paid_invoices_same_currency_unit_match_gte_0_75",
+            "policy": "approved_purchases_same_region_cluster_currency_vat_unit_match_gte_0_75",
+            "exclusions": "Missing or ambiguous region, supplier cluster or VAT basis is excluded; no FX or financing normalization",
         }
 
     def list_quotes(self, lot_id: int) -> list[dict[str, Any]]:
@@ -843,7 +870,7 @@ class ProcurementService:
         lot = self.get_lot(lot_id)
         cluster = self._lot_cluster(lot)
         benchmark = self.lot_price_benchmark(lot_id)
-        benchmark_by_item = {int(item["lot_item_id"]): item for item in benchmark["items"]}
+        benchmarks_by_vat = {}
         requested = {int(item["id"]): Decimal(item["quantity"]) for item in lot["items"]}
         quotes = self.db.all(
             """
@@ -860,6 +887,13 @@ class ProcurementService:
                 raise ValueError("stored quote supplier cluster must match lot cluster before comparison")
             if quote["currency"] != lot["currency"]:
                 raise ValueError("stored quote currency differs from lot; review is required before ranking")
+            if quote["vat_included"] not in (0, 1):
+                raise ValueError("stored quote VAT basis is ambiguous; review is required")
+            vat_basis = bool(quote["vat_included"])
+            if vat_basis not in benchmarks_by_vat:
+                benchmarks_by_vat[vat_basis] = self.lot_price_benchmark(lot_id, vat_included=vat_basis)
+            benchmark_by_item = {int(item["lot_item_id"]): item
+                for item in benchmarks_by_vat[vat_basis]["items"]}
             items = self.db.all("SELECT * FROM quote_items WHERE quote_id = ?", (quote["id"],))
             subtotal = sum(
                 requested[int(item["lot_item_id"])] * Decimal(item["unit_price"]) for item in items
@@ -940,7 +974,8 @@ class ProcurementService:
         project_id: int | None = None,
         supplier_id: int | None = None,
     ) -> dict[str, Any]:
-        allowed_types = {"paid_invoice", "tender_table", "project_section", "commercial_offer"}
+        allowed_types = {"paid_invoice", "tender_table", "project_section", "commercial_offer",
+                         "invoice", "price_list", "unknown"}
         if document_type not in allowed_types:
             raise ValueError("unsupported document type")
         if not content or len(content) > 25 * 1024 * 1024:
@@ -1424,6 +1459,8 @@ class ProcurementService:
         created_by: str = "system",
     ) -> dict[str, Any]:
         """Create a batch import job and process all files synchronously."""
+        if any(Path(filename).suffix.lower() == ".xls" for filename, _ in files):
+            raise ValueError("legacy .xls is not supported; convert to .xlsx and review before import")
         created_by = trusted_actor(created_by)
         from .imports import (
             extract_document,
@@ -1471,7 +1508,8 @@ class ProcurementService:
                 result = extract_document(content, filename)
                 sha256_map[filename] = result.sha256
 
-                # Register source document (dedup by sha256)
+                # Preserve actual source bytes; an extracted invoice is NOT a
+                # verified paid invoice. Existing records are never relabelled.
                 existing_doc = self.db.one(
                     "SELECT id FROM source_documents WHERE sha256 = ?",
                     (result.sha256,),
@@ -1479,27 +1517,14 @@ class ProcurementService:
                 if existing_doc:
                     doc_id: int = existing_doc["id"]
                 else:
+                    source = self.register_source_document(
+                        filename=filename, content=content, document_type=result.document_type,
+                        content_type="application/pdf" if Path(filename).suffix.lower() == ".pdf" else
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                    doc_id = int(source["id"])
                     with self.db.connection() as conn:
-                        c = conn.execute(
-                            """
-                            INSERT INTO source_documents(
-                                filename, content_type, size_bytes, sha256,
-                                document_type, storage_path, extraction_status, created_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                            """,
-                            (
-                                filename,
-                                "application/pdf" if filename.endswith(".pdf") else
-                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                len(content),
-                                result.sha256,
-                                'internal',
-                                result.document_type,
-                                "extracted",
-                                utcnow(),
-                            ),
-                        )
-                        doc_id = c.lastrowid
+                        conn.execute("UPDATE source_documents SET extraction_status='extracted_needs_review' WHERE id=?",
+                                     (doc_id,))
 
                 # Create supplier draft (dedup by dedup_key)
                 draft_id: int | None = None
@@ -1854,9 +1879,10 @@ class ProcurementService:
                     draft_id,
                 ),
             )
-            # Attach confirmed supplier to price history entries
+            # Supplier identity review is NOT financial or paid-invoice review.
+            # Only attach the supplier; a separate explicit entry review is required.
             conn.execute(
-                "UPDATE price_history_entries SET supplier_id=?, status='confirmed' WHERE supplier_draft_id=? AND status='draft'",
+                "UPDATE price_history_entries SET supplier_id=? WHERE supplier_draft_id=? AND status='draft'",
                 (supplier["id"], draft_id),
             )
             self.db.audit(

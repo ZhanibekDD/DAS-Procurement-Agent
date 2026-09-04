@@ -245,6 +245,7 @@ def test_body_actor_is_replaced_and_each_user_has_distinct_session_csrf(boundary
         identity = second.get("/api/auth/session?chat_id=same", headers={"X-User-ID": ALICE}).json()
         assert identity["sub"] == BOB
         body = {"item_name": "Synthetic cable", "quantity": "1", "unit": "м", "unit_price": "10",
+                "currency": "RUB", "vat_included": True,
                 "purchased_on": "2026-09-04", "confirmed_by": "forged-admin"}
         assert second.post("/api/price-history", json=body, headers=headers(alice)).status_code == 403
         result = second.post("/api/price-history", json=body, headers=headers(bob))

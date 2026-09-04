@@ -121,6 +121,7 @@ class ProcurementTestCase(unittest.TestCase):
             lot["id"],
             QuoteCreate(
                 supplier_id=supplier_a["id"],
+                currency="RUB", vat_included=True,
                 delivery_cost=Decimal("40000"),
                 lead_days=14,
                 payment_terms="50% аванс, 50% после поставки",
@@ -131,6 +132,7 @@ class ProcurementTestCase(unittest.TestCase):
         history = self.service.add_purchase_history(
             PurchaseHistoryCreate(
                 supplier_id=supplier_a["id"],
+                vat_included=True,
                 item_name="Окно ПВХ 1400x1200",
                 quantity=Decimal("60"),
                 unit="шт.",
@@ -147,6 +149,7 @@ class ProcurementTestCase(unittest.TestCase):
             lot["id"],
             QuoteCreate(
                 supplier_id=supplier_b["id"],
+                currency="RUB", vat_included=True,
                 delivery_cost=Decimal("0"),
                 lead_days=25,
                 payment_terms="100% предоплата",
@@ -188,6 +191,7 @@ class ProcurementTestCase(unittest.TestCase):
         )
         common = {
             "supplier_id": supplier["id"],
+            "region": "Воронеж", "vat_included": True,
             "quantity": Decimal("10"),
             "purchased_on": date.today(),
             "confirmed_by": "Комиссия",
@@ -231,6 +235,7 @@ class ProcurementTestCase(unittest.TestCase):
     def test_duplicate_paid_purchase_is_rejected(self):
         data = PurchaseHistoryCreate(
             item_name="Кирпич М150",
+            vat_included=True,
             quantity=Decimal("1000"),
             unit="шт.",
             unit_price=Decimal("42.50"),
@@ -383,6 +388,7 @@ class ProcurementTestCase(unittest.TestCase):
             lot["id"],
             QuoteCreate(
                 supplier_id=supplier["id"],
+                currency="RUB", vat_included=True,
                 items=[QuoteItemCreate(lot_item_id=lot["items"][0]["id"], unit_price=1000)],
             ),
         )

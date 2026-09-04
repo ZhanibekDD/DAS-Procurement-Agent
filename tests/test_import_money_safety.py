@@ -97,7 +97,7 @@ def workflow(tmp_path):
 
 
 def quote_for(supplier, lot, currency):
-    return QuoteCreate(supplier_id=supplier["id"], currency=currency,
+    return QuoteCreate(supplier_id=supplier["id"], currency=currency, vat_included=True,
         items=[QuoteItemCreate(lot_item_id=lot["items"][0]["id"], unit_price=100)])
 
 

@@ -25,7 +25,8 @@ def procurement(tmp_path):
 
 
 def quote(supplier, lot):
-    return QuoteCreate(supplier_id=supplier["id"], items=[QuoteItemCreate(lot_item_id=lot["items"][0]["id"], unit_price=10)])
+    return QuoteCreate(supplier_id=supplier["id"], currency="RUB", vat_included=True,
+        items=[QuoteItemCreate(lot_item_id=lot["items"][0]["id"], unit_price=10)])
 
 
 @pytest.mark.parametrize("lot_cluster,project_cluster", [("", "cluster_2"), ("cluster_2", ""), ("", ""), ("cluster_1", "cluster_2")])

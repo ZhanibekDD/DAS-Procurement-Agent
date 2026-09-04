@@ -741,6 +741,8 @@ def extract_document(content: bytes, filename: str) -> DocumentExtractResult:
     suffix = Path(filename).suffix.lower()
     if suffix == '.pdf':
         return extract_from_pdf(content, filename)
-    if suffix in ('.xlsx', '.xls'):
+    if suffix == '.xls':
+        raise ValueError('legacy .xls is not supported; convert the file to .xlsx and review it before import')
+    if suffix == '.xlsx':
         return extract_from_xlsx(content, filename)
     raise ValueError(f'unsupported file type for price-list extraction: {suffix!r}')

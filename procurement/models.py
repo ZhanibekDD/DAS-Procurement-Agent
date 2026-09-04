@@ -122,8 +122,9 @@ class QuoteItemCreate(StrictModel):
 
 class QuoteCreate(StrictModel):
     supplier_id: int = Field(gt=0)
-    currency: str = Field(default="RUB", pattern=r"^[A-Z]{3}$")
-    vat_included: bool = True
+    # A quote must state its money basis; do not silently invent RUB or VAT.
+    currency: str = Field(pattern=r"^[A-Z]{3}$")
+    vat_included: bool = Field(strict=True)
     delivery_cost: Decimal = Field(default=Decimal("0"), ge=0)
     lead_days: int = Field(default=0, ge=0, le=3650)
     payment_terms: str = Field(default="", max_length=1000)
@@ -140,8 +141,8 @@ class PurchaseHistoryCreate(StrictModel):
     quantity: Decimal = Field(gt=0)
     unit: str = Field(min_length=1, max_length=30)
     unit_price: Decimal = Field(gt=0)
-    currency: str = Field(default="RUB", pattern=r"^[A-Z]{3}$")
-    vat_included: bool = True
+    currency: str = Field(pattern=r"^[A-Z]{3}$")
+    vat_included: bool = Field(strict=True)
     purchased_on: date
     invoice_number: str = Field(default="", max_length=120)
     project_name: str = Field(default="", max_length=240)
