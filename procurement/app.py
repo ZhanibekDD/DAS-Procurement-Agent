@@ -4,6 +4,7 @@ import hmac
 import asyncio
 import html
 import re
+import sqlite3
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -81,9 +82,21 @@ _LOGIN_FAILURES: dict[str, list[float]] = {}
 _LOGIN_LOCK = threading.Lock()
 
 
+def _require_active_module_session(principal):
+    if principal["session_exp"] <= int(time.time()):
+        raise sso.SSOError(401)
+    try:
+        if db.sso_session_revoked(sso.module_session_key(settings, principal)):
+            raise sso.SSOError(401)
+    except sqlite3.Error:
+        raise sso.SSOError(503) from None
+
+
 def _set_sso_session(response, principal):
+    _require_active_module_session(principal)
     name, _ = sso.cookie_names(settings)
-    response.set_cookie(name, sso.session_cookie(settings, principal), max_age=principal["expires"],
+    response.set_cookie(name, sso.session_cookie(settings, principal),
+        max_age=min(principal["expires"], principal["session_exp"] - int(time.time())),
         secure=True, httponly=True, samesite="lax", path="/")
 
 
@@ -114,7 +127,11 @@ async def das_identity_boundary(request: Request, call_next):
     if not cookie and path == "/" and request.method == "GET":
         return RedirectResponse("/auth/sso", status_code=303)
     try:
+        # Check the signed stable module identity before and after backchannel I/O.
+        # A late rotating-token response cannot re-authorize a logged-out session.
+        _require_active_module_session(sso.session_claims(settings, cookie))
         principal = await asyncio.to_thread(sso.authenticate, settings, cookie)
+        _require_active_module_session(principal)
         request.state.das_principal = principal
         safe_method = request.method in {"GET", "HEAD", "OPTIONS"}
         if principal["read_only"] and path != "/auth/logout":
@@ -144,8 +161,11 @@ async def das_identity_boundary(request: Request, call_next):
         )
         return response
     except sso.SSOError as exc:
-        return JSONResponse({"detail": str(exc)}, status_code=exc.status,
-                            headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+        response = JSONResponse({"detail": str(exc)}, status_code=exc.status,
+                                headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+        if exc.status == 401:
+            response.delete_cookie(session_name, path="/", secure=True, httponly=True, samesite="lax")
+        return response
 
 
 @app.get("/auth/sso", include_in_schema=False)
@@ -410,7 +430,11 @@ def logout(
 ) -> RedirectResponse:
     if settings.sso_enabled:
         principal = request.state.das_principal
-        db.audit("sso_logout", "session", principal["sub"], actor=principal["sub"])
+        try:
+            db.revoke_sso_session(sso.module_session_key(settings, principal), principal["session_exp"],
+                                  principal["sub"], int(time.time()))
+        except sqlite3.Error:
+            raise sso.SSOError(503) from None
         request.state.sso_logout = True
         response = RedirectResponse("/auth/logged-out", status_code=303)
         name, _ = sso.cookie_names(settings)

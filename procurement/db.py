@@ -13,6 +13,14 @@ from .identity import trusted_actor
 SCHEMA = """
 PRAGMA foreign_keys = ON;
 
+CREATE TABLE IF NOT EXISTS sso_module_session_revocations (
+    session_hash TEXT PRIMARY KEY,
+    expires_at INTEGER NOT NULL,
+    revoked_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_sso_module_revocations_expiry
+    ON sso_module_session_revocations(expires_at);
+
 CREATE TABLE IF NOT EXISTS projects (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -430,6 +438,32 @@ class Database:
         with self.connection() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [dict(row) for row in rows]
+
+    def sso_session_revoked(self, session_hash: str) -> bool:
+        return self.one("SELECT 1 FROM sso_module_session_revocations WHERE session_hash=?", (session_hash,)) is not None
+
+    def revoke_sso_session(self, session_hash: str, expires_at: int, subject: str, now: int) -> None:
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            inserted = conn.execute("""INSERT INTO sso_module_session_revocations(session_hash,expires_at,revoked_at)
+                VALUES (?,?,?) ON CONFLICT(session_hash) DO NOTHING""", (session_hash, expires_at, now)).rowcount
+            if inserted:
+                self.audit("sso_logout", "session", subject, actor=subject,
+                           details={"scope": "procurement_module", "revoked": True}, conn=conn)
+
+    def cleanup_sso_revocations(self, *, now: int, limit: int = 1000, dry_run: bool = True) -> dict[str, int | bool]:
+        """Explicit bounded maintenance only; never invoked by login/request/startup."""
+        if type(now) is not int or type(limit) is not int or not 1 <= limit <= 1000 or type(dry_run) is not bool:
+            raise ValueError("cleanup requires an integer clock and a limit between 1 and 1000")
+        with self.connection() as conn:
+            if not dry_run:
+                conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute("""SELECT session_hash FROM sso_module_session_revocations
+                WHERE expires_at<=? ORDER BY expires_at,session_hash LIMIT ?""", (now, limit)).fetchall()
+            if not dry_run:
+                conn.executemany("DELETE FROM sso_module_session_revocations WHERE session_hash=? AND expires_at<=?",
+                                 [(row["session_hash"], now) for row in rows])
+        return {"dry_run": dry_run, "eligible": len(rows), "deleted": 0 if dry_run else len(rows)}
 
     def audit(
         self,

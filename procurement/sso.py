@@ -166,21 +166,41 @@ def complete(settings, state_cookie: str, code: str, state: str) -> dict:
     token, _ = _access_token(result)
     principal = introspect(settings, token)
     principal["csrf"] = secrets.token_urlsafe(32)
+    principal["session_exp"] = int(time.time()) + settings.session_ttl_seconds
     return principal
 
 
+def module_session_key(settings, principal: dict) -> str:
+    """Opaque persistent revocation key, stable across token rotation; no raw nonce/JWT storage."""
+    scope = [settings.sso_client_id, settings.sso_redirect_uri, principal["sub"], principal["csrf"]]
+    return hmac.new(settings.auth_secret.encode(), json.dumps(scope, separators=(",", ":")).encode(), hashlib.sha256).hexdigest()
+
+
 def session_cookie(settings, principal: dict) -> str:
+    deadline = principal.get("session_exp")
+    if type(deadline) is not int or deadline <= int(time.time()):
+        raise SSOError(401)
     return seal(settings, "session", {"token": principal["token"], "sub": principal["sub"],
-        "csrf": principal["csrf"], "epoch": principal["epoch"], "exp": int(time.time()) + principal["expires"]})
+        "csrf": principal["csrf"], "epoch": principal["epoch"], "session_exp": deadline,
+        "exp": min(int(time.time()) + principal["expires"], deadline)})
+
+
+def session_claims(settings, cookie: str) -> dict:
+    saved = unseal(settings, "session", cookie)
+    if (not isinstance(saved.get("token"), str) or not 16 <= len(saved["token"]) <= 8192
+            or not isinstance(saved.get("sub"), str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{40,128}", str(saved.get("csrf", "")))
+            or type(saved.get("session_exp")) is not int
+            or not int(time.time()) < saved["session_exp"] <= int(time.time()) + settings.session_ttl_seconds):
+        raise SSOError(401)
+    return saved
 
 
 def authenticate(settings, cookie: str) -> dict:
-    saved = unseal(settings, "session", cookie)
-    if (not isinstance(saved.get("token"), str) or not 16 <= len(saved["token"]) <= 8192
-            or not re.fullmatch(r"[A-Za-z0-9_-]{40,128}", str(saved.get("csrf", "")))):
-        raise SSOError(401)
+    saved = session_claims(settings, cookie)
     principal = introspect(settings, saved["token"])
     if principal["sub"] != saved.get("sub") or principal["epoch"] != saved.get("epoch"):
         raise SSOError(403)
     principal["csrf"] = saved["csrf"]
+    principal["session_exp"] = saved["session_exp"]
     return principal
