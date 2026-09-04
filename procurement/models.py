@@ -109,6 +109,7 @@ class CampaignCreate(StrictModel):
     template_code: str = Field(default="rfq-email", min_length=2, max_length=80)
     supplier_ids: list[int] = Field(min_length=1, max_length=500)
     channel: Literal["email", "telegram", "max"] = "email"
+    idempotency_key: str = Field(default="", max_length=128, pattern=r"^[A-Za-z0-9_.:-]*$")
 
 
 class QuoteItemCreate(StrictModel):

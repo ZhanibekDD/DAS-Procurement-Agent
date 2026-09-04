@@ -142,7 +142,7 @@ def introspect(settings, token: str) -> dict:
         modules = result["modules"]
         if (not isinstance(modules, list) or not all(isinstance(item, str) for item in modules)
                 or type(result["read_only"]) is not bool or type(result["epoch"]) is not int or result["epoch"] < 0
-                or not isinstance(result["username"], str) or not 1 <= len(result["username"]) <= 128
+                or not isinstance(result["username"], str) or not 1 <= len(result["username"]) <= 150
                 or not isinstance(result["email"], str) or len(result["email"]) > 320):
             raise ValueError
     except (ValueError, KeyError, TypeError, AttributeError):

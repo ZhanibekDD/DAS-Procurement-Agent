@@ -82,3 +82,26 @@ back up its dedicated volume and verify restoration first. Rollback is removal
 from exposure/stopping only this new canary and retaining its volume; the
 existing production and 9206 contours remain untouched. Never use `down -v` or
 delete existing data as rollback.
+
+## Cluster gates and sandbox outbox
+
+Unassigned or conflicting project/lot clusters block matching, campaigns,
+quote entry and comparison. A supplier must belong to that confirmed cluster;
+stored cross-cluster quotations are not ranked. Legacy data is never relabelled
+by these guards: any required regional migration remains separately approved.
+
+New canary initialization adds three ledgers only: `campaign_requests`,
+`outbox_approvals`, `sandbox_deliveries`. Request content fingerprints and an
+optional client idempotency key prevent repeated/concurrent RFQ drafts. Reusing
+a key for changed content is a conflict; matching pre-ledger campaigns require
+review instead of automatic backfill or a duplicate.
+
+Human approval binds the exact recipient, channel, content and cluster context.
+Post-approval drift or legacy approval without that binding cannot be simulated.
+`POST /api/outbox/{id}/simulate` is an explicit, CSRF/RBAC-protected local test;
+Email/MAX/Telegram adapters contain no network transport or credentials. They
+return a persistent idempotent receipt with `mode=sandbox`, `status=simulated`,
+`external_send=false`. The business message remains `approved`, never `sent`.
+No real message is dispatched, and no supplier is contacted. Changing workers
+does not lose deduplication or approval state. Rollback retains all ledgers and
+the dedicated canary volume; no production schema has been changed or applied.

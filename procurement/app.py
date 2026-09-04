@@ -702,6 +702,14 @@ def add_quote(lot_id: int, data: QuoteCreate):
         raise handle_domain_error(exc) from exc
 
 
+@app.post("/api/outbox/{message_id}/simulate", dependencies=[Depends(require_access)])
+def simulate_outbox(message_id: int):
+    try:
+        return service.simulate_outbox(message_id)
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
 @app.get("/api/lots/{lot_id}/quotes", dependencies=[Depends(require_access)])
 def list_quotes(lot_id: int):
     try:

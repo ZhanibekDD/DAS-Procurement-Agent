@@ -116,6 +116,32 @@ CREATE TABLE IF NOT EXISTS outbox_messages (
     UNIQUE(campaign_id, supplier_id)
 );
 
+-- Additive ledgers for new canary workflows; no historical rows are rewritten.
+CREATE TABLE IF NOT EXISTS campaign_requests (
+    request_key TEXT PRIMARY KEY,
+    payload_sha256 TEXT NOT NULL,
+    campaign_id INTEGER NOT NULL REFERENCES campaigns(id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_campaign_request_payload ON campaign_requests(payload_sha256);
+
+CREATE TABLE IF NOT EXISTS outbox_approvals (
+    message_id INTEGER PRIMARY KEY REFERENCES outbox_messages(id),
+    payload_sha256 TEXT NOT NULL,
+    approved_by TEXT NOT NULL,
+    approved_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sandbox_deliveries (
+    message_id INTEGER PRIMARY KEY REFERENCES outbox_messages(id),
+    channel TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    simulated_by TEXT NOT NULL,
+    simulated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS quotes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     lot_id INTEGER NOT NULL REFERENCES lots(id) ON DELETE CASCADE,

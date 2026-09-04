@@ -349,3 +349,41 @@ def test_sso_settings_fail_closed_and_do_not_require_local_passwords(monkeypatch
     monkeypatch.setenv("PROCUREMENT_ADMIN_USERNAME", "shared-admin")
     with pytest.raises(RuntimeError, match="forbids local admin"):
         Settings.from_env()
+
+
+@pytest.mark.parametrize("length,expected", [(149, 200), (150, 200), (151, 503)])
+def test_username_length_matches_das_authority_contract(boundary, monkeypatch, length, expected):
+    client, authority, _, _ = boundary
+    login(client, authority)
+    original = authority.post
+    def changed_name(settings, endpoint, payload):
+        response = original(settings, endpoint, payload)
+        response["username"] = "u" * length
+        return response
+    monkeypatch.setattr(sso, "_post", changed_name)
+    assert client.get("/api/auth/session").status_code == expected
+
+
+def test_sandbox_api_requires_human_approval_and_uses_trusted_actor(boundary):
+    client, authority, _, database = boundary
+    identity = login(client, authority)
+    request_headers = headers(identity)
+    project = client.post("/api/projects", headers=request_headers, json={"name": "Sandbox project",
+        "region": "Воронеж", "delivery_address": "Test address"}).json()
+    supplier = client.post("/api/suppliers", headers=request_headers, json={"name": "Sandbox supplier",
+        "region": "Воронеж", "email": "test@example.invalid"}).json()
+    lot = client.post("/api/lots", headers=request_headers, json={"project_id": project["id"],
+        "title": "Sandbox lot", "region": "Воронеж", "delivery_address": "Test address",
+        "response_deadline": "2099-12-31", "items": [{"name": "Synthetic cable", "quantity": 1, "unit": "м"}]}).json()
+    campaign = client.post(f"/api/lots/{lot['id']}/campaigns", headers=request_headers,
+                           json={"supplier_ids": [supplier["id"]]}).json()
+    message_id = campaign["messages"][0]["id"]
+    assert client.post(f"/api/outbox/{message_id}/simulate", headers=request_headers).status_code == 409
+    approval = client.post(f"/api/outbox/{message_id}/approve", headers=request_headers,
+                           json={"approved_by": "forged-admin"})
+    assert approval.status_code == 200 and approval.json()["approved_by"] == ALICE
+    response = client.post(f"/api/outbox/{message_id}/simulate", headers=request_headers)
+    assert response.status_code == 200 and response.json()["external_send"] is False
+    assert database.one("SELECT simulated_by FROM sandbox_deliveries WHERE message_id=?", (message_id,))["simulated_by"] == ALICE
+    authority.users[ALICE]["read_only"] = True
+    assert client.post(f"/api/outbox/{message_id}/simulate", headers=request_headers).status_code == 403

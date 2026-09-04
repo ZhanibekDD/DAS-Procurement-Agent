@@ -359,15 +359,16 @@ class ProcurementTestCase(unittest.TestCase):
             self.service.list_procurement_suggestions(status="approving")
 
     def test_incomplete_quote_is_disqualified(self):
+        # Completeness is tested after the independent confirmed-cluster prerequisite.
         project = self.service.create_project(
-            ProjectCreate(name="Проект", region="Алматы", delivery_address="ул. Абая, 1")
+            ProjectCreate(name="Проект", region="Воронеж", delivery_address="Тестовый адрес, 1")
         )
         lot = self.service.create_lot(
             LotCreate(
                 project_id=project["id"],
                 title="Песок",
-                region="Алматы",
-                delivery_address="ул. Абая, 1",
+                region="Воронеж",
+                delivery_address="Тестовый адрес, 1",
                 response_deadline=date.today() + timedelta(days=3),
                 items=[
                     LotItemCreate(name="Песок", quantity=10, unit="т"),
@@ -376,7 +377,7 @@ class ProcurementTestCase(unittest.TestCase):
             )
         )
         supplier = self.service.create_supplier(
-            SupplierCreate(name="Карьер", region="Алматы", email="a@b.kz")
+            SupplierCreate(name="Карьер", region="Воронеж", email="a@b.kz")
         )
         self.service.add_quote(
             lot["id"],

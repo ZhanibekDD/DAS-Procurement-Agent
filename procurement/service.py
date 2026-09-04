@@ -35,6 +35,7 @@ from .ranking import rank_quotes
 from .regions import infer_cluster, infer_region, resolve_cluster
 from .templates import render_template
 from .identity import trusted_actor
+from .sandbox import payload_sha256, message_fingerprint, sandbox_adapter
 
 
 class NotFoundError(ValueError):
@@ -240,12 +241,32 @@ class ProcurementService:
             )
         return rows
 
+    @staticmethod
+    def _confirmed_cluster(lot_cluster: str, project_cluster: str) -> str:
+        if lot_cluster not in {"cluster_1", "cluster_2"} or project_cluster not in {"cluster_1", "cluster_2"}:
+            raise ValueError("lot and project cluster must be confirmed before procurement operations")
+        if lot_cluster != project_cluster:
+            raise ValueError("lot cluster must match project cluster")
+        return lot_cluster
+
+    def _lot_cluster(self, lot: dict) -> str:
+        project = self.get_project(lot["project_id"])
+        return self._confirmed_cluster(lot["cluster"], project["cluster"])
+
+    @staticmethod
+    def _supplier_cluster(supplier: dict, cluster: str) -> None:
+        if supplier["cluster"] != cluster:
+            raise ValueError("supplier cluster must match lot cluster")
+        if not supplier.get("active", True):
+            raise ValueError("inactive supplier cannot participate in procurement")
+
     def match_suppliers(self, lot_id: int) -> list[dict[str, Any]]:
         lot = self.get_lot(lot_id)
+        cluster = self._lot_cluster(lot)
         search_text = " ".join([lot["title"], *(item["name"] for item in lot["items"])]).casefold()
         candidates = []
         for supplier in self.list_suppliers():
-            if lot["cluster"] and supplier["cluster"] != lot["cluster"]:
+            if supplier["cluster"] != cluster:
                 continue
             region_match = lot["region"].casefold() in supplier["region"].casefold() or supplier[
                 "region"
@@ -259,7 +280,7 @@ class ProcurementService:
             if score > 0:
                 supplier["match_score"] = round(score, 2)
                 supplier["match_reasons"] = {
-                    "cluster": lot["cluster"] or "legacy_unassigned",
+                    "cluster": cluster,
                     "region": region_match,
                     "category_hits": category_hits,
                     "verified": supplier["verified"],
@@ -288,21 +309,13 @@ class ProcurementService:
     def create_campaign(self, lot_id: int, data: CampaignCreate) -> dict[str, Any]:
         lot = self.get_lot(lot_id)
         project = self.get_project(lot["project_id"])
+        cluster = self._confirmed_cluster(lot["cluster"], project["cluster"])
         template = self.db.one("SELECT * FROM templates WHERE code = ?", (data.template_code,))
         if not template:
             raise NotFoundError("template not found")
         suppliers = [self.get_supplier(supplier_id) for supplier_id in dict.fromkeys(data.supplier_ids)]
-        if lot["cluster"]:
-            invalid = [
-                supplier["id"]
-                for supplier in suppliers
-                if supplier["cluster"] != lot["cluster"]
-            ]
-            if invalid:
-                raise ValueError(
-                    "supplier cluster must match lot cluster; blocked supplier ids: "
-                    + ", ".join(str(value) for value in invalid)
-                )
+        for supplier in suppliers:
+            self._supplier_cluster(supplier, cluster)
         items_text = "\n".join(
             f"- {item['name']}: {item['quantity']} {item['unit']}"
             + (f"; {item['specification']}" if item["specification"] else "")
@@ -356,12 +369,40 @@ class ProcurementService:
                     render_template(template["body"], context),
                 )
             )
+        fingerprint = payload_sha256({"lot_id": lot_id, "project_id": project["id"], "cluster": cluster,
+            "template_code": data.template_code, "template_version": template["version"], "channel": data.channel,
+            "messages": sorted([(supplier["id"], recipient, subject, body)
+                                for supplier, recipient, subject, body in prepared])})
+        request_key = f"lot:{lot_id}:client:{data.idempotency_key}" if data.idempotency_key else "auto:" + fingerprint
         with self.db.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute("SELECT * FROM campaign_requests WHERE request_key=?", (request_key,)).fetchone()
+            if existing:
+                if existing["payload_sha256"] != fingerprint:
+                    raise ConflictError("idempotency key was already used for different campaign content")
+                return self.get_campaign(existing["campaign_id"])
+            same_content = conn.execute("SELECT campaign_id FROM campaign_requests WHERE payload_sha256=? LIMIT 1", (fingerprint,)).fetchone()
+            if same_content:
+                conn.execute("INSERT INTO campaign_requests(request_key,payload_sha256,campaign_id,created_at) VALUES (?,?,?,?)",
+                             (request_key, fingerprint, same_content["campaign_id"], utcnow()))
+                return self.get_campaign(same_content["campaign_id"])
+            # Do not backfill approvals or silently duplicate pre-ledger campaigns.
+            legacy = conn.execute("""SELECT c.id FROM campaigns c LEFT JOIN campaign_requests r ON r.campaign_id=c.id
+                WHERE c.lot_id=? AND c.template_code=? AND c.channel=? AND r.campaign_id IS NULL""",
+                (lot_id, data.template_code, data.channel)).fetchall()
+            expected_messages = sorted((supplier["id"], recipient, subject, body) for supplier, recipient, subject, body in prepared)
+            for prior in legacy:
+                prior_messages = sorted(tuple(row) for row in conn.execute(
+                    "SELECT supplier_id,recipient,subject,body FROM outbox_messages WHERE campaign_id=?", (prior["id"],)))
+                if prior_messages == expected_messages:
+                    raise ConflictError("matching legacy campaign already exists; human review is required, no duplicate was created")
             cursor = conn.execute(
                 "INSERT INTO campaigns(lot_id, template_code, channel, created_at) VALUES (?, ?, ?, ?)",
                 (lot_id, data.template_code, data.channel, utcnow()),
             )
             campaign_id = cursor.lastrowid
+            conn.execute("INSERT INTO campaign_requests(request_key,payload_sha256,campaign_id,created_at) VALUES (?,?,?,?)",
+                         (request_key, fingerprint, campaign_id, utcnow()))
             for supplier, recipient, subject, body in prepared:
                 conn.execute(
                     """
@@ -444,33 +485,73 @@ class ProcurementService:
             tuple(params),
         )
 
-    def approve_message(self, message_id: int, approved_by: str, comment: str = "") -> dict[str, Any]:
-        approved_by = trusted_actor(approved_by)
-        message = self.db.one("SELECT * FROM outbox_messages WHERE id = ?", (message_id,))
-        if not message:
+    def _outbox_context(self, conn, message_id: int) -> dict:
+        row = conn.execute("""
+            SELECT m.*, c.lot_id, l.cluster AS lot_cluster, p.cluster AS project_cluster,
+                   s.cluster AS supplier_cluster, s.active AS supplier_active
+            FROM outbox_messages m JOIN campaigns c ON c.id=m.campaign_id
+            JOIN lots l ON l.id=c.lot_id JOIN projects p ON p.id=l.project_id
+            JOIN suppliers s ON s.id=m.supplier_id WHERE m.id=?
+        """, (message_id,)).fetchone()
+        if not row:
             raise NotFoundError("outbox message not found")
-        if message["status"] != "draft":
-            raise ConflictError("only draft messages can be approved")
+        message = dict(row)
+        cluster = self._confirmed_cluster(message["lot_cluster"], message["project_cluster"])
+        self._supplier_cluster({"cluster": message["supplier_cluster"], "active": message["supplier_active"]}, cluster)
+        return message
+
+    def approve_message(self, message_id: int, approved_by: str, comment: str = "") -> dict[str, Any]:
+        approved_by = trusted_actor(approved_by).strip()
+        if not approved_by or approved_by == "system":
+            raise ValueError("a human approval actor is required")
         with self.db.connection() as conn:
-            conn.execute(
-                "UPDATE outbox_messages SET status='approved', approved_by=?, approved_at=? WHERE id=?",
-                (approved_by, utcnow(), message_id),
-            )
-            self.db.audit(
-                "approved",
-                "outbox_message",
-                message_id,
-                actor=approved_by,
-                details={"comment": comment, "dispatch": "disabled_in_mvp"},
-                conn=conn,
-            )
+            conn.execute("BEGIN IMMEDIATE")
+            message = self._outbox_context(conn, message_id)
+            fingerprint = message_fingerprint(message)
+            existing = conn.execute("SELECT * FROM outbox_approvals WHERE message_id=?", (message_id,)).fetchone()
+            if existing:
+                if message["status"] != "approved" or existing["payload_sha256"] != fingerprint:
+                    raise ConflictError("approved content changed; create a new draft for human review")
+                return dict(conn.execute("SELECT * FROM outbox_messages WHERE id=?", (message_id,)).fetchone())
+            if message["status"] != "draft":
+                raise ConflictError("only draft messages with fresh human approval can be simulated")
+            now = utcnow()
+            conn.execute("UPDATE outbox_messages SET status='approved', approved_by=?, approved_at=? WHERE id=? AND status='draft'",
+                         (approved_by, now, message_id))
+            conn.execute("INSERT INTO outbox_approvals(message_id,payload_sha256,approved_by,approved_at) VALUES (?,?,?,?)",
+                         (message_id, fingerprint, approved_by, now))
+            self.db.audit("approved", "outbox_message", message_id, actor=approved_by,
+                          details={"comment": comment, "dispatch": "external_disabled", "payload_sha256": fingerprint}, conn=conn)
         return self.db.one("SELECT * FROM outbox_messages WHERE id = ?", (message_id,)) or {}
+
+    def simulate_outbox(self, message_id: int) -> dict:
+        """Explicit local simulation only. Persistent idempotency survives worker recreation."""
+        with self.db.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            message = self._outbox_context(conn, message_id)
+            fingerprint = message_fingerprint(message)
+            approval = conn.execute("SELECT * FROM outbox_approvals WHERE message_id=?", (message_id,)).fetchone()
+            if (not approval or message["status"] != "approved" or approval["payload_sha256"] != fingerprint
+                    or approval["approved_by"] != message["approved_by"] or approval["approved_at"] != message["approved_at"]):
+                raise ConflictError("unchanged content and explicit human approval are required for sandbox simulation")
+            existing = conn.execute("SELECT * FROM sandbox_deliveries WHERE message_id=?", (message_id,)).fetchone()
+            if existing:
+                if existing["payload_sha256"] != fingerprint:
+                    raise ConflictError("sandbox receipt does not match approved content")
+                return json.loads(existing["receipt_json"])
+            receipt = sandbox_adapter(message["channel"]).simulate(message, fingerprint)
+            conn.execute("""INSERT INTO sandbox_deliveries(message_id,channel,payload_sha256,receipt_json,simulated_by,simulated_at)
+                            VALUES (?,?,?,?,?,?)""", (message_id, message["channel"], fingerprint,
+                            json.dumps(receipt, sort_keys=True), trusted_actor(), utcnow()))
+            self.db.audit("simulated", "outbox_message", message_id, details=receipt, conn=conn)
+            return receipt
 
     def add_quote(self, lot_id: int, data: QuoteCreate) -> dict[str, Any]:
         lot = self.get_lot(lot_id)
+        cluster = self._lot_cluster(lot)
         if data.currency != lot["currency"]:
             raise ValueError("quote currency must match lot currency; exchange conversion is not configured")
-        self.get_supplier(data.supplier_id)
+        self._supplier_cluster(self.get_supplier(data.supplier_id), cluster)
         lot_item_ids = {int(item["id"]) for item in lot["items"]}
         submitted_ids = {item.lot_item_id for item in data.items}
         if not submitted_ids.issubset(lot_item_ids):
@@ -730,12 +811,14 @@ class ProcurementService:
 
     def comparison(self, lot_id: int) -> dict[str, Any]:
         lot = self.get_lot(lot_id)
+        cluster = self._lot_cluster(lot)
         benchmark = self.lot_price_benchmark(lot_id)
         benchmark_by_item = {int(item["lot_item_id"]): item for item in benchmark["items"]}
         requested = {int(item["id"]): Decimal(item["quantity"]) for item in lot["items"]}
         quotes = self.db.all(
             """
-            SELECT quotes.*, suppliers.name AS supplier_name, suppliers.rating AS supplier_rating
+            SELECT quotes.*, suppliers.name AS supplier_name, suppliers.rating AS supplier_rating,
+                   suppliers.cluster AS supplier_cluster
             FROM quotes JOIN suppliers ON suppliers.id = quotes.supplier_id
             WHERE quotes.lot_id = ? ORDER BY quotes.id
             """,
@@ -743,6 +826,8 @@ class ProcurementService:
         )
         rows = []
         for quote in quotes:
+            if quote["supplier_cluster"] != cluster:
+                raise ValueError("stored quote supplier cluster must match lot cluster before comparison")
             if quote["currency"] != lot["currency"]:
                 raise ValueError("stored quote currency differs from lot; review is required before ranking")
             items = self.db.all("SELECT * FROM quote_items WHERE quote_id = ?", (quote["id"],))
