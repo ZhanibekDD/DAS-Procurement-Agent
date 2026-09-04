@@ -374,23 +374,42 @@ class ProcurementService:
             "messages": sorted([(supplier["id"], recipient, subject, body)
                                 for supplier, recipient, subject, body in prepared])})
         request_key = f"lot:{lot_id}:client:{data.idempotency_key}" if data.idempotency_key else "auto:" + fingerprint
+        expected_messages = sorted((supplier["id"], recipient, subject, body) for supplier, recipient, subject, body in prepared)
         with self.db.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute("""SELECT l.cluster AS lot_cluster,p.cluster AS project_cluster
+                FROM lots l JOIN projects p ON p.id=l.project_id WHERE l.id=?""", (lot_id,)).fetchone()
+            if not current or self._confirmed_cluster(current["lot_cluster"], current["project_cluster"]) != cluster:
+                raise ConflictError("campaign cluster context changed; retry after review")
+            for supplier in suppliers:
+                current_supplier = conn.execute("SELECT cluster,active FROM suppliers WHERE id=?", (supplier["id"],)).fetchone()
+                if not current_supplier:
+                    raise NotFoundError("supplier not found")
+                self._supplier_cluster(dict(current_supplier), cluster)
+
+            def reuse(campaign_id):
+                existing_campaign = conn.execute("SELECT lot_id,template_code,channel FROM campaigns WHERE id=?", (campaign_id,)).fetchone()
+                stored_messages = sorted(tuple(row) for row in conn.execute(
+                    "SELECT supplier_id,recipient,subject,body FROM outbox_messages WHERE campaign_id=?", (campaign_id,)))
+                if (not existing_campaign or tuple(existing_campaign) != (lot_id, data.template_code, data.channel)
+                        or stored_messages != expected_messages):
+                    raise ConflictError("stored campaign content changed; fresh human review is required")
+                return self.get_campaign(campaign_id)
+
             existing = conn.execute("SELECT * FROM campaign_requests WHERE request_key=?", (request_key,)).fetchone()
             if existing:
                 if existing["payload_sha256"] != fingerprint:
                     raise ConflictError("idempotency key was already used for different campaign content")
-                return self.get_campaign(existing["campaign_id"])
+                return reuse(existing["campaign_id"])
             same_content = conn.execute("SELECT campaign_id FROM campaign_requests WHERE payload_sha256=? LIMIT 1", (fingerprint,)).fetchone()
             if same_content:
                 conn.execute("INSERT INTO campaign_requests(request_key,payload_sha256,campaign_id,created_at) VALUES (?,?,?,?)",
                              (request_key, fingerprint, same_content["campaign_id"], utcnow()))
-                return self.get_campaign(same_content["campaign_id"])
+                return reuse(same_content["campaign_id"])
             # Do not backfill approvals or silently duplicate pre-ledger campaigns.
             legacy = conn.execute("""SELECT c.id FROM campaigns c LEFT JOIN campaign_requests r ON r.campaign_id=c.id
                 WHERE c.lot_id=? AND c.template_code=? AND c.channel=? AND r.campaign_id IS NULL""",
                 (lot_id, data.template_code, data.channel)).fetchall()
-            expected_messages = sorted((supplier["id"], recipient, subject, body) for supplier, recipient, subject, body in prepared)
             for prior in legacy:
                 prior_messages = sorted(tuple(row) for row in conn.execute(
                     "SELECT supplier_id,recipient,subject,body FROM outbox_messages WHERE campaign_id=?", (prior["id"],)))
@@ -557,6 +576,17 @@ class ProcurementService:
         if not submitted_ids.issubset(lot_item_ids):
             raise ValueError("quote contains an item from another lot")
         with self.db.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute("""SELECT l.cluster AS lot_cluster,p.cluster AS project_cluster,l.currency
+                FROM lots l JOIN projects p ON p.id=l.project_id WHERE l.id=?""", (lot_id,)).fetchone()
+            if not current or self._confirmed_cluster(current["lot_cluster"], current["project_cluster"]) != cluster:
+                raise ConflictError("quote cluster context changed; retry after review")
+            if current["currency"] != data.currency:
+                raise ValueError("quote currency must match lot currency")
+            current_supplier = conn.execute("SELECT cluster,active FROM suppliers WHERE id=?", (data.supplier_id,)).fetchone()
+            if not current_supplier:
+                raise NotFoundError("supplier not found")
+            self._supplier_cluster(dict(current_supplier), cluster)
             cursor = conn.execute(
                 """
                 INSERT INTO quotes(

@@ -187,3 +187,37 @@ def test_automatic_or_missing_actor_is_not_human_approval(procurement, actor):
     with pytest.raises(ValueError, match="human approval actor"):
         service.approve_message(message["id"], actor)
     assert database.one("SELECT count(*) AS n FROM outbox_approvals")["n"] == 0
+
+
+def test_repeated_campaign_does_not_reuse_drifted_outbox_content(procurement):
+    database, service, _, lot, suppliers = procurement
+    data = CampaignCreate(supplier_ids=[suppliers[0]["id"]])
+    first = service.create_campaign(lot["id"], data)
+    with database.connection() as connection:
+        connection.execute("UPDATE outbox_messages SET body='changed after creation' WHERE campaign_id=?", (first["id"],))
+    with pytest.raises(ConflictError, match="stored campaign content changed"):
+        service.create_campaign(lot["id"], data)
+    assert database.one("SELECT count(*) AS n FROM outbox_messages")["n"] == 1
+
+
+@pytest.mark.parametrize("operation", ["campaign", "quote"])
+def test_cluster_is_rechecked_under_write_lock(procurement, monkeypatch, operation):
+    database, service, _, lot, suppliers = procurement
+    original = service._supplier_cluster
+    calls = 0
+    def race(supplier, cluster):
+        nonlocal calls
+        calls += 1
+        original(supplier, cluster)
+        if calls == 1:
+            # Simulate drift after preliminary validation, before the write lock.
+            with database.connection() as connection:
+                connection.execute("UPDATE suppliers SET cluster='cluster_1' WHERE id=?", (suppliers[0]["id"],))
+    monkeypatch.setattr(service, "_supplier_cluster", race)
+    with pytest.raises(ValueError, match="supplier cluster must match"):
+        if operation == "campaign":
+            service.create_campaign(lot["id"], CampaignCreate(supplier_ids=[suppliers[0]["id"]]))
+        else:
+            service.add_quote(lot["id"], quote(suppliers[0], lot))
+    assert database.one("SELECT count(*) AS n FROM outbox_messages")["n"] == 0
+    assert database.one("SELECT count(*) AS n FROM quotes")["n"] == 0
