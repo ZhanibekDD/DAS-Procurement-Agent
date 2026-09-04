@@ -155,16 +155,69 @@ function renderRfq(){
   $('#rfq').innerHTML=`<div class="rfq-flow"><div class="rfq-step ${stage===1?'active':''}"><span class="rfq-step-num">01</span><div><b>Выберите лот</b><small>Спецификация и сроки</small></div></div><div class="rfq-step ${stage===2?'active':''}"><span class="rfq-step-num">02</span><div><b>Подберите компании</b><small>База и региональный поиск</small></div></div><div class="rfq-step ${stage===3?'active':''}"><span class="rfq-step-num">03</span><div><b>Создайте запросы</b><small>Канал и шаблон сообщения</small></div></div><div class="rfq-step ${drafts?'active':''}"><span class="rfq-step-num">04</span><div><b>Согласуйте отправку</b><small>${drafts} черновиков ожидают решения</small></div></div></div><div class="layout"><section class="panel"><div class="panel-title"><div><h2>Подбор поставщиков</h2><p>Агент учитывает регион, категорию, рейтинг и проверку компании</p></div><span class="card-icon" style="margin:0">${icon('search')}</span></div><div class="toolbar"><select class="grow" id="rfqLot"><option value="">Выберите закупочный лот</option>${options}</select><button class="btn" id="matchBtn">${icon('search')}Подобрать</button></div><div id="matches">${state.matches.length?matchesMarkup():empty('Начните с выбора лота','Агент покажет наиболее подходящих поставщиков и объяснит оценку')}</div></section><section class="panel"><div class="panel-title"><div><h2>Очередь согласования</h2><p>${drafts} сообщений требуют проверки сотрудника</p></div><span class="badge amber">Ручной контроль</span></div>${outboxMarkup()}</section></div>`;$('#rfqLot').onchange=e=>{state.selectedLot=Number(e.target.value)||null;state.matches=[];renderRfq()};$('#matchBtn').onclick=loadMatches;if(state.matches.length)$('#draftCampaignBtn').onclick=createCampaign
 }
 function matchesMarkup(){return `<div class="match-list">${state.matches.map(s=>`<label class="match"><input type="checkbox" name="supplierMatch" value="${s.id}"><div><strong>${esc(s.name)}</strong><small>${esc(s.region)} · ${s.categories.map(esc).join(', ')||'без категории'} · рейтинг ${Number(s.rating).toFixed(1)}</small></div><span class="badge ${s.verified?'green':'amber'}">${Math.round(s.match_score)} баллов</span></label>`).join('')}</div><div class="toolbar" style="margin-top:14px"><select id="rfqChannel"><option value="email">Email</option><option value="telegram">Telegram</option><option value="max">MAX</option></select><select class="grow" id="rfqTemplate">${state.templates.map(t=>`<option value="${esc(t.code)}">${esc(t.name)}</option>`).join('')}</select><button class="btn" id="draftCampaignBtn">${icon('send')}Создать черновики</button></div>`}
-function outboxMarkup(){const rows=state.outbox.slice(0,10);if(!rows.length)return empty('Очередь пока пуста','После подбора поставщиков здесь появятся персональные запросы КП');return `<div class="message-list">${rows.map(m=>`<article class="message-card"><div class="message-card-top"><div class="message-person"><span class="supplier-avatar">${esc(initials(m.supplier_name))}</span><div><b>${esc(m.supplier_name)}</b><span class="message-channel">${icon('mail')}${esc(m.channel)}</span></div></div>${badge(m.status)}</div><h4>${esc(m.subject)}</h4><p>${esc(m.lot_title)}<br>${esc(m.recipient)}</p><div class="message-actions"><small>${m.status==='draft'?'Ожидает проверки':'Проверка завершена'}</small>${m.status==='draft'?`<button class="btn ghost small" onclick="approveMessage(${m.id})">${icon('check')}Одобрить</button>`:'<span class="badge green">Готово</span>'}</div></article>`).join('')}</div>`}
+// BEGIN PROCUREMENT REVIEW HELPERS — pure markup/selection functions tested by Node.
+function vatBasis(value){return value===true||value===1?'С НДС':value===false||value===0?'Без НДС':'Не указан'}
+function sourceEvidence(entry){return [entry.source_filename||`Документ #${entry.source_document_id??'—'}`,entry.source_document_type,entry.source_sheet,entry.source_page?`страница ${entry.source_page}`:'',entry.source_row?`строка ${entry.source_row}`:'',entry.source_cell].filter(Boolean).join(' · ')}
+function importedPriceRows(entries,selectable=false){
+  return entries.map(e=>`<tr>${selectable?`<td>${e.status==='draft'?`<input type="checkbox" name="batchEntry" value="${Number(e.id)}" aria-label="Проверена позиция ${esc(e.item_name)}">`:'—'}</td>`:''}<td><b>${esc(e.item_name)}</b></td><td>${esc(e.quantity??'—')} ${esc(e.unit)}</td><td>${esc(e.unit_price)} ${esc(e.currency)}</td><td>${vatBasis(e.vat_included)}</td><td><small>${esc(sourceEvidence(e))}</small><details><summary>Извлечённый текст</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(e.source_text||'Нет текстового фрагмента')}</pre></details></td><td>${esc(e.status)}${e.status==='confirmed'?`<br><small>${esc(e.confirmed_by)} · ${esc(e.confirmed_at||'')}</small>`:''}</td></tr>`).join('');
+}
+function selectedImportIds(entries,values){
+  const allowed=new Set(entries.filter(e=>e.status==='draft').map(e=>Number(e.id)));
+  const ids=[...new Set(values.map(Number))];
+  if(!ids.length||ids.some(id=>!Number.isSafeInteger(id)||!allowed.has(id)))throw new Error('Отметьте проверенные черновые позиции');
+  return ids;
+}
+function archiveEntriesPath(status){
+  if(!['draft','confirmed',''].includes(status))throw new Error('Неизвестный фильтр импортированных цен');
+  return `/api/price-history-entries?status=${encodeURIComponent(status)}&limit=500`;
+}
+function messagePreview(message){return `<p><b>Канал:</b> ${esc(message.channel)} · <b>Получатель:</b> ${esc(message.recipient)}</p><h4>${esc(message.subject)}</h4><pre style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(message.body)}</pre>`}
+function validSandboxReceipt(receipt,id){return !!receipt&&receipt.mode==='sandbox'&&receipt.status==='simulated'&&receipt.external_send===false&&receipt.message_id===Number(id)&&['email','max','telegram'].includes(receipt.channel)&&/^[a-f0-9]{64}$/.test(receipt.payload_sha256)&&receipt.receipt_id===`sandbox-${receipt.channel}-${receipt.payload_sha256}`}
+function sandboxReceiptMarkup(receipt,id){
+  if(!receipt)return '<p class="muted">Sandbox-квитанции пока нет. Внешняя отправка не выполнялась.</p>';
+  if(!validSandboxReceipt(receipt,id))return '<div class="guard">Квитанция не прошла проверку. Не считать сообщение отправленным.</div>';
+  return `<details><summary>Sandbox: simulated · external_send=false</summary><p>Сохранённая локальная квитанция, не доставка адресату. Актуальность согласования повторно проверяется при симуляции.</p><p style="overflow-wrap:anywhere">ID: ${esc(receipt.receipt_id)}<br>Канал: ${esc(receipt.channel)}<br>SHA256: ${esc(receipt.payload_sha256)}</p></details>`;
+}
+function quoteFinancialCells(quote){return `<td>${esc(quote.currency||'Не указана')}</td><td>${vatBasis(quote.vat_included)}</td><td class="num">${esc(quote.subtotal??'—')}</td><td class="num">${esc(quote.delivery_cost??'—')}</td><td class="num">${esc(quote.total_cost??'—')}</td><td>${esc(quote.lead_days??'—')} дн.</td><td>${esc(quote.payment_terms||'Не указаны')}</td>`}
+// END PROCUREMENT REVIEW HELPERS
+$('#modal').addEventListener('close',()=>{$('#modalSubmit').disabled=false;$('#modalSubmit').textContent='Сохранить'});
+function outboxMarkup(){
+  const rows=state.outbox;
+  if(!rows.length)return empty('Очередь пока пуста','После подбора поставщиков здесь появятся персональные запросы КП');
+  return `<div class="guard">Email / MAX / Telegram работают только в sandbox. Согласование и симуляция не отправляют сообщения адресатам.</div><div class="message-list">${rows.map(m=>`<article class="message-card"><div class="message-card-top"><b>${esc(m.supplier_name)}</b>${badge(m.status)}</div><p>${esc(m.lot_title)}</p><details><summary>Полный текст запроса и адресат</summary>${messagePreview(m)}</details>${sandboxReceiptMarkup(m.sandbox_receipt,m.id)}<div class="message-actions">${m.status==='draft'?`<button class="btn ghost small" onclick="approveMessage(${m.id})">Проверить и согласовать</button>`:m.status==='approved'?`<button class="btn secondary small" onclick="simulateMessage(${m.id})">${m.sandbox_receipt?'Повторить sandbox (без дубля)':'Симулировать в sandbox'}</button><small>Одобрено, не отправлено</small>`:'<small>Статус из реестра; доставка не проверялась</small>'}</div></article>`).join('')}</div>`;
+}
 async function loadMatches(){if(!state.selectedLot)return toast('Сначала выберите лот',true);try{state.matches=await api(`/api/lots/${state.selectedLot}/supplier-matches`);renderRfq();if(!state.matches.length)toast('Подходящие поставщики не найдены',true)}catch(e){toast(e.message,true)}}
 async function createCampaign(){const ids=[...document.querySelectorAll('input[name=supplierMatch]:checked')].map(x=>Number(x.value));if(!ids.length)return toast('Отметьте хотя бы одного поставщика',true);try{await api(`/api/lots/${state.selectedLot}/campaigns`,{method:'POST',body:JSON.stringify({supplier_ids:ids,channel:$('#rfqChannel').value,template_code:$('#rfqTemplate').value})});toast('Черновики запросов КП созданы');await loadAll();showView('rfq')}catch(e){toast(e.message,true)}}
-async function approveMessage(id){const approved_by=prompt('Кто согласовал сообщение?','Руководитель снабжения');if(!approved_by)return;try{await api(`/api/outbox/${id}/approve`,{method:'POST',body:JSON.stringify({approved_by,comment:''})});toast('Сообщение одобрено, но не отправлено');await loadAll();showView('rfq')}catch(e){toast(e.message,true)}}
+function approveMessage(id){
+  const message=state.outbox.find(m=>m.id===id);
+  if(!message||message.status!=='draft')return toast('Черновик не найден; обновите очередь',true);
+  const sso=!!document.querySelector('meta[name="procurement-csrf"]');
+  $('#modalTitle').textContent='Проверка запроса перед согласованием';
+  $('#modalBody').innerHTML=messagePreview(message)+`<div class="guard">Только согласование. Внешняя отправка отключена.</div>${sso?'<p>Согласующий определяется вашей сессией DAS.</p>':'<label>ФИО согласующего<input id="messageApprover" autocomplete="name"></label>'}<label><input type="checkbox" id="messageReviewed"> Я проверил адресата, канал и весь текст</label>`;
+  const button=$('#modalSubmit');button.textContent='Согласовать без отправки';button.disabled=true;
+  $('#messageReviewed').onchange=e=>button.disabled=!e.target.checked;
+  button.onclick=async()=>{
+    if(!$('#messageReviewed').checked)return;
+    const actor=sso?'session':$('#messageApprover').value.trim();
+    if(!actor)return toast('Укажите согласующего',true);
+    await modalAction(()=>api(`/api/outbox/${id}/approve`,{method:'POST',body:JSON.stringify({approved_by:actor,comment:'Полный текст проверен; внешняя отправка отключена'})}),'Согласовано. Сообщение не отправлялось');
+  };
+  $('#modal').showModal();
+}
+async function simulateMessage(id){
+  if(!confirm('Выполнить только локальную sandbox-симуляцию? Сообщение не будет отправлено адресату.'))return;
+  try{
+    const receipt=await api(`/api/outbox/${id}/simulate`,{method:'POST'});
+    if(!validSandboxReceipt(receipt,id))throw new Error('Неверная sandbox-квитанция; результат не подтверждён');
+    toast('Sandbox завершён. external_send=false');await loadAll();showView('rfq');
+  }catch(e){toast(e.message,true)}
+}
 function renderComparison(){const options=state.lots.map(l=>`<option value="${l.id}" ${state.selectedLot==l.id?'selected':''}>#${l.id} · ${esc(l.title)}</option>`).join('');$('#comparison').innerHTML=`<section class="panel"><div class="panel-title"><div><h2>Сравнение коммерческих предложений</h2><p>Цена учитывается вместе с доставкой, сроком и историей поставщика</p></div><button class="btn" id="quoteBtn">+ Добавить КП</button></div><div class="toolbar"><select class="grow" id="comparisonLot"><option value="">Выберите лот</option>${options}</select><button class="btn secondary" id="compareBtn">Построить сравнение</button></div><div id="comparisonResult">${comparisonMarkup()}</div></section>`;$('#comparisonLot').onchange=e=>state.selectedLot=Number(e.target.value)||null;$('#compareBtn').onclick=loadComparison;$('#quoteBtn').onclick=()=>openModal('quote')}
 function priceSignal(row){const labels={above_history:'Выше истории',near_history:'В диапазоне',below_history:'Ниже истории',insufficient_history:'Мало данных'};return `<span class="signal ${esc(row.price_signal)}">${labels[row.price_signal]||'Мало данных'}</span>`}
 function comparisonMarkup(){
   const c=state.comparison;if(!c)return empty('Сравнение ещё не построено','Выберите лот и загрузите полученные предложения');if(!c.quotes.length)return empty('Коммерческих предложений нет','Добавьте хотя бы одно КП для выбранного лота','<button class="btn" onclick="openModal(\'quote\')">Добавить КП</button>');
   const leader=c.quotes.find(q=>q.rank===1),covered=c.price_benchmark?.matched_items||0,total=c.price_benchmark?.total_items||0;
-  return `<div class="winner-banner"><div class="winner-seal">${icon('shield')}</div><div><small>Лучшее сочетание условий</small><strong>${esc(leader?.supplier_name||'—')}</strong><span class="muted">Рекомендация требует утверждения закупочной комиссии</span></div><div class="winner-score"><b>${leader?.score??0}</b><span>итоговый балл</span></div></div><div class="comparison-head"><div class="metric"><span>Полная стоимость лидера</span><b>${leader?money(leader.total_cost,leader.currency):'—'}</b></div><div class="metric"><span>Срок поставки</span><b>${leader?leader.lead_days+' дней':'—'}</b></div><div class="metric"><span>Покрытие историей цен</span><b style="font-size:15px">${covered}/${total} позиций</b></div></div><div class="table-wrap"><table><thead><tr><th>Место</th><th>Поставщик</th><th>Итого</th><th>Срок</th><th>История цен</th><th>Отклонение</th><th>Потенциал экономии</th><th>Покрытие</th><th>Балл</th></tr></thead><tbody>${c.quotes.map(q=>`<tr><td><b>${q.rank||'—'}</b></td><td><div class="supplier-cell"><span class="supplier-avatar">${esc(initials(q.supplier_name))}</span><div><b>${esc(q.supplier_name)}</b><small class="muted">Рейтинг ${Number(q.supplier_rating||0).toFixed(1)}</small></div></div></td><td class="num">${money(q.total_cost,q.currency)}</td><td>${q.lead_days} дн.</td><td>${priceSignal(q)}<br><small class="muted">${esc(q.history_coverage)}</small></td><td class="num">${q.history_variance_pct===null?'—':(q.history_variance_pct>0?'+':'')+q.history_variance_pct+'%'}</td><td class="num">${q.potential_saving===null?'—':money(q.potential_saving,q.currency)}</td><td>${esc(q.coverage)}</td><td class="num"><b>${q.score??0}</b></td></tr>`).join('')}</tbody></table></div><div class="guard">Память цен использует только подтверждённые оплаченные покупки в той же валюте и единице измерения. Это сигнал для переговоров, а не автоматический выбор победителя.</div>`
+  return `<div class="winner-banner"><div class="winner-seal">${icon('shield')}</div><div><small>Лидер по текущей балльной модели</small><strong>${esc(leader?.supplier_name||'—')}</strong><span class="muted">Требуется решение закупочной комиссии</span></div><div class="winner-score"><b>${leader?.score??0}</b><span>балл, не финансовая нормализация</span></div></div><div class="comparison-head"><div class="metric"><span>Сумма КП + доставка</span><b>${leader?money(leader.total_cost,leader.currency):'—'}</b></div><div class="metric"><span>Срок поставки</span><b>${leader?esc(leader.lead_days)+' дней':'—'}</b></div><div class="metric"><span>Покрытие историей цен</span><b style="font-size:15px">${covered}/${total} позиций</b></div></div><div class="guard">НДС показан по документу: цены с НДС и без НДС не приведены к единой базе. Условия оплаты не пересчитаны в стоимость финансирования; валютная конверсия не выполняется. Баллы не заменяют решение человека.</div><div class="table-wrap"><table><thead><tr><th>Место</th><th>Поставщик</th><th>Валюта</th><th>НДС</th><th>Позиции КП</th><th>Доставка</th><th>Итого</th><th>Срок</th><th>Условия оплаты</th><th>История цен</th><th>Отклонение</th><th>Потенциал экономии</th><th>Покрытие</th><th>Балл</th></tr></thead><tbody>${c.quotes.map(q=>`<tr><td><b>${q.rank||'—'}</b></td><td><b>${esc(q.supplier_name)}</b></td>${quoteFinancialCells(q)}<td>${priceSignal(q)}<br><small class="muted">${esc(q.history_coverage)}</small></td><td class="num">${q.history_variance_pct==null?'—':esc((q.history_variance_pct>0?'+':'')+q.history_variance_pct+'%')}</td><td class="num">${q.potential_saving==null?'—':money(q.potential_saving,q.currency)}</td><td>${esc(q.coverage)}</td><td class="num"><b>${q.score??0}</b></td></tr>`).join('')}</tbody></table></div><div class="guard">Ориентиры используют совместимые валюту, единицу, регион, кластер и базу НДС. Подтверждённые импортированные цены отдельно от оплаченных покупок; происхождение указано в данных сравнения. Это сигнал для переговоров, не автоматический выбор победителя.</div>`
 }
 async function loadComparison(){if(!state.selectedLot)return toast('Выберите лот',true);try{state.comparison=await api(`/api/lots/${state.selectedLot}/comparison`);renderComparison()}catch(e){toast(e.message,true)}}
 function renderPricebook(){const rows=state.priceHistory,items=new Set(rows.map(r=>r.normalized_name)).size,suppliers=new Set(rows.filter(r=>r.supplier_id).map(r=>r.supplier_id)).size;$('#pricebook').innerHTML=`<div class="price-hero"><div class="price-intro"><b>Цена должна помнить прошлое</b><span>Каждая подтверждённая покупка становится ориентиром. Новое КП выше истории более чем на 10% будет подсвечено для переговоров.</span></div><div class="metric"><span>Записей</span><b>${rows.length}</b></div><div class="metric"><span>Позиций</span><b>${items}</b></div><div class="metric"><span>Поставщиков</span><b>${suppliers}</b></div></div><section class="panel"><div class="panel-title"><div><h2>Подтверждённые покупки</h2><p>${suppliers} поставщиков · только фактически оплаченные цены</p></div><button class="btn" data-open="price-history">+ Добавить цену</button></div><div class="toolbar"><input class="grow" id="priceSearch" placeholder="Поиск по материалу, проекту или поставщику"></div>${rows.length?`<div class="table-wrap"><table id="priceTable"><thead><tr><th>Материал / услуга</th><th>Цена за единицу</th><th>Количество</th><th>Поставщик</th><th>Регион / проект</th><th>Счёт</th><th>Дата</th><th>Контроль</th></tr></thead><tbody>${rows.map(r=>`<tr data-search="${esc((r.item_name+' '+(r.supplier_name||'')+' '+r.region+' '+r.project_name).toLowerCase())}"><td><b>${esc(r.item_name)}</b><br><small class="muted">${esc(r.unit)}</small></td><td class="num"><b>${money(r.unit_price,r.currency)}</b><br><small class="muted">за ${esc(r.unit)}</small></td><td class="num">${esc(r.quantity)} ${esc(r.unit)}</td><td>${esc(r.supplier_name||'Не указан')}</td><td>${esc(r.region||'—')}<br><small class="muted">${esc(r.project_name||'')}</small></td><td>${esc(r.invoice_number||'—')}</td><td>${date(r.purchased_on)}</td><td><span class="badge green">Подтверждено</span><br><small class="muted">${esc(r.confirmed_by)}</small></td></tr>`).join('')}</tbody></table></div>`:empty('История цен пока пуста','Добавьте данные из оплаченного счёта — они сразу начнут участвовать в сравнении КП')}</section>`;bindOpeners();const q=$('#priceSearch');if(q)q.oninput=()=>document.querySelectorAll('#priceTable tbody tr').forEach(r=>r.hidden=!r.dataset.search.includes(q.value.toLowerCase()))}
@@ -218,6 +271,8 @@ function renderArchive(){
   const batches=state.importBatches||[];
   const drafts=state.supplierDrafts||[];
   const entries=state.priceEntries||[];
+  const entryStatus=state.priceEntryStatus??'draft';
+  const entryTotal=batches.reduce((n,b)=>n+(Number(entryStatus==='draft'?b.draft_entry_count:entryStatus==='confirmed'?b.confirmed_entry_count:b.price_entry_count)||0),0);
   const statusLabel={pending:'В очереди',processing:'Обрабатывается',needs_review:'На проверке',done:'Готово',failed:'Ошибка'};
   const docTypeLabel={price_list:'Прайс-лист',invoice:'Счёт',commercial_offer:'КП',unknown:'Неизвестно'};
   $('#archive').innerHTML=`
@@ -228,14 +283,14 @@ function renderArchive(){
       <button class="btn" onclick="openBatchImport()">${icon('upload')}Загрузить пакет</button>
     </div>
     ${batches.length?`<div class="table-wrap"><table><thead><tr>
-      <th>ID</th><th>Файлов</th><th>Статус</th><th>Черновики</th><th>Позиции</th><th>Создан</th>
+      <th>ID</th><th>Файлов</th><th>Статус пакета</th><th>Черновики поставщиков, всего</th><th>Позиции: всего / на проверке / подтверждены</th><th>Создан</th>
     </tr></thead><tbody>
     ${batches.map(b=>`<tr>
       <td><button class="btn secondary small" onclick="openBatch(${b.id})">#${b.id}</button></td>
       <td>${(b.filenames||[]).length}</td>
       <td>${badge(b.status)}</td>
-      <td>${(b.supplier_drafts||[]).length}</td>
-      <td>${(b.price_history_entries||[]).length}</td>
+      <td>${Number(b.supplier_draft_count)||0}</td>
+      <td>${Number(b.price_entry_count)||0} / ${Number(b.draft_entry_count)||0} / ${Number(b.confirmed_entry_count)||0}</td>
       <td>${date(b.created_at)}</td>
     </tr>`).join('')}
     </tbody></table></div>`
@@ -271,24 +326,19 @@ function renderArchive(){
   </section>
   <section class="panel">
     <div class="panel-title">
-      <div><h2>Позиции истории цен</h2>
-        <p>Извлечённые позиции с трассировкой до документа, страницы и строки.</p></div>
+      <div><h2>Импортированные цены</h2>
+        <p>Подтверждение строки означает проверку извлечения, не факт оплаты. Оплаченные покупки находятся в отдельной памяти цен.</p></div>
     </div>
+    <div class="toolbar"><label>Статус <select id="priceEntryFilter"><option value="draft" ${entryStatus==='draft'?'selected':''}>На проверке</option><option value="confirmed" ${entryStatus==='confirmed'?'selected':''}>Подтверждённые</option><option value="" ${entryStatus===''?'selected':''}>Все</option></select></label><span>Показано ${entries.length} из ${entryTotal} в пакетах (до 500 последних строк). Откройте пакет для всех его позиций.</span></div>
+    ${state.archiveError?`<div class="guard">Не удалось обновить архив: ${esc(state.archiveError)}. Это не означает отсутствие записей.</div>`:''}
     ${entries.length?`<div class="table-wrap"><table><thead><tr>
-      <th>Позиция</th><th>Ед.</th><th>Цена</th><th>Вал.</th><th>НДС</th><th>Документ</th><th>Статус</th>
+      <th>Позиция</th><th>Количество / ед.</th><th>Цена / валюта</th><th>НДС</th><th>Документ / доказательство</th><th>Статус / проверил</th>
     </tr></thead><tbody>
-    ${entries.map(e=>`<tr>
-      <td><b>${esc(e.item_name)}</b>${e.is_expired?'<span class="badge" style="background:#dc2626;margin-left:4px">истёк</span>':''}</td>
-      <td>${esc(e.unit)}</td>
-      <td style="font-variant-numeric:tabular-nums">${esc(e.unit_price)}</td>
-      <td>${esc(e.currency)}</td>
-      <td>${e.vat_included?'с НДС':'без НДС'}</td>
-      <td><small>${esc(e.source_sheet||'')}${e.source_page?' стр.'+e.source_page:''}${e.source_row?' стр.'+e.source_row:''}</small></td>
-      <td>${badge(e.status)}</td>
-    </tr>`).join('')}
+    ${importedPriceRows(entries)}
     </tbody></table></div>`
-    :empty('Позиции отсутствуют','Подтвердите пакет импорта для появления позиций в истории цен')}
+    :empty('Нет позиций для выбранного фильтра','Выберите другой статус или откройте пакет импорта')}
   </section>`;
+  $('#priceEntryFilter').onchange=async e=>{state.priceEntryStatus=e.target.value;await loadArchive();renderArchive()};
 }
 
 function openBatchImport(){
@@ -326,24 +376,30 @@ async function openBatch(id){
     const entries=b.price_history_entries||[];
     const draftEntries=entries.filter(e=>e.status==='draft');
     $('#modalTitle').textContent=`Пакет #${id} — проверка позиций`;
+    const sso=!!document.querySelector('meta[name="procurement-csrf"]');
     $('#modalBody').innerHTML=`
-      <p>${b.filenames.join(', ')}</p>
+      <p>${esc(b.filenames.join(', '))}</p>
       <p>Позиций на проверке: <b>${draftEntries.length}</b> из <b>${entries.length}</b></p>
-      <label class="field-label">Подтверждает</label>
-      <input type="text" id="batchConfirmBy" value="Сотрудник снабжения" style="margin-bottom:12px">
-      ${draftEntries.length?`<p>Нажмите «Подтвердить выбранное» чтобы принять все позиции в историю цен.</p>`:'<p>Все позиции уже обработаны.</p>'}
+      <div class="guard">Сверьте каждую позицию с документом и отметьте только проверенные строки. Подтверждение цены не подтверждает оплату.</div>
+      ${sso?'<p>Проверяющий определяется вашей сессией DAS.</p>':'<label class="field-label">ФИО проверяющего<input type="text" id="batchConfirmBy"></label>'}
+      <div class="table-wrap"><table><thead><tr><th>Проверено</th><th>Позиция</th><th>Количество / ед.</th><th>Цена / валюта</th><th>НДС</th><th>Источник</th><th>Статус</th></tr></thead><tbody>${importedPriceRows(entries,true)}</tbody></table></div>
+      <p id="batchSelectionCount">Выбрано: 0</p>
     `;
-    $('#modalSubmit').textContent='Подтвердить все позиции';
-    $('#modalSubmit').onclick=async()=>{
-      if(!draftEntries.length){$('#modal').close();return;}
-      const confirmedBy=$('#batchConfirmBy').value||'system';
+    const button=$('#modalSubmit');button.textContent='Подтвердить выбранное';button.disabled=true;
+    const selection=()=>[...document.querySelectorAll('input[name=batchEntry]:checked')].map(e=>e.value);
+    document.querySelectorAll('input[name=batchEntry]').forEach(checkbox=>checkbox.onchange=()=>{const count=selection().length;$('#batchSelectionCount').textContent=`Выбрано: ${count}`;button.disabled=!count});
+    button.onclick=async()=>{
       try{
-        await api(`/api/imports/${id}/confirm`,{method:'POST',body:JSON.stringify({confirmed_by:confirmedBy,entry_ids:draftEntries.map(e=>e.id)})});
-        toast('Позиции подтверждены');
+        const ids=selectedImportIds(entries,selection());
+        const confirmedBy=sso?'session':$('#batchConfirmBy').value.trim();
+        if(!confirmedBy)throw new Error('Укажите проверяющего');
+        button.disabled=true;
+        const result=await api(`/api/imports/${id}/confirm`,{method:'POST',body:JSON.stringify({confirmed_by:confirmedBy,entry_ids:ids})});
+        toast(`Подтверждено новых строк: ${result.confirmed}. Оплата не подтверждалась`);
         $('#modal').close();
         await loadArchive();
         renderArchive();
-      }catch(e){toast(e.message,true)}
+      }catch(e){toast(e.message,true)}finally{button.disabled=!selection().length}
     };
     $('#modal').showModal();
   }catch(e){toast(e.message,true)}
@@ -380,14 +436,12 @@ async function rejectDraft(id){
 }
 
 async function loadArchive(){
-  const [batches,drafts,entries]=await Promise.allSettled([
-    api('/api/imports'),
-    api('/api/supplier-drafts?status=needs_review'),
-    api('/api/price-history-entries?status=draft&limit=100'),
-  ]);
-  state.importBatches=batches.status==='fulfilled'?batches.value:[];
-  state.supplierDrafts=drafts.status==='fulfilled'?drafts.value:[];
-  state.priceEntries=entries.status==='fulfilled'?entries.value:[];
+  try{
+    const [batches,drafts,entries]=await Promise.all([
+      api('/api/imports'),api('/api/supplier-drafts?status=needs_review'),api(archiveEntriesPath(state.priceEntryStatus??'draft'))
+    ]);
+    state.importBatches=batches;state.supplierDrafts=drafts;state.priceEntries=entries;state.archiveError='';
+  }catch(e){state.archiveError=e.message;state.priceEntries=[]}
 }
 
 </script>

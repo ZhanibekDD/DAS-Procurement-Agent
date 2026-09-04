@@ -490,19 +490,25 @@ class ProcurementService:
             clauses.append("campaigns.lot_id = ?")
             params.append(lot_id)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        return self.db.all(
+        rows = self.db.all(
             f"""
             SELECT outbox_messages.*, suppliers.name AS supplier_name,
-                   campaigns.lot_id, lots.title AS lot_title
+                   campaigns.lot_id, lots.title AS lot_title,
+                   sandbox_deliveries.receipt_json AS sandbox_receipt_json
             FROM outbox_messages
             JOIN suppliers ON suppliers.id = outbox_messages.supplier_id
             JOIN campaigns ON campaigns.id = outbox_messages.campaign_id
             JOIN lots ON lots.id = campaigns.lot_id
+            LEFT JOIN sandbox_deliveries ON sandbox_deliveries.message_id = outbox_messages.id
             {where}
             ORDER BY outbox_messages.id DESC
             """,
             tuple(params),
         )
+        for row in rows:
+            receipt = row.pop("sandbox_receipt_json")
+            row["sandbox_receipt"] = json.loads(receipt) if receipt else None
+        return rows
 
     def _outbox_context(self, conn, message_id: int) -> dict:
         row = conn.execute("""
@@ -1683,13 +1689,22 @@ class ProcurementService:
             (batch_id,),
         )
         row["price_history_entries"] = self.db.all(
-            "SELECT * FROM price_history_entries WHERE import_batch_id = ? ORDER BY id",
+            """SELECT e.*, d.filename AS source_filename, d.document_type AS source_document_type
+               FROM price_history_entries e LEFT JOIN source_documents d ON d.id=e.source_document_id
+               WHERE e.import_batch_id = ? ORDER BY e.id""",
             (batch_id,),
         )
         return row
 
     def list_import_batches(self) -> list[dict[str, Any]]:
-        rows = self.db.all("SELECT * FROM import_batches ORDER BY id DESC")
+        rows = self.db.all("""
+            SELECT b.*,
+              (SELECT COUNT(*) FROM supplier_drafts s WHERE s.import_batch_id=b.id) AS supplier_draft_count,
+              (SELECT COUNT(*) FROM price_history_entries e WHERE e.import_batch_id=b.id) AS price_entry_count,
+              (SELECT COUNT(*) FROM price_history_entries e WHERE e.import_batch_id=b.id AND e.status='draft') AS draft_entry_count,
+              (SELECT COUNT(*) FROM price_history_entries e WHERE e.import_batch_id=b.id AND e.status='confirmed') AS confirmed_entry_count
+            FROM import_batches b ORDER BY b.id DESC
+        """)
         for row in rows:
             row["filenames"] = json.loads(row.pop("filenames_json"))
             row["sha256"] = json.loads(row.pop("sha256_json"))
@@ -1703,34 +1718,40 @@ class ProcurementService:
     ) -> dict[str, Any]:
         confirmed_by = trusted_actor(confirmed_by)
         self.get_import_batch(batch_id)
+        if not entry_ids or len(entry_ids) > 500 or any(type(eid) is not int or eid <= 0 for eid in entry_ids):
+            raise ValueError("select between 1 and 500 positive entry IDs for review")
+        entry_ids = list(dict.fromkeys(entry_ids))
         now = utcnow()
-        confirmed = 0
-        for eid in entry_ids:
-            row = self.db.one(
-                "SELECT id FROM price_history_entries WHERE id = ? AND import_batch_id = ?",
-                (eid, batch_id),
-            )
-            if not row:
-                raise NotFoundError(f"price_history_entry {eid} not in batch {batch_id}")
-            with self.db.connection() as conn:
+        with self.db.connection() as conn:
+            # Validate the entire selection under one lock before changing any row.
+            conn.execute("BEGIN IMMEDIATE")
+            selected = []
+            for eid in entry_ids:
+                row = conn.execute(
+                    "SELECT id,status FROM price_history_entries WHERE id=? AND import_batch_id=?", (eid, batch_id)
+                ).fetchone()
+                if not row:
+                    raise NotFoundError(f"price_history_entry {eid} not in batch {batch_id}")
+                if row["status"] not in {"draft", "confirmed"}:
+                    raise ConflictError("only draft or already confirmed entries may be reviewed")
+                if row["status"] == "draft":
+                    selected.append(eid)
+            for eid in selected:
                 conn.execute(
-                    "UPDATE price_history_entries SET status='confirmed', confirmed_by=?, confirmed_at=? WHERE id=?",
+                    "UPDATE price_history_entries SET status='confirmed', confirmed_by=?, confirmed_at=? WHERE id=? AND status='draft'",
                     (confirmed_by, now, eid),
                 )
-            confirmed += 1
-        # Mark batch done if all entries reviewed
-        remaining = self.db.one(
-            "SELECT COUNT(*) AS n FROM price_history_entries WHERE import_batch_id=? AND status='draft'",
-            (batch_id,),
-        )
-        if remaining and remaining["n"] == 0:
-            with self.db.connection() as conn:
-                conn.execute(
-                    "UPDATE import_batches SET status='done', reviewed_at=? WHERE id=?",
-                    (now, batch_id),
-                )
-            self.db.audit("completed", "import_batch", batch_id, actor=confirmed_by,
-                          details={"confirmed": confirmed})
+            confirmed = len(selected)
+            if confirmed:
+                self.db.audit("entries_confirmed", "import_batch", batch_id, actor=confirmed_by,
+                              details={"entry_ids": selected, "confirmed": confirmed, "paid_purchase": False}, conn=conn)
+                remaining = conn.execute(
+                    "SELECT COUNT(*) AS n FROM price_history_entries WHERE import_batch_id=? AND status='draft'", (batch_id,)
+                ).fetchone()
+                if remaining["n"] == 0:
+                    conn.execute("UPDATE import_batches SET status='done', reviewed_at=? WHERE id=?", (now, batch_id))
+                    self.db.audit("completed", "import_batch", batch_id, actor=confirmed_by,
+                                  details={"confirmed": confirmed}, conn=conn)
         return {"confirmed": confirmed}
 
     def list_supplier_drafts(
@@ -1926,20 +1947,24 @@ class ProcurementService:
         clauses: list[str] = []
         params: list[Any] = []
         if status:
-            clauses.append("status = ?")
+            if status not in {"draft", "confirmed", "rejected"}:
+                raise ValueError("unsupported imported price status")
+            clauses.append("e.status = ?")
             params.append(status)
         if supplier_id is not None:
-            clauses.append("supplier_id = ?")
+            clauses.append("e.supplier_id = ?")
             params.append(supplier_id)
         if batch_id is not None:
-            clauses.append("import_batch_id = ?")
+            clauses.append("e.import_batch_id = ?")
             params.append(batch_id)
         if search:
-            clauses.append("(item_name LIKE ? OR normalized_name LIKE ?)")
+            clauses.append("(e.item_name LIKE ? OR e.normalized_name LIKE ?)")
             params.extend([f"%{search}%", f"%{search}%"])
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         params.append(limit)
         return self.db.all(
-            f"SELECT * FROM price_history_entries {where} ORDER BY created_at DESC LIMIT ?",
+            f"""SELECT e.*, d.filename AS source_filename, d.document_type AS source_document_type
+                FROM price_history_entries e LEFT JOIN source_documents d ON d.id=e.source_document_id
+                {where} ORDER BY e.created_at DESC, e.id DESC LIMIT ?""",
             tuple(params),
         )
