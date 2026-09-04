@@ -7,6 +7,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterator
 
+from .identity import trusted_actor
+
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -414,7 +416,7 @@ class Database:
         conn: sqlite3.Connection | None = None,
     ) -> None:
         values = (
-            actor,
+            trusted_actor(actor),
             action,
             entity_type,
             str(entity_id),

@@ -34,6 +34,7 @@ from .models import (
 from .ranking import rank_quotes
 from .regions import infer_cluster, infer_region, resolve_cluster
 from .templates import render_template
+from .identity import trusted_actor
 
 
 class NotFoundError(ValueError):
@@ -444,6 +445,7 @@ class ProcurementService:
         )
 
     def approve_message(self, message_id: int, approved_by: str, comment: str = "") -> dict[str, Any]:
+        approved_by = trusted_actor(approved_by)
         message = self.db.one("SELECT * FROM outbox_messages WHERE id = ?", (message_id,))
         if not message:
             raise NotFoundError("outbox message not found")
@@ -534,6 +536,7 @@ class ProcurementService:
         return max(token_score, containment, SequenceMatcher(None, left, right).ratio())
 
     def add_purchase_history(self, data: PurchaseHistoryCreate) -> dict[str, Any]:
+        data = data.model_copy(update={"confirmed_by": trusted_actor(data.confirmed_by)})
         if data.supplier_id is not None:
             self.get_supplier(data.supplier_id)
         if data.source_document_id is not None:
@@ -1116,6 +1119,7 @@ class ProcurementService:
     def approve_procurement_suggestion(
         self, suggestion_id: int, data: ProcurementSuggestionApproval
     ) -> dict[str, Any]:
+        data = data.model_copy(update={"approved_by": trusted_actor(data.approved_by)})
         suggestion = self.get_procurement_suggestion(suggestion_id)
         if suggestion["status"] != "needs_review":
             raise ConflictError("only suggestions awaiting review can be approved")
@@ -1233,6 +1237,7 @@ class ProcurementService:
     def reject_procurement_suggestion(
         self, suggestion_id: int, data: ProcurementSuggestionRejection
     ) -> dict[str, Any]:
+        data = data.model_copy(update={"reviewed_by": trusted_actor(data.reviewed_by)})
         suggestion = self.get_procurement_suggestion(suggestion_id)
         if suggestion["status"] != "needs_review":
             raise ConflictError("only suggestions awaiting review can be rejected")
@@ -1304,6 +1309,7 @@ class ProcurementService:
         created_by: str = "system",
     ) -> dict[str, Any]:
         """Create a batch import job and process all files synchronously."""
+        created_by = trusted_actor(created_by)
         from .imports import (
             extract_document,
             detect_cluster,
@@ -1555,6 +1561,7 @@ class ProcurementService:
         entry_ids: list[int],
         confirmed_by: str,
     ) -> dict[str, Any]:
+        confirmed_by = trusted_actor(confirmed_by)
         self.get_import_batch(batch_id)
         now = utcnow()
         confirmed = 0
@@ -1654,6 +1661,7 @@ class ProcurementService:
         draft_id: int,
         data: Any,
     ) -> dict[str, Any]:
+        confirmed_by = trusted_actor(data.confirmed_by)
         from .models import SupplierCreate
         draft = self.db.one("SELECT * FROM supplier_drafts WHERE id = ?", (draft_id,))
         if not draft:
@@ -1722,7 +1730,7 @@ class ProcurementService:
                 WHERE id=?
                 """,
                 (
-                    data.confirmed_by,
+                    confirmed_by,
                     now,
                     data.review_notes,
                     name,
@@ -1740,7 +1748,7 @@ class ProcurementService:
                 "approved",
                 "supplier_draft",
                 draft_id,
-                actor=data.confirmed_by,
+                actor=confirmed_by,
                 details={
                     "supplier_id": supplier["id"],
                     "reused_existing_supplier": bool(matched),
@@ -1751,17 +1759,18 @@ class ProcurementService:
         return supplier
 
     def reject_supplier_draft(self, draft_id: int, data: Any) -> dict[str, Any]:
+        rejected_by = trusted_actor(data.rejected_by)
         draft = self.db.one("SELECT * FROM supplier_drafts WHERE id = ?", (draft_id,))
         if not draft:
             raise NotFoundError("supplier draft not found")
         with self.db.connection() as conn:
             conn.execute(
                 "UPDATE supplier_drafts SET status='rejected', confirmed_by=?, review_notes=? WHERE id=?",
-                (data.rejected_by, data.review_notes, draft_id),
+                (rejected_by, data.review_notes, draft_id),
             )
             self.db.audit(
                 "rejected", "supplier_draft", draft_id,
-                actor=data.rejected_by, details={"notes": data.review_notes}, conn=conn,
+                actor=rejected_by, details={"notes": data.review_notes}, conn=conn,
             )
         return self.db.one("SELECT * FROM supplier_drafts WHERE id = ?", (draft_id,)) or {}
 
