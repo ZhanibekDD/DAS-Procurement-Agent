@@ -65,6 +65,20 @@ format. OCR/DOCX extraction and actual external messaging are not added by this 
 
 ## Rollback and data compatibility
 
+### Fast-click refresh guard
+
+Creating a project disables modal openers until the write and list refresh finish.
+Dependent forms (lot, document, quote, purchase history) cannot snapshot an incomplete
+list while connecting or after a failed refresh. A successful POST is never retried
+by the refresh handler: failure says the record was saved and asks for a GET-only
+refresh. Existing state is retained on a failed list request; older overlapping
+responses cannot overwrite a newer list. The guard also prevents repeated modal
+submissions while the save/refresh is in flight. This is UI-only, no schema/API change.
+
+`node --test tests/ui_refresh_guard.cjs` deterministically delays GETs and archive
+loading, exercises the shipped modal handlers, repeated clicks, refresh failure and
+out-of-order GET completion. These synthetic checks are not native browser acceptance.
+
 No schema or storage migration and no mass update is required. New API response fields
 are additive; existing columns and tables are reused. `entries_confirmed` is a new
 action value in the existing audit table. Confirming rows is an intentional user action,
