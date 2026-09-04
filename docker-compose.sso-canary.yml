@@ -1,0 +1,41 @@
+name: procurement-sso-canary-v1
+services:
+  procurement-sso-canary-v1:
+    image: ${PROCUREMENT_SSO_CANARY_IMAGE:?set a separately built immutable image content ID}
+    container_name: procurement-sso-canary-v1
+    pull_policy: never
+    env_file:
+      - ${PROCUREMENT_SSO_ENV_FILE:?set an absolute root-only SSO environment file outside Git}
+    environment:
+      PROCUREMENT_ENV: canary
+      PROCUREMENT_DB_PATH: /data/procurement-sso-canary.db
+      PROCUREMENT_OUTBOX_MODE: draft_only
+      # No legacy user/password or API-key bypass in this isolated contour.
+      PROCUREMENT_ADMIN_USERNAME: ""
+      PROCUREMENT_ADMIN_PASSWORD_HASH: ""
+      PROCUREMENT_API_KEY: ""
+      DAS_SSO_CLIENT_ID: procurement
+    ports:
+      - "127.0.0.1:19206:9200"
+    volumes:
+      - procurement-sso-canary-data-v1:/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-B", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9200/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+volumes:
+  procurement-sso-canary-data-v1:
+    name: procurement-sso-canary-data-v1
+networks:
+  default:
+    name: ${DAS_SSO_CANARY_NETWORK:?set the coordinated private identity-canary network}
+    external: true

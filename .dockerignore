@@ -3,5 +3,6 @@
 !procurement/**
 !Dockerfile.regional-release
 !Dockerfile.regional-release-v2
+!Dockerfile.sso-canary
 procurement/**/__pycache__/
 procurement/**/*.pyc
