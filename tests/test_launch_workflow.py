@@ -192,9 +192,9 @@ def test_sheet_review_corrections_source_attachments_campaign_snapshot(workflow)
     assert len(m['attachments'])==1 and m['attachments'][0]['sha256']==hashlib.sha256(content).hexdigest()
     assert '2026-10-20' in m['body'] and '001230040500' in m['body'] and 'Исправлено 0' in m['body']
     with pytest.raises(ConflictError):w.attach_lot(lot['id'],[])
-    assert w.document_bytes(doc)==content
+    assert w.document_file(doc).path.read_bytes()==content
     Path(doc['storage_path']).write_bytes(b'corrupt')
-    with pytest.raises(ConflictError):w.document_bytes(doc)
+    with pytest.raises(ConflictError):w.document_file(doc)
 
 
 def test_cross_project_attachment_is_rejected_before_lot_creation(workflow):

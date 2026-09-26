@@ -11,6 +11,7 @@ import sqlite3
 import threading
 import time
 from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack
 from ipaddress import ip_address, ip_network
 from pathlib import Path
 from typing import Any
@@ -56,6 +57,7 @@ from .models import (
 )
 from .launch_workflow import LaunchWorkflow
 from .table_ingest import MAX_FILE, read_table
+from .upload_io import staged_upload, UploadBodyLimit, upload_request, UploadTooLarge, MAX_BATCH
 from .passwords import verify_password
 from .service import ConflictError, NotFoundError, ProcurementService
 from .identity import authenticated_actor, trusted_actor
@@ -80,6 +82,7 @@ app = FastAPI(
     description="Internal supplier RFQ and tender comparison workflow",
     lifespan=lifespan,
 )
+app.add_middleware(UploadBodyLimit)
 
 
 SESSION_COOKIE = "procurement_session"
@@ -129,6 +132,8 @@ async def das_identity_boundary(request: Request, call_next):
         actor = claims['sub'] if claims else None
         if not actor and settings.api_key and hmac.compare_digest(request.headers.get('x-api-key',''),settings.api_key):
             actor = 'service-api'
+        if upload_request(request.scope) and not actor and (settings.environment=='production' or settings.api_key or settings.local_auth_configured):
+            return JSONResponse({'detail':'access denied'},status_code=403)
         context = authenticated_actor.set(actor)
         try:
             return await call_next(request)
@@ -358,6 +363,8 @@ def require_access(
 
 
 def handle_domain_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, UploadTooLarge):
+        return HTTPException(status_code=413, detail=str(exc))
     if isinstance(exc, NotFoundError):
         return HTTPException(status_code=404, detail=str(exc))
     if isinstance(exc, ConflictError):
@@ -552,8 +559,8 @@ def list_suppliers(region: str = Query(default=""), category: str = Query(defaul
 @app.post("/api/suppliers/import", dependencies=[Depends(require_access)])
 async def import_suppliers(file: UploadFile = File(...), commit: bool = Query(default=False)):
     try:
-        content = await file.read()
-        preview = parse_supplier_table(content, file.filename or "")
+        async with staged_upload(file) as content:
+            preview = await run_in_threadpool(parse_supplier_table,content,file.filename or '')
         imported = []
         if commit:
             for supplier in preview.rows:
@@ -581,15 +588,10 @@ async def upload_source_document(
     supplier_id: int | None = Query(default=None),
 ):
     try:
-        content = await file.read(25 * 1024 * 1024 + 1)
-        result = service.register_source_document(
-            filename=file.filename or "",
-            content=content,
-            document_type=document_type,
-            content_type=file.content_type or "application/octet-stream",
-            project_id=project_id,
-            supplier_id=supplier_id,
-        )
+        async with staged_upload(file) as content:
+            result = await run_in_threadpool(service.register_source_document,
+                filename=file.filename or '',content=content,document_type=document_type,
+                content_type=file.content_type or 'application/octet-stream',project_id=project_id,supplier_id=supplier_id)
         return {**result, "storage_path": "internal", "next_step": "ai_extraction_then_human_review"}
     except Exception as exc:
         raise handle_domain_error(exc) from exc
@@ -828,7 +830,7 @@ def list_audit(limit: int = Query(default=50, ge=1, le=200)):
 
 
 # ── PR #8: batch import & supplier-drafts endpoints ──────────────────────────
-MAX_IMPORT_BATCH_BYTES = 50 * 1024 * 1024
+MAX_IMPORT_BATCH_BYTES = MAX_BATCH
 
 
 @app.post("/api/imports/batch", dependencies=[Depends(require_access)], status_code=201)
@@ -841,18 +843,15 @@ async def batch_import(
         raise HTTPException(status_code=422, detail="at least one file is required")
     if len(files) > 20:
         raise HTTPException(status_code=422, detail="maximum 20 files per batch")
-    file_pairs: list[tuple[str, bytes]] = []
-    total = 0
-    for f in files:
-        content = await f.read(min(25 * 1024 * 1024 + 1, MAX_IMPORT_BATCH_BYTES - total + 1))
-        if len(content) > 25 * 1024 * 1024:
-            raise HTTPException(status_code=413, detail=f"file {f.filename!r} exceeds 25 MB")
-        total += len(content)
-        if total > MAX_IMPORT_BATCH_BYTES:
-            raise HTTPException(status_code=413, detail='batch exceeds 50 MB aggregate limit')
-        file_pairs.append((f.filename or "unnamed", content))
     try:
-        return await run_in_threadpool(service.create_import_batch, file_pairs, created_by=created_by)
+        async with AsyncExitStack() as stack:
+            file_pairs=[]
+            total=0
+            for f in files:
+                content=await stack.enter_async_context(staged_upload(f,MAX_IMPORT_BATCH_BYTES-total))
+                total+=len(content)
+                file_pairs.append((f.filename or 'unnamed',content))
+            return await run_in_threadpool(service.create_import_batch,file_pairs,created_by=created_by)
     except Exception as exc:
         raise handle_domain_error(exc) from exc
 

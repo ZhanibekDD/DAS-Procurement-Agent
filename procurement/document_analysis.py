@@ -9,25 +9,71 @@ from typing import Any
 from pypdf import PdfReader
 
 from .models import LotItemCreate, ProcurementSuggestionCreate
+from .upload_io import FilePayload, MAX_FILE, open_payload, UploadTooLarge, TOO_LARGE
 
 
 def _number(value: str) -> Decimal:
     return Decimal(value.replace(" ", "").replace("\xa0", "").replace(",", "."))
 
 
-def extract_pdf_page(content: bytes, page_number: int) -> str:
+def _extract_pdf_page(content, page_number: int) -> str:
     if not content.startswith(b"%PDF-"):
         raise ValueError("invalid PDF payload")
-    try:
-        reader = PdfReader(io.BytesIO(content))
-    except Exception as exc:
-        raise ValueError("PDF cannot be read") from exc
-    if page_number < 1 or page_number > len(reader.pages):
-        raise ValueError(f"PDF page must be between 1 and {len(reader.pages)}")
-    text = reader.pages[page_number - 1].extract_text() or ""
+    with open_payload(content) as stream:
+        try:
+            reader = PdfReader(stream)
+        except Exception as exc:
+            raise ValueError("PDF cannot be read") from exc
+        if reader.is_encrypted:
+            raise ValueError('PDF is encrypted')
+        if page_number < 1 or page_number > len(reader.pages):
+            raise ValueError(f"PDF page must be between 1 and {len(reader.pages)}")
+        text = reader.pages[page_number - 1].extract_text() or ""
+    if len(text)>100000:
+        raise ValueError('PDF page text exceeds safe limits')
     if not text.strip():
         raise ValueError("PDF page has no extractable text; OCR is required")
     return text
+
+
+def _page_worker(content, page_number, pipe):
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_AS,(512*1024*1024,512*1024*1024))
+        resource.setrlimit(resource.RLIMIT_CPU,(15,15))
+    except ImportError:
+        pass
+    try:pipe.send((True,_extract_pdf_page(content,page_number)))
+    except Exception as exc:pipe.send((False,str(exc)[:1000]))
+    finally:pipe.close()
+
+
+def extract_pdf_page(content, page_number: int) -> str:
+    if not isinstance(content,FilePayload):return _extract_pdf_page(content,page_number)
+    from .imports import _PDF_SLOTS
+    import multiprocessing
+    context=multiprocessing.get_context('spawn')
+    receiver,sender=context.Pipe(duplex=False)
+    process=context.Process(target=_page_worker,args=(content,page_number,sender))
+    if not _PDF_SLOTS.acquire(blocking=False):
+        receiver.close();sender.close()
+        raise ValueError('PDF parser capacity is busy; retry later')
+    result=None
+    try:
+        process.start();sender.close()
+        if receiver.poll(20):
+            try:result=receiver.recv()
+            except EOFError:pass
+    finally:
+        receiver.close();sender.close()
+        if process.pid is not None:
+            process.join(timeout=1)
+            if process.is_alive():process.kill();process.join(timeout=2)
+            process.close()
+        _PDF_SLOTS.release()
+    if not result:raise ValueError('PDF extraction exceeded resource limits or failed')
+    if not result[0]:raise ValueError(result[1])
+    return result[1]
 
 
 def extract_bulat_fence_schedule(
@@ -267,8 +313,9 @@ def compare_fence_documents(
     }
 
 
-def read_stored_pdf(path: str) -> bytes:
+def read_stored_pdf(path: str) -> FilePayload:
     file_path = Path(path)
     if file_path.suffix.casefold() != ".pdf" or not file_path.is_file():
         raise ValueError("stored source document is not an available PDF")
-    return file_path.read_bytes()
+    if file_path.stat().st_size>MAX_FILE:raise UploadTooLarge(TOO_LARGE)
+    return FilePayload(file_path)

@@ -72,7 +72,7 @@ function openLaunchImport(kind){
     ${sheet?`<label>Проект<select id="launchProject"><option value="">Выберите</option>${state.projects.map(p=>`<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></label>`:'<label>Регион по умолчанию<input id="launchRegion" value="Воронежская область"></label>'}
     <label>XLSX / CSV<input id="launchFile" type="file" accept=".xlsx,.csv"></label>
     <div class="form-grid"><label>Лист (пусто — первый)<input id="launchSheet"></label><label>Строка заголовков<input id="launchHeader" type="number" min="1" max="100" value="1"></label></div>
-    <p>До 25 МБ. Сначала сопоставление колонок и проверка данных. Ничего не создаётся без подтверждения.</p>
+    <p>До 100 МБ. Сначала сопоставление колонок и проверка данных. Ничего не создаётся без подтверждения.</p>
     <div id="launchMapping"></div><div id="launchPreview"></div>`,'Предпросмотр',previewLaunchImport);
   for(const selector of ['#launchFile','#launchSheet','#launchHeader',sheet?'#launchProject':'#launchRegion'])$(selector).addEventListener('change',invalidateLaunchPreview);
 }

@@ -304,6 +304,8 @@ class ClusterAndApprovalTests(unittest.TestCase):
         )
         item = approved["lot"]["items"][0]
         self.assertEqual(item["source_document_id"], document["id"])
+        self.assertEqual(approved['lot']['attachments'][0]['document_id'],document['id'])
+        self.assertEqual(approved['lot']['attachments'][0]['sha256'],document['sha256'])
         self.assertEqual(item["source_page"], 13)
         self.assertEqual(item["source_reference"], "Спецификация, поз. П1")
         self.assertEqual(approved["lot"]["rfq_requirements"]["color_ral"], "RAL 6005")
@@ -326,6 +328,7 @@ class ClusterAndApprovalTests(unittest.TestCase):
             approved["lot"]["id"], CampaignCreate(supplier_ids=[supplier["id"]])
         )
         body = campaign["messages"][0]["body"]
+        self.assertEqual(campaign['messages'][0]['attachments'][0]['document_id'],document['id'])
         self.assertIn("Дополнительные требования", body)
         self.assertIn("RAL 6005", body)
         self.assertIn("указать оба варианта", body)

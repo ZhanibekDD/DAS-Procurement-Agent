@@ -1008,8 +1008,9 @@ class ProcurementService:
                          "invoice", "price_list", "unknown"}
         if document_type not in allowed_types:
             raise ValueError("unsupported document type")
-        if not content or len(content) > 25 * 1024 * 1024:
-            raise ValueError("document must be between 1 byte and 25 MB")
+        from .upload_io import MAX_FILE, TOO_LARGE, UploadTooLarge, chunks, payload_sha256
+        if len(content)>MAX_FILE:raise UploadTooLarge(TOO_LARGE)
+        if not len(content):raise ValueError('Файл пуст')
         suffix = Path(filename).suffix.lower()
         from .table_ingest import safe_upload
         if suffix not in {".pdf", ".xlsx", ".csv", ".docx"}:
@@ -1026,7 +1027,7 @@ class ProcurementService:
         if supplier_id is not None:
             self.get_supplier(supplier_id)
 
-        digest = hashlib.sha256(content).hexdigest()
+        digest = payload_sha256(content)
         if self.db.path == ":memory:":
             raise RuntimeError("document storage is unavailable for in-memory database")
 
@@ -1047,9 +1048,10 @@ class ProcurementService:
                 return dict(existing)
             try:
                 with storage_path.open('xb') as output:
-                    output.write(content)
+                    for part in chunks(content):output.write(part)
             except FileExistsError:
-                if hashlib.sha256(storage_path.read_bytes()).hexdigest() != digest:
+                from .upload_io import FilePayload
+                if payload_sha256(FilePayload(storage_path)) != digest:
                     raise ConflictError('immutable upload conflict')
             cursor = conn.execute(
                 """
@@ -1328,6 +1330,8 @@ class ProcurementService:
             )
             if claimed.rowcount != 1:
                 raise ConflictError("only suggestions awaiting review can be approved")
+            from .launch_workflow import LaunchWorkflow
+            LaunchWorkflow(self)._documents(conn,suggestion['project_id'],[suggestion['source_document_id']])
             section = conn.execute(
                 "SELECT * FROM project_sections WHERE project_id=? AND code=?",
                 (suggestion["project_id"], suggestion["section_code"]),
@@ -1383,6 +1387,8 @@ class ProcurementService:
                 ),
             )
             lot_id = int(lot_cursor.lastrowid)
+            conn.execute('INSERT INTO lot_attachments(lot_id,document_id) VALUES (?,?)',
+                         (lot_id,suggestion['source_document_id']))
             for item_data in suggestion["items"]:
                 item = LotItemCreate.model_validate(item_data)
                 conn.execute(
@@ -1507,8 +1513,9 @@ class ProcurementService:
         created_by: str = "system",
     ) -> dict[str, Any]:
         """Bound extraction before writes; claim each source atomically."""
-        if not 1 <= len(files) <= 20 or sum(len(content) for _, content in files) > 50 * 1024 * 1024:
-            raise ValueError('batch requires 1-20 files within a 50 MB aggregate limit')
+        from .upload_io import MAX_BATCH
+        if not 1 <= len(files) <= 20 or sum(len(content) for _, content in files) > MAX_BATCH:
+            raise ValueError('batch requires 1-20 files within a 100 MB aggregate limit')
         if any(Path(filename).suffix.lower() == ".xls" for filename, _ in files):
             raise ValueError("legacy .xls is not supported; convert to .xlsx and review before import")
         created_by = trusted_actor(created_by)

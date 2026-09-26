@@ -155,7 +155,9 @@ def test_batch_aggregate_limit_before_any_service_write(monkeypatch,sizes,accept
     class Upload:
         filename='synthetic.pdf'
         def __init__(self,size):self.size=size
-        async def read(self,maximum):return b'X'*min(maximum,self.size)
+        async def read(self,maximum):
+            n=min(maximum,self.size);self.size-=n
+            return b'X'*n
     if accepted:
         assert asyncio.run(app.batch_import([Upload(size) for size in sizes]))=={'status':'test'}
         assert len(calls)==1

@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, File, Form, HTTPException, Request, UploadFile
@@ -11,6 +12,7 @@ from starlette.concurrency import run_in_threadpool
 from pydantic import Field, StrictInt
 from .models import StrictModel, SupplierCreate, LotCreate
 from .table_ingest import read_table, MAX_FILE
+from .upload_io import staged_upload
 
 
 class Confirm(StrictModel):
@@ -95,22 +97,25 @@ def install(app, settings, service, launch, require_access, session_claims, doma
     def restore(sid: int, data: SupplierState):
         return call(launch.supplier_state,sid,True,data.revision,data.confirmed)
 
+    @asynccontextmanager
     async def table(file, mapping, sheet, header_row):
         try:
-            content = await file.read(MAX_FILE + 1)
-            parsed = await run_in_threadpool(read_table,content,file.filename or '',sheet,header_row)
-            chosen = json.loads(mapping) if mapping else None
-            if chosen is not None and not isinstance(chosen,dict):
-                raise ValueError('Сопоставление должно быть объектом')
-            return parsed,chosen,content
+            async with staged_upload(file) as content:
+                parsed = await run_in_threadpool(read_table,content,file.filename or '',sheet,header_row)
+                chosen = json.loads(mapping) if mapping else None
+                if chosen is not None and not isinstance(chosen,dict):
+                    raise ValueError('Сопоставление должно быть объектом')
+                yield parsed,chosen,content
+        except HTTPException:
+            raise
         except Exception as exc:
             raise domain_error(exc) from None
 
     @app.post('/api/launch/supplier-import/preview', dependencies=[Depends(write_access)])
     async def preview_suppliers(file: UploadFile=File(...), mapping: str=Form(''),
                                 sheet: str=Form(''), header_row: int=Form(1), region: str=Form('Воронежская область')):
-        parsed,chosen,_ = await table(file,mapping,sheet,header_row)
-        return await run_in_threadpool(call,launch.supplier_preview,parsed,chosen,region)
+        async with table(file,mapping,sheet,header_row) as (parsed,chosen,_):
+            return await run_in_threadpool(call,launch.supplier_preview,parsed,chosen,region)
 
     @app.post('/api/launch/supplier-import/{pid}/apply', dependencies=[Depends(write_access)])
     def apply(pid: str,data: Confirm):
@@ -128,10 +133,10 @@ def install(app, settings, service, launch, require_access, session_claims, doma
 
     @app.post('/api/launch/lot-sheet/preview', dependencies=[Depends(write_access)])
     async def preview_lot(file: UploadFile=File(...),mapping: str=Form(''),sheet: str=Form(''),header_row: int=Form(1),project_id: int=Form(...)):
-        parsed,chosen,content = await table(file,mapping,sheet,header_row)
-        document = await run_in_threadpool(call,lambda: service.register_source_document(filename=file.filename or '',content=content,
-                         document_type='project_section',project_id=project_id))
-        return await run_in_threadpool(call,launch.sheet_preview,parsed,chosen,document)
+        async with table(file,mapping,sheet,header_row) as (parsed,chosen,content):
+            document = await run_in_threadpool(call,lambda: service.register_source_document(filename=file.filename or '',content=content,
+                             document_type='project_section',project_id=project_id))
+            return await run_in_threadpool(call,launch.sheet_preview,parsed,chosen,document)
 
     @app.post('/api/launch/lot-sheet/{pid}/create', dependencies=[Depends(write_access)],status_code=201)
     def create(pid: str,data: SheetConfirm):
@@ -146,7 +151,7 @@ def install(app, settings, service, launch, require_access, session_claims, doma
         doc=service.db.one('SELECT * FROM source_documents WHERE id=?',(did,))
         if not doc:
             raise HTTPException(404,'Файл не найден')
-        call(launch.document_bytes,doc)
+        call(launch.document_file,doc)
         service.db.audit('downloaded','source_document',did)
         return FileResponse(doc['storage_path'],filename=doc['filename'],media_type='application/octet-stream',headers={'X-Content-Type-Options':'nosniff','Cache-Control':'no-store'})
 

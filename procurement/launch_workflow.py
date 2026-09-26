@@ -17,6 +17,8 @@ from .region_routing import resolve_cluster
 from .sandbox import payload_sha256, message_fingerprint
 from .service import ConflictError, NotFoundError
 from .table_ingest import contacts, mapped, suggested_mapping, quantity, delivery_date
+from .upload_io import MAX_BATCH, FilePayload, payload_sha256 as file_sha256
+from .stream_mail import send_streamed
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS launch_previews (
@@ -311,10 +313,10 @@ class LaunchWorkflow:
             doc = conn.execute('SELECT * FROM source_documents WHERE id=? AND project_id=?',(did,project_id)).fetchone()
             if not doc:
                 raise ValueError('Вложение не принадлежит проекту заявки')
-            self.document_bytes(dict(doc))
+            self.document_file(dict(doc))
             rows.append(dict(doc))
-        if sum(r['size_bytes'] for r in rows) > 25 * 1024 * 1024:
-            raise ValueError('Общий размер вложений превышает 25 МБ')
+        if sum(r['size_bytes'] for r in rows) > MAX_BATCH:
+            raise ValueError('Общий размер вложений превышает 100 МБ')
         return rows
 
     def attach_lot(self, lot_id, ids):
@@ -331,13 +333,13 @@ class LaunchWorkflow:
             self.db.audit('lot_attachments_updated','lot',lot_id,details={'document_ids':ids},conn=conn)
         return self.service.get_lot(lot_id)
 
-    def document_bytes(self, doc):
+    def document_file(self, doc):
         root = Path(self.db.path).resolve().parent / 'uploads'
         path = Path(doc['storage_path']).resolve()
         if not path.is_relative_to(root) or not path.is_file() or path.stat().st_size != doc['size_bytes']:
             raise ConflictError('Вложение недоступно или изменено')
-        content = path.read_bytes()
-        if hashlib.sha256(content).hexdigest() != doc['sha256']:
+        content = FilePayload(path)
+        if file_sha256(content) != doc['sha256']:
             raise ConflictError('SHA вложения не совпадает')
         return content
 
@@ -371,13 +373,13 @@ class LaunchWorkflow:
             key = uuid.uuid4().hex
             email['Message-ID'] = '<' + key + '@' + sender.split('@')[1] + '>'
             email.set_content(message['body'])
+            attachments=[]
             for attachment in message.get('attachments',[]):
                 doc = conn.execute('SELECT * FROM source_documents WHERE id=?',(attachment['document_id'],)).fetchone()
                 if not doc or doc['sha256'] != attachment['sha256']:
                     raise ConflictError('Вложение изменилось после согласования')
-                content = self.document_bytes(dict(doc))
-                mime = mimetypes.guess_type(attachment['filename'])[0] or 'application/octet-stream'
-                email.add_attachment(content,maintype=mime.split('/')[0],subtype=mime.split('/')[1],filename=attachment['filename'])
+                content = self.document_file(dict(doc))
+                attachments.append((attachment['filename'],content,attachment['sha256']))
             conn.execute('INSERT INTO mail_deliveries VALUES (?,?,?,?,?,?)',(message_id,fingerprint,'sending',key,trusted_actor(),utcnow()))
             self.db.audit('mail_send_started','outbox_message',message_id,details={'attachment_count':len(message.get('attachments',[]))},conn=conn)
         try:
@@ -397,8 +399,7 @@ class LaunchWorkflow:
                     if password_path.stat().st_mode & 0o077:
                         raise ValueError('SMTP secret должен иметь права 0400/0600')
                     smtp.login(user,password_path.read_text().strip())
-                if smtp.send_message(email):
-                    raise RuntimeError('SMTP rejected recipient')
+                send_streamed(smtp,email,attachments)
         except Exception:
             with self.db.connection() as conn:
                 conn.execute("UPDATE mail_deliveries SET status='unknown',updated_at=? WHERE message_id=?",(utcnow(),message_id))

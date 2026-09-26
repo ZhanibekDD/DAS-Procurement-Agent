@@ -26,7 +26,7 @@ def http_boundary(tmp_path,monkeypatch):
     db=Database(settings.db_path);db.initialize();service=ProcurementService(db);launch=LaunchWorkflow(service)
     for name,value in [('settings',settings),('db',db),('service',service)]:monkeypatch.setattr(application,name,value)
     authority=Authority();monkeypatch.setattr(sso,'_post',authority.post)
-    app=FastAPI();app.middleware('http')(application.das_identity_boundary)
+    app=FastAPI();app.add_middleware(application.UploadBodyLimit);app.middleware('http')(application.das_identity_boundary)
     app.router.routes.extend(r for r in application.app.router.routes if not r.path.startswith('/api/launch/') and r.path!='/assets/launch.js')
     install(app,settings,service,launch,application.require_access,application._session_claims,application.handle_domain_error)
     with TestClient(app,base_url=BASE) as client:yield client,authority,settings,db

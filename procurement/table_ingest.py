@@ -9,7 +9,7 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
-MAX_FILE = 25 * 1024 * 1024
+from .upload_io import MAX_FILE, TOO_LARGE, UploadTooLarge, open_payload
 MAX_ROWS = 10000
 MAX_COLS = 100
 
@@ -18,7 +18,7 @@ def validate_xlsx_expansion(content: bytes, filename: str) -> None:
     """Check actual worksheet XML, not attacker-controlled dimension hints."""
     from xml.etree import ElementTree as ET
     safe_upload(content, filename, {'.xlsx'})
-    with zipfile.ZipFile(io.BytesIO(content)) as archive:
+    with open_payload(content) as source, zipfile.ZipFile(source) as archive:
         if sum(i.file_size for i in archive.infolist()) > 20 * 1024 * 1024:
             raise ValueError('XLSX expanded data exceeds 20 MB')
         sheets = [i for i in archive.namelist() if re.fullmatch(r'xl/worksheets/[^/]+\.xml', i)]
@@ -54,8 +54,9 @@ def validate_xlsx_expansion(content: bytes, filename: str) -> None:
 
 
 def safe_upload(content: bytes, filename: str, allowed: set[str]) -> str:
-    if not content or len(content) > MAX_FILE:
-        raise ValueError('Файл пуст или превышает 25 МБ')
+    if len(content) > MAX_FILE:
+        raise UploadTooLarge(TOO_LARGE)
+    if not len(content):raise ValueError('Файл пуст')
     if (not filename or len(filename) > 200 or any(c in filename for c in '/\\\r\n\x00:<>"|?*')
             or filename.startswith('.') or Path(filename).suffix.lower() not in allowed):
         raise ValueError('Недопустимое имя или расширение файла')
@@ -64,7 +65,7 @@ def safe_upload(content: bytes, filename: str, allowed: set[str]) -> str:
     suffix = Path(filename).suffix.lower()
     if suffix in {'.xlsx', '.docx'}:
         try:
-            with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            with open_payload(content) as source, zipfile.ZipFile(source) as archive:
                 infos = archive.infolist()
                 if (len(infos) > 20000 or sum(i.file_size for i in infos) > 100 * 1024 * 1024
                         or any('vbaproject' in i.filename.lower() or i.flag_bits & 1 for i in infos)
@@ -78,20 +79,32 @@ def safe_upload(content: bytes, filename: str, allowed: set[str]) -> str:
 
 
 def read_table(content: bytes, filename: str, sheet: str = '', header_row: int = 1) -> dict:
+    with open_payload(content) as stream:
+        return _read_table(content,stream,filename,sheet,header_row)
+
+
+def _read_table(content,stream,filename,sheet,header_row):
     suffix = safe_upload(content, filename, {'.xlsx', '.csv'})
     if not 1 <= header_row <= 100:
         raise ValueError('Строка заголовков должна быть от 1 до 100')
     if suffix == '.csv':
+        # Detect encoding incrementally, never decode the whole uploaded file.
+        import codecs
+        decoder=codecs.getincrementaldecoder('utf-8-sig')()
+        encoding='utf-8-sig'
         try:
-            text = content.decode('utf-8-sig')
-        except UnicodeDecodeError:
-            text = content.decode('cp1251')
+            while part:=stream.read(1024*1024):decoder.decode(part)
+            decoder.decode(b'',final=True)
+        except UnicodeDecodeError:encoding='cp1251'
+        stream.seek(0)
+        text=io.TextIOWrapper(stream,encoding=encoding,newline='')
         try:
-            dialect = csv.Sniffer().sniff(text[:4096], delimiters=',;\t')
+            dialect = csv.Sniffer().sniff(text.read(4096), delimiters=',;\t')
         except csv.Error:
             dialect = csv.excel
+        text.seek(0)
         raw = []
-        for row in csv.reader(io.StringIO(text), dialect):
+        for row in csv.reader(text, dialect):
             if len(raw) >= MAX_ROWS + 100 or len(row) > MAX_COLS:
                 raise ValueError('Таблица превышает 10000 строк или 100 колонок')
             raw.append(row)
@@ -99,7 +112,7 @@ def read_table(content: bytes, filename: str, sheet: str = '', header_row: int =
         selected = 'CSV'
     else:
         validate_xlsx_expansion(content, filename)
-        book = load_workbook(io.BytesIO(content), read_only=True, data_only=False, keep_links=False)
+        book = load_workbook(stream, read_only=True, data_only=False, keep_links=False)
         try:
             sheets = book.sheetnames
             if sheet and sheet not in sheets:

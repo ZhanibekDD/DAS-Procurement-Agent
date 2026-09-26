@@ -9,6 +9,7 @@ from typing import Iterable
 from openpyxl import load_workbook
 
 from .models import SupplierCreate
+from .upload_io import open_payload, payload_sha256, MAX_FILE, UploadTooLarge, TOO_LARGE
 
 
 HEADER_ALIASES = {
@@ -88,6 +89,8 @@ def _parse_rows(rows: Iterable[tuple[object, ...]]) -> ImportPreview:
     headers, mapping = _header_mapping(header_row)
     preview = ImportPreview(headers=headers)
     for row_number, row in enumerate(iterator, start=2):
+        if row_number>10001 or len(row)>100 or any(len(str(value or ''))>8000 for value in row):
+            raise ValueError('Supplier table exceeds safe row/column/cell limits')
         try:
             supplier = _supplier_from_row(list(row), mapping)
             if supplier is not None:
@@ -98,18 +101,28 @@ def _parse_rows(rows: Iterable[tuple[object, ...]]) -> ImportPreview:
 
 
 def parse_supplier_table(content: bytes, filename: str) -> ImportPreview:
+    from .table_ingest import safe_upload, validate_xlsx_expansion
+    safe_upload(content,filename,{'.csv','.xlsx'})
+    with open_payload(content) as stream:
+        return _parse_supplier_stream(content,stream,filename)
+
+
+def _parse_supplier_stream(content,stream,filename):
     suffix = Path(filename).suffix.lower()
     if suffix == ".csv":
-        text = content.decode("utf-8-sig")
-        sample = text[:4096]
+        text = io.TextIOWrapper(stream,encoding='utf-8-sig',newline='')
+        sample = text.read(4096)
+        text.seek(0)
         try:
             dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
         except csv.Error:
             dialect = csv.excel
             dialect.delimiter = ";"
-        return _parse_rows(tuple(row) for row in csv.reader(io.StringIO(text), dialect))
+        return _parse_rows(tuple(row) for row in csv.reader(text, dialect))
     if suffix == ".xlsx":
-        workbook = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+        from .table_ingest import validate_xlsx_expansion
+        validate_xlsx_expansion(content,filename)
+        workbook = load_workbook(stream, read_only=True, data_only=True)
         try:
             sheet = workbook.active
             return _parse_rows(sheet.iter_rows(values_only=True))
@@ -424,18 +437,19 @@ def _extract_pdf_text(content: bytes) -> tuple[list[str], list[str]]:
     try:
         from pypdf import PdfReader
         import io as _io
-        reader = PdfReader(_io.BytesIO(content))
-        if reader.is_encrypted or len(reader.pages) > MAX_PDF_PAGES:
-            raise ValueError('PDF exceeds 50 pages or is encrypted')
-        pages = []
-        total = 0
-        for page in reader.pages:
-            text = page.extract_text() or ''
-            total += len(text)
-            if len(text) > 100000 or total > MAX_PDF_TEXT:
-                raise ValueError('PDF expanded text exceeds limits')
-            pages.append(text)
-        return pages, []
+        with open_payload(content) as stream:
+            reader = PdfReader(stream)
+            if reader.is_encrypted or len(reader.pages) > MAX_PDF_PAGES:
+                raise ValueError('PDF exceeds 50 pages or is encrypted')
+            pages = []
+            total = 0
+            for page in reader.pages:
+                text = page.extract_text() or ''
+                total += len(text)
+                if len(text) > 100000 or total > MAX_PDF_TEXT:
+                    raise ValueError('PDF expanded text exceeds limits')
+                pages.append(text)
+            return pages, []
     except Exception as exc:
         return [], [f'PDF parse error: {exc}']
 
@@ -460,7 +474,7 @@ def _extract_items_from_pdf_tables(
     try:
         import pdfplumber
         import io as _io_plumb
-        with pdfplumber.open(_io_plumb.BytesIO(content)) as pdf:
+        with open_payload(content) as stream, pdfplumber.open(stream) as pdf:
             if len(pdf.pages) > MAX_PDF_PAGES:
                 raise ValueError('PDF exceeds 50 pages')
             for page_num, page in enumerate(pdf.pages, start=1):
@@ -600,7 +614,7 @@ def _extract_items_from_pdf_text(
 
 
 def extract_from_pdf(content: bytes, filename: str) -> DocumentExtractResult:
-    sha256 = hashlib.sha256(content).hexdigest()
+    sha256 = payload_sha256(content)
     pages, errors = _extract_pdf_text(content)
     if errors:
         return DocumentExtractResult(filename=filename,sha256=sha256,document_type='unknown',
@@ -675,20 +689,22 @@ def extract_from_xlsx(content: bytes, filename: str) -> DocumentExtractResult:
     from openpyxl import load_workbook
     import io as _io
 
-    sha256 = hashlib.sha256(content).hexdigest()
+    sha256 = payload_sha256(content)
     errors: list[str] = []
 
+    stream = open_payload(content)
     try:
         from .table_ingest import MAX_ROWS, MAX_COLS, validate_xlsx_expansion
         # Legacy batch uploads normalize the storage basename; inspect the same
         # safe basename here, while preserving provenance in the result.
         validate_xlsx_expansion(content, Path(filename.replace('\\', '/')).name)
-        wb = load_workbook(_io.BytesIO(content), read_only=True, data_only=True, keep_links=False)
+        wb = load_workbook(stream, read_only=True, data_only=True, keep_links=False)
         for ws in wb:
             if (ws.max_row or 0) > MAX_ROWS + 100 or (ws.max_column or 0) > MAX_COLS:
                 wb.close()
                 raise ValueError('XLSX row/column dimensions exceed limits')
     except Exception as exc:
+        stream.close()
         return DocumentExtractResult(
             filename=filename, sha256=sha256, document_type='unknown',
             supplier_name='', supplier_tax_id='', supplier_region='',
@@ -701,6 +717,7 @@ def extract_from_xlsx(content: bytes, filename: str) -> DocumentExtractResult:
         return _extract_bounded_xlsx(wb, filename, sha256)
     finally:
         wb.close()
+        stream.close()
 
 
 def _extract_bounded_xlsx(wb, filename: str, sha256: str) -> DocumentExtractResult:
@@ -838,8 +855,9 @@ def extract_document(content: bytes, filename: str) -> DocumentExtractResult:
     """Extract items and supplier info from a КП/invoice/price-list file."""
     suffix = Path(filename).suffix.lower()
     if suffix == '.pdf':
-        if not content.startswith(b'%PDF-') or len(content) > 25 * 1024 * 1024:
-            raise ValueError('PDF is invalid or exceeds 25 MB')
+        if len(content)>MAX_FILE:raise UploadTooLarge(TOO_LARGE)
+        if not content.startswith(b'%PDF-'):
+            raise ValueError('PDF is invalid')
         return _extract_pdf_isolated(content, filename)
     if suffix == '.xls':
         raise ValueError('legacy .xls is not supported; convert the file to .xlsx and review it before import')
