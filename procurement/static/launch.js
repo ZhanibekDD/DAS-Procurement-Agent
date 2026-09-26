@@ -33,7 +33,7 @@ async function editLaunchSupplier(id){
   try{
     const s=await api(`/api/launch/suppliers/${id}`);launchState.edit=s;baseShowModal('supplier');
     $('#modalTitle').textContent='Редактирование поставщика';
-    for(const [field,input] of Object.entries({name:'sName',tax_id:'sTax',region:'sRegion',email:'sEmail',phone:'sPhone',telegram:'sTelegram',max_contact:'sMax',rating:'sRating',verified:'sVerified'}))$('#'+input).value=String(s[field]);
+    for(const [field,input] of Object.entries({name:'sName',tax_id:'sTax',region:'sRegion',email:'sEmail',phone:'sPhone',telegram:'sTelegram',max_contact:'sMax',rating:'sRating',verified:'sVerified'}))$('#'+input).value=String(field==='verified'?!!s[field]:s[field]);
     $('#sCategories').value=s.categories.join(', ');
     $('#modalBody').insertAdjacentHTML('beforeend',`<label>Кластер<select id="sCluster"><option value="cluster_1" ${s.cluster==='cluster_1'?'selected':''}>Кластер 1</option><option value="cluster_2" ${s.cluster==='cluster_2'?'selected':''}>Кластер 2</option></select></label>`);
     $('#modalSubmit').onclick=()=>modalAction(()=>launchJson(`/api/launch/suppliers/${id}`,'PUT',{
@@ -74,7 +74,9 @@ function openLaunchImport(kind){
     <div class="form-grid"><label>Лист (пусто — первый)<input id="launchSheet"></label><label>Строка заголовков<input id="launchHeader" type="number" min="1" max="100" value="1"></label></div>
     <p>До 25 МБ. Сначала сопоставление колонок и проверка данных. Ничего не создаётся без подтверждения.</p>
     <div id="launchMapping"></div><div id="launchPreview"></div>`,'Предпросмотр',previewLaunchImport);
+  for(const selector of ['#launchFile','#launchSheet','#launchHeader',sheet?'#launchProject':'#launchRegion'])$(selector).addEventListener('change',invalidateLaunchPreview);
 }
+function invalidateLaunchPreview(){launchState.preview=null;$('#launchPreview').innerHTML='<p>Источник или сопоставление изменены. Повторите предпросмотр.</p>';$('#modalSubmit').textContent='Предпросмотр';$('#modalSubmit').onclick=previewLaunchImport}
 async function previewLaunchImport(){
   const file=$('#launchFile').files[0];if(!file)return toast('Выберите файл',true);
   const fd=new FormData();fd.append('file',file);fd.append('sheet',$('#launchSheet').value);fd.append('header_row',$('#launchHeader').value);
@@ -87,6 +89,7 @@ async function previewLaunchImport(){
   try{
     const p=await api(`/api/launch/${sheet?'lot-sheet':'supplier-import'}/preview`,{method:'POST',body:fd});launchState.preview=p;
     $('#launchMapping').innerHTML=mappingMarkup(p,sheet?sheetMapFields:supplierMapFields)+`<button class="btn secondary" type="button" onclick="previewLaunchImport()">Повторить с выбранными колонками</button>`;
+    document.querySelectorAll('[data-map]').forEach(x=>x.addEventListener('change',invalidateLaunchPreview));
     if(p.needs_mapping){$('#launchPreview').innerHTML='<p>Сопоставьте обязательные колонки и повторите предпросмотр.</p>';return}
     if(sheet){renderSheetReview(p);return}
     const report=p.report;
