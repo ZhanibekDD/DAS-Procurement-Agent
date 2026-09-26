@@ -2,6 +2,7 @@
 import hashlib
 import io
 import zipfile
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -137,3 +138,90 @@ def test_legacy_approved_link_backfills_from_authoritative_rows_and_audit(workfl
         conn.execute('UPDATE price_history_entries SET supplier_id=NULL')
     db.initialize()
     assert db.one('SELECT approved_supplier_id FROM supplier_drafts')['approved_supplier_id'] == supplier['id']
+
+
+@pytest.mark.parametrize('sizes,accepted', [([5,5],True),([5,6],False),([10,1],False)])
+def test_batch_aggregate_limit_before_any_service_write(monkeypatch,sizes,accepted):
+    import procurement.app as app
+    from fastapi import HTTPException
+    monkeypatch.setattr(app,'MAX_IMPORT_BATCH_BYTES',10)
+    calls=[]
+    monkeypatch.setattr(app.service,'create_import_batch',lambda *a,**k:calls.append(a) or {'status':'test'})
+    class Upload:
+        filename='synthetic.pdf'
+        def __init__(self,size):self.size=size
+        async def read(self,maximum):return b'X'*min(maximum,self.size)
+    if accepted:
+        assert asyncio.run(app.batch_import([Upload(size) for size in sizes]))=={'status':'test'}
+        assert len(calls)==1
+    else:
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(app.batch_import([Upload(size) for size in sizes]))
+        assert exc.value.status_code==413 and not calls
+
+
+def test_pdf_page_and_text_bounds_and_real_isolated_parser():
+    from pypdf import PdfWriter
+    from procurement.imports import _extract_pdf_text,extract_document
+    from pypdf.generic import DecodedStreamObject,NameObject,DictionaryObject
+    writer=PdfWriter()
+    for _ in range(51):writer.add_blank_page(width=200,height=200)
+    buffer=io.BytesIO();writer.write(buffer)
+    assert _extract_pdf_text(buffer.getvalue())[0]==[]
+    assert _extract_pdf_text(buffer.getvalue())[1]
+    result=extract_document(buffer.getvalue(),'synthetic.pdf')
+    assert result.errors and not result.items
+    writer=PdfWriter();page=writer.add_blank_page(width=200,height=200)
+    font=DictionaryObject({NameObject('/Type'):NameObject('/Font'),NameObject('/Subtype'):NameObject('/Type1'),NameObject('/BaseFont'):NameObject('/Helvetica')})
+    page[NameObject('/Resources')]=DictionaryObject({NameObject('/Font'):DictionaryObject({NameObject('/F1'):writer._add_object(font)})})
+    stream=DecodedStreamObject();stream.set_data(b'BT /F1 12 Tf ('+b'S'*100001+b') Tj ET')
+    page[NameObject('/Contents')]=writer._add_object(stream)
+    buffer=io.BytesIO();writer.write(buffer)
+    assert _extract_pdf_text(buffer.getvalue())[1]
+    empty=PdfWriter();empty.add_blank_page(width=200,height=200)
+    buffer=io.BytesIO();empty.write(buffer)
+    result=extract_document(buffer.getvalue(),'synthetic.pdf')
+    assert not result.errors and not result.items
+
+
+def test_pdf_capacity_is_bounded_without_starting_extra_processes():
+    from procurement.imports import _PDF_SLOTS,_extract_pdf_isolated
+    assert _PDF_SLOTS.acquire(blocking=False) and _PDF_SLOTS.acquire(blocking=False)
+    try:
+        with pytest.raises(ValueError,match='capacity'):
+            _extract_pdf_isolated(b'%PDF-','synthetic.pdf')
+    finally:
+        _PDF_SLOTS.release();_PDF_SLOTS.release()
+
+
+def test_approved_draft_cannot_be_rejected_by_stale_request(workflow):
+    from procurement.models import SupplierDraftReject
+    db,service,batch=workflow
+    draft=batch['supplier_drafts'][0]['id']
+    service.confirm_supplier_draft(draft,confirmation())
+    before={table:db.all('SELECT * FROM '+table) for table in ('supplier_drafts','suppliers','price_history_entries','audit_log')}
+    with pytest.raises(ConflictError):
+        service.reject_supplier_draft(draft,SupplierDraftReject(rejected_by='ТЕСТ stale'))
+    assert all(db.all('SELECT * FROM table'.replace('table',table))==rows for table,rows in before.items())
+
+
+def test_concurrent_draft_reject_or_approve_has_one_winner(workflow):
+    from procurement.models import SupplierDraftReject
+    db,service,batch=workflow;draft=batch['supplier_drafts'][0]['id']
+    def compete(n):
+        try:
+            if n%2:return service.reject_supplier_draft(draft,SupplierDraftReject(rejected_by='ТЕСТ reviewer'))
+            return service.confirm_supplier_draft(draft,confirmation())
+        except ConflictError:return None
+    with ThreadPoolExecutor(max_workers=16) as pool:results=list(pool.map(compete,range(32)))
+    assert len([v for v in results if v is not None])==1
+    row=db.one('SELECT * FROM supplier_drafts')
+    assert (row['status']=='approved')==(row['approved_supplier_id'] is not None)
+    assert db.one('SELECT count(*) n FROM suppliers')['n']==int(row['status']=='approved')
+    assert db.one("SELECT count(*) n FROM audit_log WHERE entity_type='supplier_draft' AND action IN ('approved','rejected')")['n']==1
+
+
+@pytest.mark.parametrize('region',['Орловская область','Орёл','ОРЛОВСКАЯ ОБЛАСТЬ'])
+def test_existing_orlov_region_cluster_matches_official_name(region):
+    from procurement.regions import infer_cluster,infer_region
+    assert infer_cluster(region)==infer_cluster(infer_region('', '5700000000'))=='cluster_2'

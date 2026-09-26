@@ -1496,6 +1496,8 @@ class ProcurementService:
         created_by: str = "system",
     ) -> dict[str, Any]:
         """Create a batch import job and process all files synchronously."""
+        if not 1 <= len(files) <= 20 or sum(len(content) for _, content in files) > 50 * 1024 * 1024:
+            raise ValueError('batch requires 1-20 files within a 50 MB aggregate limit')
         if any(Path(filename).suffix.lower() == ".xls" for filename, _ in files):
             raise ValueError("legacy .xls is not supported; convert to .xlsx and review before import")
         created_by = trusted_actor(created_by)
@@ -1946,12 +1948,15 @@ class ProcurementService:
 
     def reject_supplier_draft(self, draft_id: int, data: Any) -> dict[str, Any]:
         rejected_by = trusted_actor(data.rejected_by)
-        draft = self.db.one("SELECT * FROM supplier_drafts WHERE id = ?", (draft_id,))
-        if not draft:
-            raise NotFoundError("supplier draft not found")
         with self.db.connection() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            draft = conn.execute('SELECT status FROM supplier_drafts WHERE id=?', (draft_id,)).fetchone()
+            if not draft:
+                raise NotFoundError('supplier draft not found')
+            if draft['status'] not in ('needs_review','pending'):
+                raise ConflictError('only pending supplier drafts may be rejected')
             conn.execute(
-                "UPDATE supplier_drafts SET status='rejected', confirmed_by=?, review_notes=? WHERE id=?",
+                "UPDATE supplier_drafts SET status='rejected', confirmed_by=?, review_notes=? WHERE id=? AND status IN ('needs_review','pending')",
                 (rejected_by, data.review_notes, draft_id),
             )
             self.db.audit(

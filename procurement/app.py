@@ -827,6 +827,7 @@ def list_audit(limit: int = Query(default=50, ge=1, le=200)):
 
 
 # ── PR #8: batch import & supplier-drafts endpoints ──────────────────────────
+MAX_IMPORT_BATCH_BYTES = 50 * 1024 * 1024
 
 
 @app.post("/api/imports/batch", dependencies=[Depends(require_access)], status_code=201)
@@ -840,10 +841,14 @@ async def batch_import(
     if len(files) > 20:
         raise HTTPException(status_code=422, detail="maximum 20 files per batch")
     file_pairs: list[tuple[str, bytes]] = []
+    total = 0
     for f in files:
-        content = await f.read(25 * 1024 * 1024 + 1)
+        content = await f.read(min(25 * 1024 * 1024 + 1, MAX_IMPORT_BATCH_BYTES - total + 1))
         if len(content) > 25 * 1024 * 1024:
             raise HTTPException(status_code=413, detail=f"file {f.filename!r} exceeds 25 MB")
+        total += len(content)
+        if total > MAX_IMPORT_BATCH_BYTES:
+            raise HTTPException(status_code=413, detail='batch exceeds 50 MB aggregate limit')
         file_pairs.append((f.filename or "unnamed", content))
     try:
         return service.create_import_batch(file_pairs, created_by=created_by)

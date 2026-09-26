@@ -367,13 +367,74 @@ _ORG_RE = re.compile(r'(?:ООО|ИП|АО|ЗАО|ПАО)[\s"«]+([^»"\n]{3,80}
 # ---------------------------------------------------------------------------
 # PDF extraction
 # ---------------------------------------------------------------------------
+MAX_PDF_PAGES = 50
+MAX_PDF_TEXT = 1_000_000
+from threading import BoundedSemaphore
+_PDF_SLOTS = BoundedSemaphore(2)
+
+
+def _pdf_worker(content: bytes, filename: str, pipe) -> None:
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_AS, (512 * 1024 * 1024, 512 * 1024 * 1024))
+        resource.setrlimit(resource.RLIMIT_CPU, (15, 15))
+    except ImportError:
+        pass  # Parent wall-clock deadline applies on Windows too.
+    try:
+        pipe.send(extract_from_pdf(content, filename))
+    except BaseException:
+        pipe.send(None)
+    finally:
+        pipe.close()
+
+
+def _extract_pdf_isolated(content: bytes, filename: str) -> DocumentExtractResult:
+    """Untrusted PDF parsers cannot exhaust the HTTP worker or run forever."""
+    import multiprocessing
+    context = multiprocessing.get_context('spawn')
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(target=_pdf_worker, args=(content, filename, sender))
+    if not _PDF_SLOTS.acquire(blocking=False):
+        receiver.close();sender.close()
+        raise ValueError('PDF parser capacity is busy; retry later')
+    result = None
+    try:
+        process.start();sender.close()
+        if receiver.poll(20):
+            try:
+                result = receiver.recv()
+            except EOFError:
+                pass
+    finally:
+        receiver.close()
+        if process.pid is not None:
+            process.join(timeout=1)
+            if process.is_alive():
+                process.kill();process.join(timeout=2)
+            process.close()
+        sender.close()
+        _PDF_SLOTS.release()
+    if result is None:
+        raise ValueError('PDF extraction exceeded resource limits or failed; no extracted data accepted')
+    return result
+
+
 def _extract_pdf_text(content: bytes) -> tuple[list[str], list[str]]:
     """Return (page_texts, errors)."""
     try:
         from pypdf import PdfReader
         import io as _io
         reader = PdfReader(_io.BytesIO(content))
-        pages = [page.extract_text() or '' for page in reader.pages]
+        if reader.is_encrypted or len(reader.pages) > MAX_PDF_PAGES:
+            raise ValueError('PDF exceeds 50 pages or is encrypted')
+        pages = []
+        total = 0
+        for page in reader.pages:
+            text = page.extract_text() or ''
+            total += len(text)
+            if len(text) > 100000 or total > MAX_PDF_TEXT:
+                raise ValueError('PDF expanded text exceeds limits')
+            pages.append(text)
         return pages, []
     except Exception as exc:
         return [], [f'PDF parse error: {exc}']
@@ -400,8 +461,15 @@ def _extract_items_from_pdf_tables(
         import pdfplumber
         import io as _io_plumb
         with pdfplumber.open(_io_plumb.BytesIO(content)) as pdf:
+            if len(pdf.pages) > MAX_PDF_PAGES:
+                raise ValueError('PDF exceeds 50 pages')
             for page_num, page in enumerate(pdf.pages, start=1):
+                if len(page.chars) > 100000:
+                    raise ValueError('PDF page complexity exceeds limits')
                 tables = page.extract_tables()
+                page.close()
+                if len(tables) > 100:
+                    raise ValueError('PDF page complexity exceeds limits')
                 for table in tables:
                     if not table or len(table) < 2:
                         continue
@@ -429,6 +497,8 @@ def _extract_items_from_pdf_tables(
                     ):
                         if row is None:
                             continue
+                        if row_num > 10000 or len(row) > 100 or len(items) >= 10000:
+                            raise ValueError('PDF table exceeds row/column limits')
                         raw_name = (
                             str(row[name_col] or '').strip()
                             if name_col < len(row) else ''
@@ -534,6 +604,10 @@ def _extract_items_from_pdf_text(
 def extract_from_pdf(content: bytes, filename: str) -> DocumentExtractResult:
     sha256 = hashlib.sha256(content).hexdigest()
     pages, errors = _extract_pdf_text(content)
+    if errors:
+        return DocumentExtractResult(filename=filename,sha256=sha256,document_type='unknown',
+            supplier_name='',supplier_tax_id='',supplier_region='',supplier_email='',supplier_phone='',supplier_contact='',
+            document_date=None,valid_until=None,currency='RUB',vat_included=False,items=[],errors=errors)
     full_text = '\n'.join(pages)
     header_text = '\n'.join(pages[:2]) if pages else ''
 
@@ -752,7 +826,9 @@ def extract_document(content: bytes, filename: str) -> DocumentExtractResult:
     """Extract items and supplier info from a КП/invoice/price-list file."""
     suffix = Path(filename).suffix.lower()
     if suffix == '.pdf':
-        return extract_from_pdf(content, filename)
+        if not content.startswith(b'%PDF-') or len(content) > 25 * 1024 * 1024:
+            raise ValueError('PDF is invalid or exceeds 25 MB')
+        return _extract_pdf_isolated(content, filename)
     if suffix == '.xls':
         raise ValueError('legacy .xls is not supported; convert the file to .xlsx and review it before import')
     if suffix == '.xlsx':
