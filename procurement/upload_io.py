@@ -12,6 +12,7 @@ MAX_BATCH = MAX_FILE
 MAX_BODY = MAX_BATCH + 1024 * 1024  # bounded multipart framing, not file allowance
 CHUNK = 1024 * 1024
 TOO_LARGE = 'Файл больше 100 МБ'
+PACK_TOO_LARGE = 'Пакет файлов больше 100 МБ; загружайте по одному'
 
 
 class UploadTooLarge(ValueError):
@@ -56,7 +57,7 @@ async def staged_upload(file, limit=MAX_FILE):
             while part := await file.read(CHUNK):
                 size+=len(part)
                 if size>limit:
-                    raise UploadTooLarge(TOO_LARGE if limit==MAX_FILE else 'Пакет файлов больше 100 МБ; загружайте по одному')
+                    raise UploadTooLarge(TOO_LARGE if limit==MAX_FILE else PACK_TOO_LARGE)
                 task=asyncio.create_task(asyncio.to_thread(destination.write,part))
                 try:await asyncio.shield(task)
                 except asyncio.CancelledError:
@@ -83,9 +84,10 @@ class UploadBodyLimit:
         from starlette.formparsers import MultiPartException
         from starlette.responses import JSONResponse
         length=dict(scope.get('headers',[])).get(b'content-length',b'0')
+        error=PACK_TOO_LARGE if scope['path']=='/api/imports/batch' else TOO_LARGE
         try:too_large=int(length)>MAX_BODY
         except ValueError:too_large=True
-        if too_large:return await JSONResponse({'detail':TOO_LARGE},413)(scope,receive,send)
+        if too_large:return await JSONResponse({'detail':error},413)(scope,receive,send)
         try:await asyncio.wait_for(self.slots.acquire(),timeout=0.05)
         except TimeoutError:
             return await JSONResponse({'detail':'Загрузка занята; повторите позже'},429)(scope,receive,send)
@@ -99,7 +101,7 @@ class UploadBodyLimit:
                 if total>MAX_BODY:
                     exceeded=True
                     # Starlette closes partially spooled files for this exception.
-                    raise MultiPartException(TOO_LARGE)
+                    raise MultiPartException(error)
             return message
         async def bounded_send(message):
             if exceeded and message['type']=='http.response.start' and message['status']==400:

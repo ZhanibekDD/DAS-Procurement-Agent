@@ -26,3 +26,11 @@ test('nginx HTML 413 becomes understandable message',async()=>{
   const {ctx}=context(413);
   await assert.rejects(ctx.api('/api/documents',{method:'POST',body:new FormData()}),/Файл больше 100 МБ/);
 });
+test('two individually valid 60 MiB files are refused with aggregate explanation before HTTP',async()=>{
+  const {ctx,calls}=context();
+  class Medium extends Blob {get size(){return 60*1024*1024}}
+  class Input extends FormData {values(){return [new Medium(),new Medium()].values()}}
+  await assert.rejects(ctx.api('/api/imports/batch',{method:'POST',body:new Input()}),/Пакет файлов больше 100 МБ/);
+  assert.equal(calls.length,0);
+  assert.ok(html.includes('100 МБ суммарно на пакет'));
+});

@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from procurement.upload_io import (FilePayload,MAX_FILE,MAX_BODY,CHUNK,TOO_LARGE,
-    UploadTooLarge,staged_upload,payload_sha256,UploadBodyLimit)
+    UploadTooLarge,staged_upload,payload_sha256,UploadBodyLimit,PACK_TOO_LARGE)
 from procurement.table_ingest import read_table
 from procurement.imports import parse_supplier_table
 from procurement.stream_mail import send_streamed
@@ -104,6 +104,18 @@ def test_request_envelope_101mb_and_chunked_limit(chunked):
         await UploadBodyLimit(app)(scope,receive,send)
         assert emitted[0]['status']==413
         assert TOO_LARGE.encode() in emitted[1]['body']
+    asyncio.run(run())
+
+
+def test_aggregate_request_error_explains_batch_limit():
+    async def run():
+        sent=[]
+        async def send(message):sent.append(message)
+        async def app(*args):pytest.fail('Oversized envelope must not be parsed')
+        async def receive():pytest.fail('Oversized body must not be read')
+        scope={'type':'http','method':'POST','path':'/api/imports/batch','headers':[(b'content-length',str(MAX_BODY+1).encode())]}
+        await UploadBodyLimit(app)(scope,receive,send)
+        assert sent[0]['status']==413 and PACK_TOO_LARGE.encode() in sent[1]['body']
     asyncio.run(run())
 
 
