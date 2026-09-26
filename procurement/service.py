@@ -1024,24 +1024,27 @@ class ProcurementService:
             self.get_supplier(supplier_id)
 
         digest = hashlib.sha256(content).hexdigest()
-        existing = self.db.one("SELECT * FROM source_documents WHERE sha256 = ?", (digest,))
-        if existing:
-            if existing['project_id'] != project_id or existing['supplier_id'] != supplier_id:
-                raise ConflictError('same file already belongs to a different project/supplier; no cross-project reuse')
-            return existing
         if self.db.path == ":memory:":
             raise RuntimeError("document storage is unavailable for in-memory database")
 
         storage_dir = Path(self.db.path).resolve().parent / "uploads" / document_type
         storage_dir.mkdir(parents=True, exist_ok=True)
         storage_path = storage_dir / f"{digest}{suffix}"
-        try:
-            with storage_path.open('xb') as output:
-                output.write(content)
-        except FileExistsError:
-            if hashlib.sha256(storage_path.read_bytes()).hexdigest() != digest:
-                raise ConflictError('immutable upload conflict')
         with self.db.connection() as conn:
+            # Claim the SHA before writing bytes: concurrent registrations cannot
+            # observe a half-written file or race the unique source row.
+            conn.execute('BEGIN IMMEDIATE')
+            existing = conn.execute('SELECT * FROM source_documents WHERE sha256=?', (digest,)).fetchone()
+            if existing:
+                if existing['project_id'] != project_id or existing['supplier_id'] != supplier_id:
+                    raise ConflictError('same file already belongs to a different project/supplier; no cross-project reuse')
+                return dict(existing)
+            try:
+                with storage_path.open('xb') as output:
+                    output.write(content)
+            except FileExistsError:
+                if hashlib.sha256(storage_path.read_bytes()).hexdigest() != digest:
+                    raise ConflictError('immutable upload conflict')
             cursor = conn.execute(
                 """
                 INSERT INTO source_documents(
@@ -1496,224 +1499,129 @@ class ProcurementService:
         *,
         created_by: str = "system",
     ) -> dict[str, Any]:
-        """Create a batch import job and process all files synchronously."""
+        """Bound extraction before writes; claim each source atomically."""
         if not 1 <= len(files) <= 20 or sum(len(content) for _, content in files) > 50 * 1024 * 1024:
             raise ValueError('batch requires 1-20 files within a 50 MB aggregate limit')
         if any(Path(filename).suffix.lower() == ".xls" for filename, _ in files):
             raise ValueError("legacy .xls is not supported; convert to .xlsx and review before import")
         created_by = trusted_actor(created_by)
-        from .imports import (
-            extract_document,
-            detect_cluster,
-            supplier_dedup_key,
-            price_validity_state,
-        )
-        from datetime import date
+        from .imports import extract_document, detect_cluster, supplier_dedup_key, price_validity_state
 
-        filenames = [fn for fn, _ in files]
-        sha256_map: dict[str, str] = {}
+        # Parse outside SQLite locks and cap the entire batch, not only each file.
+        # A limit violation has no database/file side effects.
+        prepared = []
+        total_items = 0
         errors: list[str] = []
-        all_items: list[dict[str, Any]] = []
-        new_drafts = False
-
-        with self.db.connection() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO import_batches(
-                    status, filenames_json, total_files, processed_files,
-                    sha256_json, created_by, created_at
-                ) VALUES (?, ?, ?, 0, ?, ?, ?)
-                """,
-                (
-                    "processing",
-                    json.dumps(filenames, ensure_ascii=False),
-                    len(files),
-                    json.dumps({}, ensure_ascii=False),
-                    created_by,
-                    utcnow(),
-                ),
-            )
-            batch_id = cursor.lastrowid
-            self.db.audit(
-                "created",
-                "import_batch",
-                batch_id,
-                actor=created_by,
-                details={"total_files": len(files)},
-                conn=conn,
-            )
-
-        processed = 0
+        sha256_map: dict[str, str] = {}
         for filename, content in files:
             try:
                 result = extract_document(content, filename)
-                sha256_map[filename] = result.sha256
+            except Exception as exc:
+                errors.append(f"{filename}: extraction failed — {type(exc).__name__}")
+                continue
+            total_items += len(result.items)
+            if total_items > 10_000:
+                raise ValueError('batch exceeds the 10000 extracted item aggregate limit')
+            sha256_map[filename] = result.sha256
+            errors.extend(f"{filename}: {error}"[:2000] for error in result.errors[:100])
+            # A wholly failed extraction has no reviewable supplier/price rows.
+            if result.errors and not result.items:
+                continue
+            prepared.append((filename, content, result))
 
-                # Preserve actual source bytes; an extracted invoice is NOT a
-                # verified paid invoice. Existing records are never relabelled.
-                existing_doc = self.db.one(
-                    "SELECT id FROM source_documents WHERE sha256 = ?",
-                    (result.sha256,),
-                )
+        with self.db.connection() as conn:
+            cursor = conn.execute("""
+                INSERT INTO import_batches(status, filenames_json, total_files,
+                    processed_files, sha256_json, created_by, created_at)
+                VALUES ('processing', ?, ?, 0, ?, ?, ?)
+            """, (json.dumps([fn for fn, _ in files], ensure_ascii=False), len(files),
+                  json.dumps(sha256_map, ensure_ascii=False), created_by, utcnow()))
+            batch_id = cursor.lastrowid
+            self.db.audit('created', 'import_batch', batch_id, actor=created_by,
+                          details={'total_files': len(files)}, conn=conn)
+
+        inserted_count = 0
+        new_drafts = False
+        for filename, content, result in prepared:
+            try:
+                existing_doc = self.db.one('SELECT id FROM source_documents WHERE sha256=?', (result.sha256,))
                 if existing_doc:
-                    doc_id: int = existing_doc["id"]
+                    doc_id = existing_doc['id']
                 else:
                     source = self.register_source_document(
                         filename=filename, content=content, document_type=result.document_type,
-                        content_type="application/pdf" if Path(filename).suffix.lower() == ".pdf" else
-                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                    doc_id = int(source["id"])
-                    with self.db.connection() as conn:
-                        conn.execute("UPDATE source_documents SET extraction_status='extracted_needs_review' WHERE id=?",
-                                     (doc_id,))
+                        content_type='application/pdf' if Path(filename).suffix.lower()=='.pdf'
+                        else 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+                    doc_id = int(source['id'])
 
-                # Create supplier draft (dedup by dedup_key)
-                draft_id: int | None = None
-                approved_supplier_id: int | None = None
-                if result.supplier_name or result.supplier_tax_id:
-                    dedup_key = supplier_dedup_key(
-                        result.supplier_tax_id,
-                        result.supplier_name,
-                        result.supplier_email,
-                        result.supplier_phone,
-                    )
-                    supplier_region = result.supplier_region or infer_region(
-                        result.supplier_name, result.supplier_tax_id
-                    )
-                    cluster, cluster_status = detect_cluster(supplier_region)
-                    raw_data = {
-                        "name": result.supplier_name,
-                        "tax_id": result.supplier_tax_id,
-                        "region": result.supplier_region,
-                        "email": result.supplier_email,
-                        "phone": result.supplier_phone,
-                        "contact_person": result.supplier_contact,
-                        "document_date": result.document_date,
-                    }
-                    existing_draft = self.db.one(
-                        "SELECT id,status,approved_supplier_id FROM supplier_drafts WHERE dedup_key = ?",
-                        (dedup_key,),
-                    )
-                    if existing_draft:
-                        draft_id = existing_draft["id"]
-                        if existing_draft['status'] == 'approved':
-                            approved_supplier_id = existing_draft['approved_supplier_id']
-                            if approved_supplier_id is None:
-                                raise ValueError('approved supplier draft has no authoritative supplier link')
-                    else:
-                        with self.db.connection() as conn:
-                            c = conn.execute(
-                                """
-                                INSERT INTO supplier_drafts(
-                                    import_batch_id, source_document_id,
-                                    name, tax_id, region, cluster,
-                                    email, phone, contact_person,
-                                    raw_json, dedup_key,
-                                    status, cluster_status, created_at
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                """,
-                                (
-                                    batch_id,
-                                    doc_id,
-                                    result.supplier_name,
-                                    result.supplier_tax_id,
-                                    supplier_region,
-                                    cluster,
-                                    result.supplier_email,
-                                    result.supplier_phone,
-                                    result.supplier_contact,
-                                    json.dumps(raw_data, ensure_ascii=False),
-                                    dedup_key,
-                                    "needs_review",
-                                    cluster_status,
-                                    utcnow(),
-                                ),
-                            )
-                            draft_id = c.lastrowid
-                            new_drafts = True
-
-                # Store price history entries — skip if already imported (SHA256 dedup)
-                existing_entry_count = self.db.one(
-                    "SELECT COUNT(*) AS n FROM price_history_entries"
-                    " WHERE source_document_id = ?",
-                    (doc_id,),
-                )
-                entries_already_exist = (
-                    existing_entry_count and existing_entry_count["n"] > 0
-                )
-                if entries_already_exist:
-                    # Existing rows belong to their original batch; a no-op is done,
-                    # not an empty, unconfirmable needs_review batch.
-                    pass
-                else:
-                    v_state = price_validity_state(result.valid_until)
-                    for item in result.items:
-                        with self.db.connection() as conn:
-                            conn.execute(
-                                """
-                            INSERT INTO price_history_entries(
-                                import_batch_id, source_document_id, supplier_draft_id, supplier_id,
-                                item_name, brand, normalized_name,
-                                quantity, unit, unit_price, total_price,
-                                currency, vat_included,
-                                document_date, valid_until, validity_state,
-                                source_page, source_sheet, source_row, source_cell, source_text,
-                                status, created_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                """,
-                                (
-                                    batch_id,
-                                    doc_id,
-                                    draft_id,
-                                    approved_supplier_id,
-                                    item.item_name,
-                                    item.brand,
-                                    item.normalized_name,
-                                    item.quantity,
-                                    item.unit,
-                                    item.unit_price,
-                                    item.total_price,
-                                    item.currency,
-                                    int(item.vat_included),
-                                    result.document_date,
-                                    result.valid_until,
-                                    v_state,
-                                    item.source_page,
-                                    item.source_sheet,
-                                    item.source_row,
-                                    item.source_cell,
-                                    item.source_text,
-                                    "draft",
-                                    utcnow(),
-                                ),
-                            )
-                        all_items.append({"item_name": item.item_name, "unit_price": item.unit_price})
-
-                if result.errors:
-                    errors.extend(f"{filename}: {e}" for e in result.errors)
-
+                # One bounded transaction per source (<=10000 rows across the
+                # entire batch). The read/claim/draft/price inserts are atomic.
+                with self.db.connection() as conn:
+                    conn.execute('BEGIN IMMEDIATE')
+                    if conn.execute('SELECT 1 FROM price_history_entries WHERE source_document_id=? LIMIT 1',
+                                    (doc_id,)).fetchone():
+                        continue
+                    draft_id = None
+                    approved_supplier_id = None
+                    created_draft = False
+                    if result.supplier_name or result.supplier_tax_id:
+                        dedup_key = supplier_dedup_key(result.supplier_tax_id, result.supplier_name,
+                                                      result.supplier_email, result.supplier_phone)
+                        existing_draft = conn.execute(
+                            'SELECT id,status,approved_supplier_id FROM supplier_drafts WHERE dedup_key=?',
+                            (dedup_key,)).fetchone()
+                        if existing_draft:
+                            draft_id = existing_draft['id']
+                            if existing_draft['status']=='approved':
+                                approved_supplier_id = existing_draft['approved_supplier_id']
+                                if approved_supplier_id is None:
+                                    raise ValueError('approved supplier draft has no authoritative supplier link')
+                        else:
+                            region = result.supplier_region or infer_region(result.supplier_name, result.supplier_tax_id)
+                            cluster, cluster_status = detect_cluster(region)
+                            raw = {'name':result.supplier_name, 'tax_id':result.supplier_tax_id,
+                                   'region':result.supplier_region, 'email':result.supplier_email,
+                                   'phone':result.supplier_phone, 'contact_person':result.supplier_contact,
+                                   'document_date':result.document_date}
+                            cursor = conn.execute("""
+                                INSERT INTO supplier_drafts(import_batch_id,source_document_id,
+                                    name,tax_id,region,cluster,email,phone,contact_person,
+                                    raw_json,dedup_key,status,cluster_status,created_at)
+                                VALUES (?,?,?,?,?,?,?,?,?,?,?,'needs_review',?,?)
+                            """, (batch_id,doc_id,result.supplier_name,result.supplier_tax_id,region,cluster,
+                                  result.supplier_email,result.supplier_phone,result.supplier_contact,
+                                  json.dumps(raw,ensure_ascii=False),dedup_key,cluster_status,utcnow()))
+                            draft_id = cursor.lastrowid
+                            created_draft = True
+                    now = utcnow()
+                    validity = price_validity_state(result.valid_until)
+                    rows = [(
+                        batch_id,doc_id,draft_id,approved_supplier_id,item.item_name,item.brand,
+                        item.normalized_name,item.quantity,item.unit,item.unit_price,item.total_price,
+                        item.currency,int(item.vat_included),result.document_date,result.valid_until,validity,
+                        item.source_page,item.source_sheet,item.source_row,item.source_cell,item.source_text,'draft',now
+                    ) for item in result.items]
+                    conn.executemany("""
+                        INSERT INTO price_history_entries(import_batch_id,source_document_id,supplier_draft_id,supplier_id,
+                            item_name,brand,normalized_name,quantity,unit,unit_price,total_price,currency,vat_included,
+                            document_date,valid_until,validity_state,source_page,source_sheet,source_row,source_cell,
+                            source_text,status,created_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """, rows)
+                    conn.execute("UPDATE source_documents SET extraction_status='extracted_needs_review' WHERE id=?",
+                                 (doc_id,))
+                # Count only committed rows/claims, not rolled-back attempts.
+                inserted_count += len(rows)
+                new_drafts = new_drafts or created_draft
             except Exception as exc:
-                errors.append(f"{filename}: extraction failed — {exc}")
+                errors.append(f"{filename}: import failed — {type(exc).__name__}")
 
-            processed += 1
-
-        # Update batch status
-        final_status = "needs_review" if (all_items or new_drafts or errors) else "done"
+        final_status = 'needs_review' if inserted_count or new_drafts else 'failed' if errors else 'done'
         with self.db.connection() as conn:
-            conn.execute(
-                """
-                UPDATE import_batches
-                SET status = ?, processed_files = ?, sha256_json = ?
-                WHERE id = ?
-                """,
-                (
-                    final_status,
-                    processed,
-                    json.dumps(sha256_map, ensure_ascii=False),
-                    batch_id,
-                ),
-            )
-
+            conn.execute("""
+                UPDATE import_batches SET status=?,processed_files=?,sha256_json=?,errors_json=? WHERE id=?
+            """, (final_status,len(files),json.dumps(sha256_map,ensure_ascii=False),
+                  json.dumps(errors,ensure_ascii=False),batch_id))
         return self.get_import_batch(batch_id)
 
     def get_import_batch(self, batch_id: int) -> dict[str, Any]:
@@ -1722,6 +1630,7 @@ class ProcurementService:
             raise NotFoundError("import batch not found")
         row["filenames"] = json.loads(row.pop("filenames_json"))
         row["sha256"] = json.loads(row.pop("sha256_json"))
+        row["errors"] = json.loads(row.pop("errors_json"))
         row["supplier_drafts"] = self.db.all(
             "SELECT * FROM supplier_drafts WHERE import_batch_id = ? ORDER BY id",
             (batch_id,),
@@ -1746,6 +1655,7 @@ class ProcurementService:
         for row in rows:
             row["filenames"] = json.loads(row.pop("filenames_json"))
             row["sha256"] = json.loads(row.pop("sha256_json"))
+            row["errors"] = json.loads(row.pop("errors_json"))
         return rows
 
     def confirm_batch_entries(

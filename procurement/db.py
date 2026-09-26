@@ -409,6 +409,9 @@ class Database:
             "supplier_drafts": (
                 ("approved_supplier_id", "INTEGER REFERENCES suppliers(id) ON DELETE SET NULL"),
             ),
+            "import_batches": (
+                ("errors_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ),
         }
         for table, columns in additions.items():
             existing = {

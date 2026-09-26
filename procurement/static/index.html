@@ -414,6 +414,8 @@ async function openBatch(id){
     const sso=!!document.querySelector('meta[name="procurement-csrf"]');
     $('#modalBody').innerHTML=`
       <p>${esc(b.filenames.join(', '))}</p>
+      <p>Статус: <b>${esc(b.status)}</b></p>
+      ${(b.errors||[]).length?`<div class="guard">Ошибки извлечения: ${(b.errors||[]).map(esc).join('<br>')}. Ошибочные файлы не считаются импортированными.</div>`:''}
       <p>Позиций на проверке: <b>${draftEntries.length}</b> из <b>${entries.length}</b></p>
       <div class="guard">Сверьте каждую позицию с документом и отметьте только проверенные строки. Подтверждение цены не подтверждает оплату.</div>
       ${sso?'<p>Проверяющий определяется вашей сессией DAS.</p>':'<label class="field-label">ФИО проверяющего<input type="text" id="batchConfirmBy"></label>'}
