@@ -595,7 +595,15 @@ def extract_from_xlsx(content: bytes, filename: str) -> DocumentExtractResult:
     errors: list[str] = []
 
     try:
-        wb = load_workbook(_io.BytesIO(content), read_only=True, data_only=True)
+        from .table_ingest import MAX_ROWS, MAX_COLS, validate_xlsx_expansion
+        # Legacy batch uploads normalize the storage basename; inspect the same
+        # safe basename here, while preserving provenance in the result.
+        validate_xlsx_expansion(content, Path(filename.replace('\\', '/')).name)
+        wb = load_workbook(_io.BytesIO(content), read_only=True, data_only=True, keep_links=False)
+        for ws in wb:
+            if (ws.max_row or 0) > MAX_ROWS + 100 or (ws.max_column or 0) > MAX_COLS:
+                wb.close()
+                raise ValueError('XLSX row/column dimensions exceed limits')
     except Exception as exc:
         return DocumentExtractResult(
             filename=filename, sha256=sha256, document_type='unknown',
@@ -605,22 +613,26 @@ def extract_from_xlsx(content: bytes, filename: str) -> DocumentExtractResult:
             items=[], errors=[f'XLSX open error: {exc}'],
         )
 
-    all_items: list[ExtractedItem] = []
-    header_text_parts: list[str] = []
-    sheets: list[tuple[str, list[tuple], int, list[str], str]] = []
     try:
-        sheet_rows = [(name, list(wb[name].iter_rows(values_only=True)))
-                      for name in wb.sheetnames]
+        return _extract_bounded_xlsx(wb, filename, sha256)
     finally:
         wb.close()
 
+
+def _extract_bounded_xlsx(wb, filename: str, sha256: str) -> DocumentExtractResult:
+    from .table_ingest import MAX_COLS
+    errors: list[str] = []
+    all_items: list[ExtractedItem] = []
+    header_text_parts: list[str] = []
+    sheets: list[tuple[str, int, list[str], str]] = []
+
     # A document title mentioning "price" is not itself a table header.
-    for sheet_name, rows in sheet_rows:
-        if not rows:
-            continue
+    for sheet_name in wb.sheetnames:
         header_idx: int | None = None
         headers: list[str] = []
-        for i, row in enumerate(rows):
+        header_parts: list[str] = []
+        for i, row in enumerate(wb[sheet_name].iter_rows(max_row=100, max_col=MAX_COLS, values_only=True)):
+            header_parts.extend(str(c) for c in row if c is not None)
             row_strs = [str(c).strip() if c is not None else '' for c in row]
             if (_col_index(row_strs, _NAME_COL_NAMES) is not None
                     and _col_index(row_strs, _PRICE_COL_NAMES) is not None):
@@ -630,13 +642,12 @@ def extract_from_xlsx(content: bytes, filename: str) -> DocumentExtractResult:
         if header_idx is None:
             errors.append(f'Sheet {sheet_name!r}: required columns not found')
             continue
-        header_text = ' '.join(str(c) for row in rows[:header_idx + 1]
-                               for c in row if c is not None)
+        header_text = ' '.join(header_parts)
         header_text_parts.append(header_text)
-        sheets.append((sheet_name, rows, header_idx, headers, header_text))
+        sheets.append((sheet_name, header_idx, headers, header_text))
 
     workbook_currencies = _explicit_currencies(' '.join(header_text_parts))
-    for sheet_name, rows, header_idx, headers, sheet_header in sheets:
+    for sheet_name, header_idx, headers, sheet_header in sheets:
         sheet_currencies = _explicit_currencies(sheet_header)
         currencies = sheet_currencies or workbook_currencies or {'RUB'}
         if len(currencies) != 1:
@@ -662,7 +673,8 @@ def extract_from_xlsx(content: bytes, filename: str) -> DocumentExtractResult:
 
         max_col = max(c for c in [name_col, price_col, qty_col, unit_col] if c is not None)
 
-        for row_idx, row in enumerate(rows[header_idx + 1:], start=header_idx + 2):
+        for row_idx, row in enumerate(wb[sheet_name].iter_rows(
+                min_row=header_idx + 2, max_col=MAX_COLS, values_only=True), start=header_idx + 2):
             cells = [str(c).strip() if c is not None else '' for c in row]
             if len(cells) <= max_col:
                 continue

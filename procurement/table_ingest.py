@@ -14,6 +14,45 @@ MAX_ROWS = 10000
 MAX_COLS = 100
 
 
+def validate_xlsx_expansion(content: bytes, filename: str) -> None:
+    """Check actual worksheet XML, not attacker-controlled dimension hints."""
+    from xml.etree import ElementTree as ET
+    safe_upload(content, filename, {'.xlsx'})
+    with zipfile.ZipFile(io.BytesIO(content)) as archive:
+        if sum(i.file_size for i in archive.infolist()) > 20 * 1024 * 1024:
+            raise ValueError('XLSX expanded data exceeds 20 MB')
+        sheets = [i for i in archive.namelist() if re.fullmatch(r'xl/worksheets/[^/]+\.xml', i)]
+        if len(sheets) > 20:
+            raise ValueError('XLSX exceeds 20 sheets')
+        rows = cells = strings = 0
+        parts = sheets + (['xl/sharedStrings.xml'] if 'xl/sharedStrings.xml' in archive.namelist() else [])
+        for part in parts:
+            with archive.open(part) as stream:
+                for _, node in ET.iterparse(stream, events=('end',)):
+                    tag = node.tag.rsplit('}', 1)[-1]
+                    if tag == 'c':
+                        cells += 1
+                        match = re.fullmatch(r'([A-Z]+)(\d+)', node.attrib.get('r', ''))
+                        if not match:
+                            raise ValueError('XLSX invalid cell coordinates')
+                        column = 0
+                        for char in match[1]:
+                            column = column * 26 + ord(char) - 64
+                        if column > MAX_COLS or int(match[2]) > MAX_ROWS + 100 or cells > 200000:
+                            raise ValueError('XLSX row/column/cell limit exceeded')
+                    elif tag == 'row':
+                        rows += 1
+                        if rows > MAX_ROWS + 100 or int(node.attrib.get('r', '0')) > MAX_ROWS + 100:
+                            raise ValueError('XLSX row limit exceeded')
+                    elif tag == 't' and len(node.text or '') > 8000:
+                        raise ValueError('XLSX cell exceeds 8000 characters')
+                    elif tag == 'si':
+                        strings += 1
+                        if strings > 200000:
+                            raise ValueError('XLSX shared-string limit exceeded')
+                    node.clear()
+
+
 def safe_upload(content: bytes, filename: str, allowed: set[str]) -> str:
     if not content or len(content) > MAX_FILE:
         raise ValueError('Файл пуст или превышает 25 МБ')
@@ -59,6 +98,7 @@ def read_table(content: bytes, filename: str, sheet: str = '', header_row: int =
         sheets = ['CSV']
         selected = 'CSV'
     else:
+        validate_xlsx_expansion(content, filename)
         book = load_workbook(io.BytesIO(content), read_only=True, data_only=False, keep_links=False)
         try:
             sheets = book.sheetnames

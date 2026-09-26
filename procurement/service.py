@@ -1511,6 +1511,7 @@ class ProcurementService:
         sha256_map: dict[str, str] = {}
         errors: list[str] = []
         all_items: list[dict[str, Any]] = []
+        new_drafts = False
 
         with self.db.connection() as conn:
             cursor = conn.execute(
@@ -1565,6 +1566,7 @@ class ProcurementService:
 
                 # Create supplier draft (dedup by dedup_key)
                 draft_id: int | None = None
+                approved_supplier_id: int | None = None
                 if result.supplier_name or result.supplier_tax_id:
                     dedup_key = supplier_dedup_key(
                         result.supplier_tax_id,
@@ -1586,11 +1588,15 @@ class ProcurementService:
                         "document_date": result.document_date,
                     }
                     existing_draft = self.db.one(
-                        "SELECT id FROM supplier_drafts WHERE dedup_key = ?",
+                        "SELECT id,status,approved_supplier_id FROM supplier_drafts WHERE dedup_key = ?",
                         (dedup_key,),
                     )
                     if existing_draft:
                         draft_id = existing_draft["id"]
+                        if existing_draft['status'] == 'approved':
+                            approved_supplier_id = existing_draft['approved_supplier_id']
+                            if approved_supplier_id is None:
+                                raise ValueError('approved supplier draft has no authoritative supplier link')
                     else:
                         with self.db.connection() as conn:
                             c = conn.execute(
@@ -1621,6 +1627,7 @@ class ProcurementService:
                                 ),
                             )
                             draft_id = c.lastrowid
+                            new_drafts = True
 
                 # Store price history entries — skip if already imported (SHA256 dedup)
                 existing_entry_count = self.db.one(
@@ -1632,13 +1639,9 @@ class ProcurementService:
                     existing_entry_count and existing_entry_count["n"] > 0
                 )
                 if entries_already_exist:
-                    # Re-import: reuse existing entries, no duplicates
-                    existing_for_doc = self.db.all(
-                        "SELECT item_name, unit_price FROM price_history_entries"
-                        " WHERE source_document_id = ?",
-                        (doc_id,),
-                    )
-                    all_items.extend(existing_for_doc)
+                    # Existing rows belong to their original batch; a no-op is done,
+                    # not an empty, unconfirmable needs_review batch.
+                    pass
                 else:
                     v_state = price_validity_state(result.valid_until)
                     for item in result.items:
@@ -1646,19 +1649,20 @@ class ProcurementService:
                             conn.execute(
                                 """
                             INSERT INTO price_history_entries(
-                                import_batch_id, source_document_id, supplier_draft_id,
+                                import_batch_id, source_document_id, supplier_draft_id, supplier_id,
                                 item_name, brand, normalized_name,
                                 quantity, unit, unit_price, total_price,
                                 currency, vat_included,
                                 document_date, valid_until, validity_state,
                                 source_page, source_sheet, source_row, source_cell, source_text,
                                 status, created_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                 """,
                                 (
                                     batch_id,
                                     doc_id,
                                     draft_id,
+                                    approved_supplier_id,
                                     item.item_name,
                                     item.brand,
                                     item.normalized_name,
@@ -1691,7 +1695,7 @@ class ProcurementService:
             processed += 1
 
         # Update batch status
-        final_status = "needs_review" if (all_items or errors) else "done"
+        final_status = "needs_review" if (all_items or new_drafts or errors) else "done"
         with self.db.connection() as conn:
             conn.execute(
                 """
@@ -1855,40 +1859,35 @@ class ProcurementService:
     ) -> dict[str, Any]:
         confirmed_by = trusted_actor(data.confirmed_by)
         from .models import SupplierCreate
-        draft = self.db.one("SELECT * FROM supplier_drafts WHERE id = ?", (draft_id,))
-        if not draft:
-            raise NotFoundError("supplier draft not found")
-        if draft["status"] not in ("needs_review", "pending"):
-            raise ValueError(f"draft status is {draft['status']!r}, expected needs_review")
-
-        name = data.name or draft["name"]
-        email = data.email or draft["email"]
-        phone = data.phone or draft["phone"]
-        contact = data.contact_person or draft["contact_person"]
-        region = data.region or draft["region"]
-        if not region:
-            raise ValueError("supplier region is required before confirmation")
-        cluster = resolve_cluster(region, data.cluster or draft["cluster"])
-        if not cluster:
-            raise ValueError("supplier cluster is required before confirmation")
-
-        matched = self._match_existing_supplier(
-            {
-                "name": name,
-                "tax_id": draft["tax_id"],
-                "email": email,
-            },
-            self.db.all(
-                "SELECT id, name, tax_id, region, cluster, email "
-                "FROM suppliers WHERE active = 1"
-            ),
-        )
-        if matched and matched["cluster"] and matched["cluster"] != cluster:
-            raise ConflictError("existing supplier belongs to another cluster")
-
-        if matched:
-            supplier_id = int(matched["id"])
-            with self.db.connection() as conn:
+        # Lock before the status check and keep the entire approval atomic.
+        # No nested service connections may commit a supplier before its claim.
+        with self.db.connection() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            draft_row = conn.execute("SELECT * FROM supplier_drafts WHERE id=?", (draft_id,)).fetchone()
+            if not draft_row:
+                raise NotFoundError("supplier draft not found")
+            draft = dict(draft_row)
+            if draft['status'] not in ('needs_review', 'pending'):
+                raise ConflictError(f"draft status is {draft['status']!r}, expected needs_review")
+            name = data.name or draft['name']
+            email = data.email or draft['email']
+            phone = data.phone or draft['phone']
+            region = data.region or draft['region']
+            if not region:
+                raise ValueError('supplier region is required before confirmation')
+            cluster = resolve_cluster(region, data.cluster or draft['cluster'])
+            if not cluster:
+                raise ValueError('supplier cluster is required before confirmation')
+            supplier_data = SupplierCreate(name=name, tax_id=draft['tax_id'], region=region,
+                                           email=email, phone=phone, cluster=cluster, categories=[])
+            matched = self._match_existing_supplier(
+                {'name': name, 'tax_id': draft['tax_id'], 'email': email},
+                [dict(row) for row in conn.execute(
+                    'SELECT id,name,tax_id,region,cluster,email FROM suppliers WHERE active=1').fetchall()])
+            if matched and matched['cluster'] and matched['cluster'] != cluster:
+                raise ConflictError('existing supplier belongs to another cluster')
+            if matched:
+                supplier_id = int(matched['id'])
                 conn.execute(
                     """
                     UPDATE suppliers
@@ -1898,27 +1897,20 @@ class ProcurementService:
                     """,
                     (region, cluster, supplier_id),
                 )
-            supplier = self.get_supplier(supplier_id)
-        else:
-            supplier_data = SupplierCreate(
-                name=name,
-                tax_id=draft["tax_id"],
-                region=region,
-                email=email,
-                phone=phone,
-                cluster=cluster,
-                categories=[],
-            )
-            supplier = self.create_supplier(supplier_data, source="import_batch")
-
-        now = utcnow()
-        with self.db.connection() as conn:
+            else:
+                supplier_id = conn.execute('''INSERT INTO suppliers(
+                    name,tax_id,region,email,phone,cluster,categories_json,rating,verified,source,created_at)
+                    VALUES (?,?,?,?,?,?,?,3,0,'import_batch',?)''',
+                    (supplier_data.name,supplier_data.tax_id,region,email,phone,cluster,'[]',utcnow())).lastrowid
+                self.db.audit('created','supplier',supplier_id,actor=confirmed_by,
+                              details={'source':'import_batch'},conn=conn)
+            now = utcnow()
             conn.execute(
                 """
                 UPDATE supplier_drafts
                 SET status='approved', confirmed_by=?, confirmed_at=?,
                     review_notes=?, name=?, region=?, cluster=?,
-                    cluster_status='confirmed'
+                    cluster_status='confirmed', approved_supplier_id=?
                 WHERE id=?
                 """,
                 (
@@ -1928,14 +1920,15 @@ class ProcurementService:
                     name,
                     region,
                     cluster,
+                    supplier_id,
                     draft_id,
                 ),
             )
             # Supplier identity review is NOT financial or paid-invoice review.
             # Only attach the supplier; a separate explicit entry review is required.
             conn.execute(
-                "UPDATE price_history_entries SET supplier_id=? WHERE supplier_draft_id=? AND status='draft'",
-                (supplier["id"], draft_id),
+                "UPDATE price_history_entries SET supplier_id=? WHERE supplier_draft_id=? AND supplier_id IS NULL",
+                (supplier_id, draft_id),
             )
             self.db.audit(
                 "approved",
@@ -1943,13 +1936,13 @@ class ProcurementService:
                 draft_id,
                 actor=confirmed_by,
                 details={
-                    "supplier_id": supplier["id"],
+                    "supplier_id": supplier_id,
                     "reused_existing_supplier": bool(matched),
                     "cluster": cluster,
                 },
                 conn=conn,
             )
-        return supplier
+        return self.get_supplier(supplier_id)
 
     def reject_supplier_draft(self, draft_id: int, data: Any) -> dict[str, Any]:
         rejected_by = trusted_actor(data.rejected_by)

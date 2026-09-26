@@ -406,6 +406,9 @@ class Database:
                 ("source_page", "INTEGER"),
                 ("source_reference", "TEXT NOT NULL DEFAULT ''"),
             ),
+            "supplier_drafts": (
+                ("approved_supplier_id", "INTEGER REFERENCES suppliers(id) ON DELETE SET NULL"),
+            ),
         }
         for table, columns in additions.items():
             existing = {
@@ -414,6 +417,22 @@ class Database:
             for name, definition in columns:
                 if name not in existing:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+        # Recover only authoritative historical links, never fuzzy-match an approval.
+        conn.execute("""UPDATE supplier_drafts SET approved_supplier_id=(
+            SELECT min(supplier_id) FROM price_history_entries WHERE supplier_draft_id=supplier_drafts.id)
+            WHERE status='approved' AND approved_supplier_id IS NULL AND (
+            SELECT count(DISTINCT supplier_id) FROM price_history_entries
+            WHERE supplier_draft_id=supplier_drafts.id)=1""")
+        for draft in conn.execute("SELECT id FROM supplier_drafts WHERE status='approved' AND approved_supplier_id IS NULL").fetchall():
+            row = conn.execute("""SELECT details_json FROM audit_log WHERE action='approved'
+                AND entity_type='supplier_draft' AND entity_id=? ORDER BY id DESC LIMIT 1""", (str(draft['id']),)).fetchone()
+            if row:
+                try:
+                    supplier_id = json.loads(row['details_json']).get('supplier_id')
+                except (ValueError, TypeError):
+                    continue
+                if type(supplier_id) is int and conn.execute('SELECT 1 FROM suppliers WHERE id=?', (supplier_id,)).fetchone():
+                    conn.execute('UPDATE supplier_drafts SET approved_supplier_id=? WHERE id=?', (supplier_id, draft['id']))
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
