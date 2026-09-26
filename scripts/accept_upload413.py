@@ -20,9 +20,8 @@ def accept(url,credentials,capture,pdf_path):
     with httpx.Client(base_url=url,timeout=120) as client:
         check('personal login',client.post('/auth/login',data=credentials).status_code==303)
         html=client.get('/').text
-        csrf=re.search(r'<meta name="procurement-csrf" content="([a-f0-9]+)">',html)[1]
         launch_csrf=re.search(r'<meta name="procurement-launch-csrf" content="([a-f0-9]+)">',html)[1]
-        client.headers.update({'X-CSRF-Token':csrf,'X-Launch-CSRF-Token':launch_csrf})
+        client.headers.update({'X-Launch-CSRF-Token':launch_csrf})
         def post(path,expected=201,**kw):
             r=client.post(path,**kw)
             check('POST '+path,r.status_code==expected)
@@ -41,7 +40,7 @@ def accept(url,credentials,capture,pdf_path):
         extracted=post(f"/api/documents/{doc['id']}/extract/fence-schedule?page=13")['suggestion']
         check('six positions preview',len(extracted['items'])==6 and [x['quantity'] for x in extracted['items']]==['9','12','6','28','1','1'])
         check('no lot before confirmation',not any(x['project_id']==pr['id'] for x in client.get('/api/lots').json()))
-        result=post(f"/api/procurement-suggestions/{extracted['id']}/approve",json={'approved_by':'Canary test',
+        result=post(f"/api/procurement-suggestions/{extracted['id']}/approve",200,json={'approved_by':'Canary test',
             'response_deadline':'2026-10-31','rfq_requirements':{'delivery_address_confirmation':'Тестовый адрес',
                 'coating':'цинк','color_ral':'RAL 6005','mesh_cell':'50x200','rod_diameter':'5 мм','delivery_or_pickup':'supplier_choice'}})
         lot=result['lot']
