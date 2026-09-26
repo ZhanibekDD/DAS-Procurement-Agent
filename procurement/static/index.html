@@ -215,14 +215,14 @@ function approveMessage(id){
   if(!message||message.status!=='draft')return toast('Черновик не найден; обновите очередь',true);
   const sso=!!document.querySelector('meta[name="procurement-csrf"]');
   $('#modalTitle').textContent='Проверка запроса перед согласованием';
-  $('#modalBody').innerHTML=messagePreview(message)+`<div class="guard">Только согласование. Внешняя отправка отключена.</div>${sso?'<p>Согласующий определяется вашей сессией DAS.</p>':'<label>ФИО согласующего<input id="messageApprover" autocomplete="name"></label>'}<label><input type="checkbox" id="messageReviewed"> Я проверил адресата, канал и весь текст</label>`;
+  $('#modalBody').innerHTML=messagePreview(message)+`<div class="guard">Только согласование. Отправка выполняется отдельным действием после проверки адресата и вложений.</div>${sso?'<p>Согласующий определяется вашей сессией DAS.</p>':'<label>ФИО согласующего<input id="messageApprover" autocomplete="name"></label>'}<label><input type="checkbox" id="messageReviewed"> Я проверил адресата, канал, весь текст и вложения</label>`;
   const button=$('#modalSubmit');button.textContent='Согласовать без отправки';button.disabled=true;
   $('#messageReviewed').onchange=e=>button.disabled=!e.target.checked;
   button.onclick=async()=>{
     if(!$('#messageReviewed').checked)return;
     const actor=sso?'session':$('#messageApprover').value.trim();
     if(!actor)return toast('Укажите согласующего',true);
-    await modalAction(()=>api(`/api/outbox/${id}/approve`,{method:'POST',body:JSON.stringify({approved_by:actor,comment:'Полный текст проверен; внешняя отправка отключена'})}),'Согласовано. Сообщение не отправлялось');
+    await modalAction(()=>api(`/api/outbox/${id}/approve`,{method:'POST',body:JSON.stringify({approved_by:actor,comment:'Полный текст и вложения проверены; только согласование'})}),'Согласовано. Сообщение не отправлялось');
   };
   $('#modal').showModal();
 }
@@ -480,5 +480,6 @@ async function loadArchive(){
 }
 
 </script>
+<script src="/assets/launch.js"></script>
 </body>
 </html>

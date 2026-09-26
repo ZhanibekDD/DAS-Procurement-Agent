@@ -54,6 +54,7 @@ class LotItemCreate(StrictModel):
     source_document_id: int | None = Field(default=None, gt=0)
     source_page: int | None = Field(default=None, ge=1, le=10000)
     source_reference: str = Field(default="", max_length=500)
+    delivery_date: date | None = None
 
 
 class RfqRequirements(StrictModel):
@@ -77,6 +78,7 @@ class LotCreate(StrictModel):
     currency: str = Field(default="RUB", pattern=r"^[A-Z]{3}$")
     rfq_requirements: RfqRequirements | None = None
     items: list[LotItemCreate] = Field(min_length=1, max_length=500)
+    attachment_document_ids: list[int] = Field(default_factory=list, max_length=30)
 
 
 class ProcurementSuggestionCreate(StrictModel):

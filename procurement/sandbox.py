@@ -13,7 +13,10 @@ def payload_sha256(payload: dict) -> str:
 def message_fingerprint(message: dict) -> str:
     fields = ("id", "campaign_id", "supplier_id", "channel", "recipient", "subject", "body",
               "lot_id", "lot_cluster", "project_cluster", "supplier_cluster")
-    return payload_sha256({key: message[key] for key in fields})
+    payload = {key: message[key] for key in fields}
+    if message.get('attachments'):
+        payload['attachments'] = message['attachments']
+    return payload_sha256(payload)
 
 
 class SandboxAdapter:

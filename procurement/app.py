@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import hmac
+import hashlib
+import json
+import os
 import asyncio
 import html
 import re
@@ -24,7 +27,8 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, FileResponse
+from pydantic import Field
 
 from .auth import TokenError, issue_token, verify_token
 from .config import Settings
@@ -47,7 +51,10 @@ from .models import (
     BatchImportConfirm,
     SupplierDraftConfirm,
     SupplierDraftReject,
+    StrictModel,
 )
+from .launch_workflow import LaunchWorkflow
+from .table_ingest import MAX_FILE, read_table
 from .passwords import verify_password
 from .service import ConflictError, NotFoundError, ProcurementService
 from .identity import authenticated_actor, trusted_actor
@@ -57,6 +64,7 @@ from . import sso
 settings = Settings.from_env()
 db = Database(settings.db_path)
 service = ProcurementService(db)
+launch = LaunchWorkflow(service)
 
 
 @asynccontextmanager
@@ -106,6 +114,8 @@ _READ_ONLY_GET = (
     r"/api/lots(?:/\d+(?:/(?:supplier-matches|quotes|comparison|price-benchmark))?)?",
     r"/api/campaigns", r"/api/outbox", r"/api/price-history", r"/api/templates", r"/api/audit",
     r"/api/imports(?:/\d+)?", r"/api/supplier-drafts", r"/api/price-history-entries", r"/assets/[^/]+",
+    r"/api/launch/config", r"/api/launch/suppliers(?:/\d+)?", r"/api/launch/imports",
+    r"/api/launch/documents/\d+/download",
 )
 
 
@@ -114,7 +124,15 @@ async def das_identity_boundary(request: Request, call_next):
     if not settings.sso_enabled:
         if request.url.path in {"/auth/sso", "/auth/sso/callback", "/auth/logged-out", "/api/auth/session"}:
             return JSONResponse({"detail": "not found"}, status_code=404)
-        return await call_next(request)
+        claims = _session_claims(request.cookies.get(SESSION_COOKIE, ''))
+        actor = claims['sub'] if claims else None
+        if not actor and settings.api_key and hmac.compare_digest(request.headers.get('x-api-key',''),settings.api_key):
+            actor = 'service-api'
+        context = authenticated_actor.set(actor)
+        try:
+            return await call_next(request)
+        finally:
+            authenticated_actor.reset(context)
     path = request.url.path
     if path in {"/login", "/auth/login"}:
         return JSONResponse({"detail": "local login is disabled; use DAS SSO"}, status_code=404)
@@ -465,6 +483,9 @@ def index(
         return RedirectResponse(url="/login", status_code=303)
     path = Path(__file__).parent / "static" / "index.html"
     content = path.read_text(encoding="utf-8")
+    if not settings.sso_enabled and session_token:
+        csrf = hmac.new(settings.auth_secret.encode(), ('launch:' + session_token).encode(), hashlib.sha256).hexdigest()
+        content = content.replace('<head>', '<head><meta name="procurement-launch-csrf" content="' + csrf + '">')
     if settings.sso_enabled:
         principal = request.state.das_principal
         content = content.replace('Независимая учётная запись «Снабжения». API-ключ в браузер не передаётся.',
@@ -900,3 +921,6 @@ def list_price_history_entries(
     except Exception as exc:
         raise handle_domain_error(exc) from exc
 
+
+from .launch_routes import install as install_launch_routes
+install_launch_routes(app, settings, service, launch, require_access, _session_claims, handle_domain_error)

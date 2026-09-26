@@ -25,4 +25,4 @@ testpaths = ["tests"]
 pythonpath = ["."]
 
 [tool.setuptools.package-data]
-procurement = ["static/*.html"]
+procurement = ["static/*.html", "static/*.js", "static/assets/*"]

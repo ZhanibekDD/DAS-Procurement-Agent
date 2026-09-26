@@ -373,6 +373,8 @@ class Database:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self.connection() as conn:
             conn.executescript(SCHEMA)
+            from .launch_workflow import SCHEMA as LAUNCH_SCHEMA
+            conn.executescript(LAUNCH_SCHEMA)
             self._migrate_columns(conn)
             for code, template in DEFAULT_TEMPLATES.items():
                 conn.execute(
@@ -399,6 +401,7 @@ class Database:
                 ("rfq_requirements_json", "TEXT NOT NULL DEFAULT '{}'"),
             ),
             "lot_items": (
+                ("delivery_date", "TEXT"),
                 ("source_document_id", "INTEGER REFERENCES source_documents(id) ON DELETE SET NULL"),
                 ("source_page", "INTEGER"),
                 ("source_reference", "TEXT NOT NULL DEFAULT ''"),

@@ -167,6 +167,8 @@ class ProcurementService:
             if not section:
                 raise NotFoundError("project section not found")
         with self.db.connection() as conn:
+            from .launch_workflow import LaunchWorkflow
+            LaunchWorkflow(self)._documents(conn, data.project_id, data.attachment_document_ids)
             cursor = conn.execute(
                 """
                 INSERT INTO lots(
@@ -200,8 +202,8 @@ class ProcurementService:
                     """
                     INSERT INTO lot_items(
                         lot_id, name, quantity, unit, specification,
-                        source_document_id, source_page, source_reference
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        source_document_id, source_page, source_reference, delivery_date
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         lot_id,
@@ -212,8 +214,11 @@ class ProcurementService:
                         item.source_document_id,
                         item.source_page,
                         item.source_reference,
+                        str(item.delivery_date) if item.delivery_date else None,
                     ),
                 )
+            conn.executemany('INSERT INTO lot_attachments VALUES (?,?)',
+                             [(lot_id, d) for d in sorted(set(data.attachment_document_ids))])
             self.db.audit(
                 "created", "lot", lot_id, details={"project_name": project["name"]}, conn=conn
             )
@@ -225,6 +230,8 @@ class ProcurementService:
             raise NotFoundError("lot not found")
         row["rfq_requirements"] = json.loads(row.pop("rfq_requirements_json", "{}") or "{}")
         row["items"] = self.db.all("SELECT * FROM lot_items WHERE lot_id = ? ORDER BY id", (lot_id,))
+        row['attachments'] = self.db.all('''SELECT d.id AS document_id,d.filename,d.sha256,d.size_bytes
+            FROM lot_attachments a JOIN source_documents d ON d.id=a.document_id WHERE a.lot_id=?''', (lot_id,))
         return row
 
     def list_lots(self) -> list[dict[str, Any]]:
@@ -319,6 +326,7 @@ class ProcurementService:
         items_text = "\n".join(
             f"- {item['name']}: {item['quantity']} {item['unit']}"
             + (f"; {item['specification']}" if item["specification"] else "")
+            + (f"; срок {item['delivery_date']}" if item.get('delivery_date') else "")
             for item in lot["items"]
         )
         requirements = lot.get("rfq_requirements") or {}
@@ -371,6 +379,7 @@ class ProcurementService:
             )
         fingerprint = payload_sha256({"lot_id": lot_id, "project_id": project["id"], "cluster": cluster,
             "template_code": data.template_code, "template_version": template["version"], "channel": data.channel,
+            "attachments": lot.get('attachments', []),
             "messages": sorted([(supplier["id"], recipient, subject, body)
                                 for supplier, recipient, subject, body in prepared])})
         request_key = f"lot:{lot_id}:client:{data.idempotency_key}" if data.idempotency_key else "auto:" + fingerprint
@@ -381,6 +390,10 @@ class ProcurementService:
                 FROM lots l JOIN projects p ON p.id=l.project_id WHERE l.id=?""", (lot_id,)).fetchone()
             if not current or self._confirmed_cluster(current["lot_cluster"], current["project_cluster"]) != cluster:
                 raise ConflictError("campaign cluster context changed; retry after review")
+            current_attachments = [dict(r) for r in conn.execute('''SELECT d.id AS document_id,d.filename,d.sha256,d.size_bytes
+                FROM lot_attachments a JOIN source_documents d ON d.id=a.document_id WHERE a.lot_id=? ORDER BY d.id''',(lot_id,))]
+            if sorted(lot.get('attachments',[]),key=lambda a:a['document_id']) != current_attachments:
+                raise ConflictError('Вложения изменились; обновите черновик')
             for supplier in suppliers:
                 current_supplier = conn.execute("SELECT cluster,active FROM suppliers WHERE id=?", (supplier["id"],)).fetchone()
                 if not current_supplier:
@@ -423,14 +436,16 @@ class ProcurementService:
             conn.execute("INSERT INTO campaign_requests(request_key,payload_sha256,campaign_id,created_at) VALUES (?,?,?,?)",
                          (request_key, fingerprint, campaign_id, utcnow()))
             for supplier, recipient, subject, body in prepared:
-                conn.execute(
+                message_id = conn.execute(
                     """
                     INSERT INTO outbox_messages(
                         campaign_id, supplier_id, channel, recipient, subject, body, created_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (campaign_id, supplier["id"], data.channel, recipient, subject, body, utcnow()),
-                )
+                ).lastrowid
+                conn.executemany('INSERT INTO outbox_attachments VALUES (?,?,?,?,?)',
+                    [(message_id,a['document_id'],a['filename'],a['sha256'],a['size_bytes']) for a in lot.get('attachments',[])])
             conn.execute("UPDATE lots SET status = 'rfq_draft' WHERE id = ?", (lot_id,))
             self.db.audit(
                 "drafted",
@@ -453,6 +468,8 @@ class ProcurementService:
             """,
             (campaign_id,),
         )
+        for message in row['messages']:
+            message['attachments'] = self.db.all('SELECT document_id,filename,sha256,size_bytes FROM outbox_attachments WHERE message_id=? ORDER BY document_id',(message['id'],))
         return row
 
     def list_campaigns(self, lot_id: int | None = None) -> list[dict[str, Any]]:
@@ -508,6 +525,8 @@ class ProcurementService:
         for row in rows:
             receipt = row.pop("sandbox_receipt_json")
             row["sandbox_receipt"] = json.loads(receipt) if receipt else None
+            row['attachments'] = self.db.all('SELECT document_id,filename,sha256,size_bytes FROM outbox_attachments WHERE message_id=? ORDER BY document_id',(row['id'],))
+            row['delivery'] = self.db.one('SELECT status,updated_at FROM mail_deliveries WHERE message_id=?',(row['id'],))
         return rows
 
     def _outbox_context(self, conn, message_id: int) -> dict:
@@ -521,6 +540,7 @@ class ProcurementService:
         if not row:
             raise NotFoundError("outbox message not found")
         message = dict(row)
+        message['attachments'] = [dict(r) for r in conn.execute('SELECT document_id,filename,sha256,size_bytes FROM outbox_attachments WHERE message_id=? ORDER BY document_id',(message_id,))]
         cluster = self._confirmed_cluster(message["lot_cluster"], message["project_cluster"])
         self._supplier_cluster({"cluster": message["supplier_cluster"], "active": message["supplier_active"]}, cluster)
         return message
@@ -546,7 +566,7 @@ class ProcurementService:
             conn.execute("INSERT INTO outbox_approvals(message_id,payload_sha256,approved_by,approved_at) VALUES (?,?,?,?)",
                          (message_id, fingerprint, approved_by, now))
             self.db.audit("approved", "outbox_message", message_id, actor=approved_by,
-                          details={"comment": comment, "dispatch": "external_disabled", "payload_sha256": fingerprint}, conn=conn)
+                          details={"comment": comment, "dispatch": "approval_only", "payload_sha256": fingerprint}, conn=conn)
         return self.db.one("SELECT * FROM outbox_messages WHERE id = ?", (message_id,)) or {}
 
     def simulate_outbox(self, message_id: int) -> dict:
@@ -987,12 +1007,16 @@ class ProcurementService:
         if not content or len(content) > 25 * 1024 * 1024:
             raise ValueError("document must be between 1 byte and 25 MB")
         suffix = Path(filename).suffix.lower()
+        from .table_ingest import safe_upload
         if suffix not in {".pdf", ".xlsx", ".csv", ".docx"}:
             raise ValueError("only PDF, DOCX, XLSX and CSV documents are supported")
         if suffix == ".pdf" and not content.startswith(b"%PDF-"):
             raise ValueError("invalid PDF payload")
         if suffix in {".xlsx", ".docx"} and not content.startswith(b"PK"):
             raise ValueError("invalid Office document payload")
+        # Legacy batch callers supply source-relative names, never destinations.
+        filename = filename.replace('\\', '/').rsplit('/', 1)[-1]
+        safe_upload(content, filename, {'.pdf','.xlsx','.csv','.docx'})
         if project_id is not None:
             self.get_project(project_id)
         if supplier_id is not None:
@@ -1001,6 +1025,8 @@ class ProcurementService:
         digest = hashlib.sha256(content).hexdigest()
         existing = self.db.one("SELECT * FROM source_documents WHERE sha256 = ?", (digest,))
         if existing:
+            if existing['project_id'] != project_id or existing['supplier_id'] != supplier_id:
+                raise ConflictError('same file already belongs to a different project/supplier; no cross-project reuse')
             return existing
         if self.db.path == ":memory:":
             raise RuntimeError("document storage is unavailable for in-memory database")
@@ -1008,7 +1034,12 @@ class ProcurementService:
         storage_dir = Path(self.db.path).resolve().parent / "uploads" / document_type
         storage_dir.mkdir(parents=True, exist_ok=True)
         storage_path = storage_dir / f"{digest}{suffix}"
-        storage_path.write_bytes(content)
+        try:
+            with storage_path.open('xb') as output:
+                output.write(content)
+        except FileExistsError:
+            if hashlib.sha256(storage_path.read_bytes()).hexdigest() != digest:
+                raise ConflictError('immutable upload conflict')
         with self.db.connection() as conn:
             cursor = conn.execute(
                 """
