@@ -32,7 +32,8 @@ from .models import (
     TemplateUpsert,
 )
 from .ranking import rank_quotes
-from .regions import infer_cluster, infer_region, normalize_region, resolve_cluster
+from .regions import infer_region, normalize_region
+from .region_routing import infer_cluster, resolve_cluster
 from .templates import render_template
 from .identity import trusted_actor
 from .sandbox import payload_sha256, message_fingerprint, sandbox_adapter

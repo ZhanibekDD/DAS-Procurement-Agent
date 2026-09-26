@@ -13,7 +13,7 @@ from .db import utcnow
 from .identity import trusted_actor
 from .imports import HEADER_ALIASES, supplier_dedup_key
 from .models import SupplierCreate, LotCreate
-from .regions import resolve_cluster
+from .region_routing import resolve_cluster
 from .sandbox import payload_sha256, message_fingerprint
 from .service import ConflictError, NotFoundError
 from .table_ingest import contacts, mapped, suggested_mapping, quantity, delivery_date

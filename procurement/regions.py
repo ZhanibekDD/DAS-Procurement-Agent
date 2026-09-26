@@ -95,10 +95,6 @@ def normalize_region(value: str) -> str:
 
 def infer_cluster(region: str) -> str:
     normalized = normalize_region(region)
-    # Official adjective aliases must not alter the immutable v1 migration's
-    # marker manifest/hash. This is input normalization for new operations only.
-    if normalized == 'орловская область':
-        normalized = 'орел'
     matches = [
         cluster
         for cluster, markers in REGIONAL_CLUSTERS.items()

@@ -137,7 +137,7 @@ def detect_cluster(region: str) -> tuple[str, str]:
     Only 'cluster_1' / 'cluster_2' are valid output values.
     Unknown regions return ('', 'needs_review') — no guessing.
     """
-    from .regions import infer_cluster as _infer_cluster
+    from .region_routing import infer_cluster as _infer_cluster
     cluster = _infer_cluster(region)
     return cluster, ('confirmed' if cluster else 'needs_review')
 

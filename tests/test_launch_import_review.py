@@ -223,5 +223,8 @@ def test_concurrent_draft_reject_or_approve_has_one_winner(workflow):
 
 @pytest.mark.parametrize('region',['Орловская область','Орёл','ОРЛОВСКАЯ ОБЛАСТЬ'])
 def test_existing_orlov_region_cluster_matches_official_name(region):
-    from procurement.regions import infer_cluster,infer_region
+    from procurement.regions import infer_region
+    from procurement.region_routing import infer_cluster,resolve_cluster
     assert infer_cluster(region)==infer_cluster(infer_region('', '5700000000'))=='cluster_2'
+    assert resolve_cluster(region)=='cluster_2'
+    with pytest.raises(ValueError):resolve_cluster(region,'cluster_1')
