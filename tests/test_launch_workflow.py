@@ -122,6 +122,56 @@ def test_import_rollback_blocks_financial_history_reference_atomically(workflow,
     assert db.one('SELECT status FROM launch_previews WHERE id=?',(p['preview_id'],))['status']=='applied'
 
 
+@pytest.mark.parametrize('use',['campaign','quote','price','document'])
+def test_updated_supplier_import_cannot_rollback_after_use(workflow,use):
+    from procurement.models import QuoteCreate,QuoteItemCreate
+    db,service,w=workflow
+    supplier=service.create_supplier(SupplierCreate(name='ТЕСТ прежний',region='Москва',cluster='cluster_1',
+        tax_id='7707083893',email='fixture@example.test'))
+    table=read_table('Фирма;ИНН;Регион;Кластер\nТЕСТ обновлён;7707083893;Воронежская область;cluster_2\n'.encode(),'updated.csv')
+    p=w.supplier_preview(table,{'name':0,'tax_id':1,'region':2,'cluster':3});w.apply_import(p['preview_id'],True)
+    assert w.supplier(supplier['id'])['cluster']=='cluster_2'
+    pr=project(service);lot=service.create_lot(LotCreate(**lot_payload(pr['id'])))
+    if use=='campaign':service.create_campaign(lot['id'],CampaignCreate(supplier_ids=[supplier['id']]))
+    elif use=='quote':service.add_quote(lot['id'],QuoteCreate(supplier_id=supplier['id'],currency='RUB',vat_included=True,
+        items=[QuoteItemCreate(lot_item_id=lot['items'][0]['id'],unit_price=100)]))
+    elif use=='price':
+        with db.connection() as conn:conn.execute(
+            "INSERT INTO price_history_entries(supplier_id,item_name,normalized_name,unit_price,created_at) VALUES (?,?,?,?,?)",
+            (supplier['id'],'ТЕСТ','тест','100','2026-09-27'))
+    else:service.register_source_document(filename='items.xlsx',content=(FIXTURES/'items.xlsx').read_bytes(),
+        document_type='invoice',supplier_id=supplier['id'])
+    before={t:db.all('SELECT * FROM '+t) for t in ('suppliers','launch_previews','audit_log')}
+    with pytest.raises(ConflictError,match='уже используется'):w.rollback_import(p['preview_id'],True)
+    assert all(db.all('SELECT * FROM '+t)==rows for t,rows in before.items())
+    if use=='campaign':
+        with db.connection() as conn:assert service._outbox_context(conn,service.list_outbox()[0]['id'])
+    if use=='quote':assert service.comparison(lot['id'])['quotes']
+
+
+@pytest.mark.parametrize('change',['edit','import'])
+def test_used_supplier_cluster_cannot_be_changed(workflow,change):
+    db,service,w=workflow
+    supplier=service.create_supplier(SupplierCreate(name='ТЕСТ прежний',region='Москва',cluster='cluster_1',
+        tax_id='7707083893',email='fixture@example.test'))
+    pr=service.create_project(ProjectCreate(name='ТЕСТ Москва',region='Москва',cluster='cluster_1',delivery_address='ТЕСТ'))
+    payload={**lot_payload(pr['id']),'region':'Москва','cluster':'cluster_1'}
+    lot=service.create_lot(LotCreate(**payload))
+    service.create_campaign(lot['id'],CampaignCreate(supplier_ids=[supplier['id']]))
+    current=w.supplier(supplier['id'])
+    if change=='import':
+        table=read_table('Фирма;ИНН;Регион;Кластер\nТЕСТ обновлён;7707083893;Воронежская область;cluster_2\n'.encode(),'updated.csv')
+        p=w.supplier_preview(table,{'name':0,'tax_id':1,'region':2,'cluster':3})
+    before=db.all('SELECT * FROM suppliers');audits=db.all('SELECT * FROM audit_log')
+    with pytest.raises(ConflictError,match='смена кластера'):
+        if change=='import':w.apply_import(p['preview_id'],True)
+        else:
+            values={k:current[k] for k in SupplierCreate.model_fields}
+            w.edit_supplier(supplier['id'],{**values,'region':'Воронежская область','cluster':'cluster_2'},current['revision'])
+    assert db.all('SELECT * FROM suppliers')==before and db.all('SELECT * FROM audit_log')==audits
+    with db.connection() as conn:assert service._outbox_context(conn,service.list_outbox()[0]['id'])
+
+
 def test_sheet_review_corrections_source_attachments_campaign_snapshot(workflow):
     db,service,w=workflow
     pr=project(service); content=(FIXTURES/'items.xlsx').read_bytes()

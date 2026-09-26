@@ -78,6 +78,8 @@ class LaunchWorkflow:
                 raise NotFoundError('Поставщик не найден')
             if not before['active'] or payload_sha256(dict(before)) != revision:
                 raise ConflictError('Карточка изменилась или удалена; обновите страницу')
+            if before['cluster'] != values['cluster'] and self._supplier_used(conn,supplier_id):
+                raise ConflictError('Поставщик уже используется; смена кластера запрещена')
             self._update(conn, supplier_id, values)
             after = dict(conn.execute('SELECT * FROM suppliers WHERE id=?', (supplier_id,)).fetchone())
             self.db.audit('supplier_edited', 'supplier', supplier_id,
@@ -88,6 +90,11 @@ class LaunchWorkflow:
     def _update(conn, supplier_id, values):
         conn.execute('UPDATE suppliers SET ' + ','.join(k + '=?' for k in values) + ' WHERE id=?',
                      (*values.values(), supplier_id))
+
+    @staticmethod
+    def _supplier_used(conn,supplier_id):
+        return any(conn.execute('SELECT 1 FROM ' + table + ' WHERE supplier_id=? LIMIT 1',(supplier_id,)).fetchone()
+                   for table in ('outbox_messages','quotes','purchase_history','price_history_entries','source_documents'))
 
     def supplier_state(self, supplier_id, active, revision, confirmed):
         if confirmed is not True:
@@ -187,6 +194,8 @@ class LaunchWorkflow:
                     if not current or dict(current) != before:
                         raise ConflictError('Поставщик изменился после предпросмотра')
                     sid = before['id']
+                    if before['cluster'] != values['cluster'] and self._supplier_used(conn,sid):
+                        raise ConflictError('Поставщик уже используется; смена кластера импортом запрещена')
                     self._update(conn, sid, values)
                 else:
                     # Recheck identity under the write lock; no race-created duplicates.
@@ -219,14 +228,13 @@ class LaunchWorkflow:
                 current = conn.execute('SELECT * FROM suppliers WHERE id=?', (change['supplier_id'],)).fetchone()
                 if not current or encode(dict(current)) != change['after_json']:
                     raise ConflictError('После импорта карточка изменена; автоматический откат запрещён')
+                if self._supplier_used(conn,change['supplier_id']):
+                    raise ConflictError('Импортированный поставщик уже используется; откат запрещён')
                 if change['before_json']:
                     before = json.loads(change['before_json'])
                     before.pop('id')
                     self._update(conn, change['supplier_id'], before)
                 else:
-                    if any(conn.execute('SELECT 1 FROM ' + t + ' WHERE supplier_id=? LIMIT 1', (change['supplier_id'],)).fetchone()
-                           for t in ('outbox_messages','quotes','purchase_history','price_history_entries','source_documents')):
-                        raise ConflictError('Импортированный поставщик уже используется; откат запрещён')
                     conn.execute('UPDATE suppliers SET active=0 WHERE id=?', (change['supplier_id'],))
             conn.execute("UPDATE launch_previews SET status='rolled_back' WHERE id=?", (pid,))
             self.db.audit('supplier_import_rolled_back','supplier_import',pid,details={'changed':len(changes)},conn=conn)

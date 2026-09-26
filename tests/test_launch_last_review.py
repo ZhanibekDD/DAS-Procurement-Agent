@@ -308,3 +308,32 @@ def test_failed_corrected_import_preserves_rejection_and_key_atomically(service)
     assert service.db.all('SELECT * FROM supplier_drafts')==[rejected]
     assert service.db.all('SELECT * FROM price_history_entries')==before
     assert not service.db.all("SELECT * FROM audit_log WHERE action='superseded'")
+
+
+@pytest.mark.parametrize('ordering',['project_first','project_wins_registration'])
+def test_atomic_price_source_reuse_preserves_project_ownership(service,monkeypatch,ordering):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    project=service.create_project(ProjectCreate(name='ТЕСТ проект',region='Воронеж',delivery_address='ТЕСТ'))
+    register=service.register_source_document
+    entered,released=Event(),Event()
+    def registration(**kwargs):
+        if kwargs.get('_price_import') and ordering=='project_wins_registration':
+            entered.set();assert released.wait(10)
+        return register(**kwargs)
+    monkeypatch.setattr(service,'register_source_document',registration)
+    def project_document():return register(filename='project.xlsx',content=SYNTHETIC_PRICELIST,
+        document_type='project_section',project_id=project['id'])
+    if ordering=='project_first':
+        document=project_document()
+        batch=service.create_import_batch([('prices.xlsx',SYNTHETIC_PRICELIST)])
+    else:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future=pool.submit(service.create_import_batch,[('prices.xlsx',SYNTHETIC_PRICELIST)])
+            assert entered.wait(10);document=project_document();released.set();batch=future.result(timeout=20)
+    assert not batch['errors'] and batch['status']=='needs_review' and len(batch['price_history_entries'])==1
+    assert batch['price_history_entries'][0]['source_document_id']==document['id']
+    assert service.db.one('SELECT * FROM source_documents')==document
+    # Ordinary document uploads still cannot reassign another project's source.
+    with pytest.raises(ConflictError,match='different project'):
+        register(filename='copy.xlsx',content=SYNTHETIC_PRICELIST,document_type='project_section')

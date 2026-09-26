@@ -1039,7 +1039,10 @@ class ProcurementService:
             conn.execute('BEGIN IMMEDIATE')
             existing = conn.execute('SELECT * FROM source_documents WHERE sha256=?', (digest,)).fetchone()
             if existing:
-                if existing['project_id'] != project_id or existing['supplier_id'] != supplier_id:
+                # Price import reviews caller-provided bytes without reassigning
+                # the source's project/supplier ownership.
+                reuse_for_review = _price_import and project_id is None and supplier_id is None
+                if not reuse_for_review and (existing['project_id'] != project_id or existing['supplier_id'] != supplier_id):
                     raise ConflictError('same file already belongs to a different project/supplier; no cross-project reuse')
                 return dict(existing)
             try:
@@ -1550,16 +1553,12 @@ class ProcurementService:
         new_drafts = False
         for filename, content, result in prepared:
             try:
-                existing_doc = self.db.one('SELECT id FROM source_documents WHERE sha256=?', (result.sha256,))
-                if existing_doc:
-                    doc_id = existing_doc['id']
-                else:
-                    source = self.register_source_document(
-                        filename=filename, content=content, document_type=result.document_type,
-                        content_type='application/pdf' if Path(filename).suffix.lower()=='.pdf'
-                        else 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                        _price_import=True)
-                    doc_id = int(source['id'])
+                source = self.register_source_document(
+                    filename=filename, content=content, document_type=result.document_type,
+                    content_type='application/pdf' if Path(filename).suffix.lower()=='.pdf'
+                    else 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    _price_import=True)
+                doc_id = int(source['id'])
 
                 # One bounded transaction per source (<=10000 rows across the
                 # entire batch). The read/claim/draft/price inserts are atomic.
