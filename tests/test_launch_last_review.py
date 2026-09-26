@@ -89,6 +89,37 @@ def test_pdf_text_zero_price_does_not_become_confirmable():
     assert _extract_items_from_pdf_text(['ТЕСТ кабель 1 10.25'],'RUB',False)[0].unit_price=='10.25'
 
 
+@pytest.mark.parametrize('basis,currency,vat',[
+    ('RUB без НДС','RUB',False),('USD с НДС','USD',True),
+    ('EUR включая НДС','EUR',True),('KZT НДС включён','KZT',True),
+    ('руб. без НДС','RUB',False),('₽ с НДС','RUB',True),
+    ('без НДС',None,None),('RUB',None,None),('',None,None),
+    ('RUB USD без НДС',None,None),('EUR KZT с НДС',None,None),
+    ('RUB без НДС и с НДС',None,None),
+    ('USD без НДС; НДС включен',None,None),
+])
+def test_pdf_requires_unique_explicit_currency_and_vat(service,monkeypatch,basis,currency,vat):
+    from procurement.imports import extract_from_pdf
+    text='ООО «ТЕСТ поставщик»\n'+basis+'\nТЕСТ кабель 1 10.25'
+    monkeypatch.setattr('procurement.imports._extract_pdf_text',lambda *args:([text],[]))
+    table_calls=[]
+    def tables(*args):table_calls.append(True);return [],False
+    monkeypatch.setattr('procurement.imports._extract_items_from_pdf_tables',tables)
+    result=extract_from_pdf(b'%PDF-synthetic','synthetic.pdf')
+    if currency is not None:
+        assert not result.errors and table_calls
+        assert len(result.items)==1 and result.currency==currency
+        assert result.items[0].currency==currency and result.items[0].vat_included is vat
+    else:
+        assert result.errors and not result.items and not table_calls
+        monkeypatch.setattr('procurement.imports.extract_document',lambda *args:result)
+        batch=service.create_import_batch([('synthetic.pdf',b'%PDF-synthetic')])
+        assert batch['status']=='failed' and batch['errors']
+        assert not batch['supplier_drafts'] and not batch['price_history_entries']
+        assert not service.list_source_documents()
+        assert service.get_import_batch(batch['id'])['errors']==batch['errors']
+
+
 @pytest.mark.parametrize('source',['same','other','missing','corrupt'])
 def test_lot_item_source_must_belong_to_project_and_match_bytes(service,source):
     project=service.create_project(ProjectCreate(name='ТЕСТ A',region='Воронеж',delivery_address='ТЕСТ'))

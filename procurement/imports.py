@@ -605,13 +605,25 @@ def extract_from_pdf(content: bytes, filename: str) -> DocumentExtractResult:
     if errors:
         return DocumentExtractResult(filename=filename,sha256=sha256,document_type='unknown',
             supplier_name='',supplier_tax_id='',supplier_region='',supplier_email='',supplier_phone='',supplier_contact='',
-            document_date=None,valid_until=None,currency='RUB',vat_included=False,items=[],errors=errors)
+            document_date=None,valid_until=None,currency='',vat_included=False,items=[],errors=errors)
     full_text = '\n'.join(pages)
     header_text = '\n'.join(pages[:2]) if pages else ''
 
     doc_type = _classify_document(full_text)
-    currency = detect_currency(full_text)
-    vat_included = 'без ндс' not in full_text.casefold()
+    currencies = _explicit_currencies(full_text)
+    currency = next(iter(currencies)) if len(currencies) == 1 else ''
+    if not currency:
+        errors.append('PDF missing or ambiguous currency requires review')
+    try:
+        explicit_vat = _vat_context(full_text)
+        if explicit_vat is None:
+            errors.append('PDF missing VAT basis requires review')
+    except ValueError as exc:
+        explicit_vat = None
+        errors.append(f'PDF: {exc}')
+    # No financial row can carry an inferred basis. False is only an unused
+    # placeholder in the rejected result; errors prevent any row extraction.
+    vat_included = explicit_vat is True
     doc_date = extract_date(full_text)
 
     valid_re = re.compile(
@@ -630,7 +642,7 @@ def extract_from_pdf(content: bytes, filename: str) -> DocumentExtractResult:
     supplier_name = org_m.group(0).strip()[:120] if org_m else ''
 
     # Primary: structured table extraction (pdfplumber) — handles invoices, КП, price-lists
-    items, _has_tables = _extract_items_from_pdf_tables(content, currency, vat_included)
+    items, _has_tables = ([], True) if errors else _extract_items_from_pdf_tables(content, currency, vat_included)
     # Fallback: line-by-line regex — ONLY for PDFs with no tables at all.
     # If pdfplumber found tables but no price column → structural doc (engineering specs,
     # drawings) → return 0 items; do NOT mine masses/quantities as fake prices.

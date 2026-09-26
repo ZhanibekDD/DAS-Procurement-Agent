@@ -186,7 +186,7 @@ def test_pdf_page_and_text_bounds_and_real_isolated_parser():
     empty=PdfWriter();empty.add_blank_page(width=200,height=200)
     buffer=io.BytesIO();empty.write(buffer)
     result=extract_document(buffer.getvalue(),'synthetic.pdf')
-    assert not result.errors and not result.items
+    assert result.errors and not result.items  # No explicit financial basis.
 
 
 def test_pdf_capacity_is_bounded_without_starting_extra_processes():
