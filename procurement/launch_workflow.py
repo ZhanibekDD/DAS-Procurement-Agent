@@ -225,7 +225,7 @@ class LaunchWorkflow:
                     self._update(conn, change['supplier_id'], before)
                 else:
                     if any(conn.execute('SELECT 1 FROM ' + t + ' WHERE supplier_id=? LIMIT 1', (change['supplier_id'],)).fetchone()
-                           for t in ('outbox_messages','quotes','purchase_history','source_documents')):
+                           for t in ('outbox_messages','quotes','purchase_history','price_history_entries','source_documents')):
                         raise ConflictError('Импортированный поставщик уже используется; откат запрещён')
                     conn.execute('UPDATE suppliers SET active=0 WHERE id=?', (change['supplier_id'],))
             conn.execute("UPDATE launch_previews SET status='rolled_back' WHERE id=?", (pid,))

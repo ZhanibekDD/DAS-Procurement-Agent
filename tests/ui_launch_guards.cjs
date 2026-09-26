@@ -17,3 +17,13 @@ test('changing a source or mapping invalidates confirmation and cached preview',
   assert.equal(state.preview,null);assert.equal(nodes['#modalSubmit'].onclick,handler);
   assert.ok(source.includes("addEventListener('change',invalidateLaunchPreview)"));
 });
+test('attachment selection excludes hidden background forms',()=>{
+  const modal={querySelectorAll:()=>[{value:'11'},{value:'12'}]};
+  const tender={querySelectorAll:()=>[{value:'77'}]};
+  const ctx=vm.createContext({$:()=>modal,document:{querySelectorAll(){throw Error('global selection is unsafe')}}});
+  const start=source.indexOf('function chosenAttachments('),end=source.indexOf('const baseSuppliers');
+  vm.runInContext(source.slice(start,end),ctx);
+  assert.deepEqual(Array.from(ctx.chosenAttachments()),[11,12]);
+  assert.deepEqual(Array.from(ctx.chosenAttachments(tender)),[77]);
+  assert.ok(source.includes("chosenAttachments($('#tenderAttachmentChoices'))"));
+});

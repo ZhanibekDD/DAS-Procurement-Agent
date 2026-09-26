@@ -19,7 +19,7 @@ function attachmentChoices(projectId,selected=[]){
   const docs=state.documents.filter(d=>Number(d.project_id)===Number(projectId));
   return docs.length?docs.map(d=>`<label style="display:block"><input type="checkbox" name="launchAttachment" value="${d.id}" ${selected.includes(d.id)?'checked':''}> ${esc(d.filename)} (${(d.size_bytes/1024).toFixed(1)} КБ)</label>`).join(''):'<p>У проекта пока нет файлов. Загрузите их в разделе «Документы» с привязкой к проекту.</p>';
 }
-function chosenAttachments(){return [...document.querySelectorAll('input[name="launchAttachment"]:checked')].map(x=>Number(x.value))}
+function chosenAttachments(root=$('#modalBody')){return [...root.querySelectorAll('input[name="launchAttachment"]:checked')].map(x=>Number(x.value))}
 const baseSuppliers=renderSuppliers;
 renderSuppliers=function(){
   baseSuppliers();
@@ -149,6 +149,6 @@ async function sendLaunchMessage(id){
   });
 }
 const baseTender=renderTender;
-renderTender=function(){baseTender();const lot=state.tenderLot;if(!lot)return;$('#tender').insertAdjacentHTML('beforeend',`<section class="panel"><h3>Вложения заявки</h3>${attachmentChoices(lot.project_id,(lot.attachments||[]).map(a=>a.document_id))}<button class="btn secondary" onclick="saveLaunchAttachments(${lot.id})">Сохранить вложения до подготовки КП</button></section>`)};
-async function saveLaunchAttachments(id){try{await launchJson(`/api/launch/lots/${id}/attachments`,'PUT',{document_ids:chosenAttachments()});await openLot(id);toast('Вложения заявки сохранены')}catch(e){toast(e.message,true)}}
+renderTender=function(){baseTender();const lot=state.tenderLot;if(!lot)return;$('#tender').insertAdjacentHTML('beforeend',`<section class="panel"><h3>Вложения заявки</h3><div id="tenderAttachmentChoices">${attachmentChoices(lot.project_id,(lot.attachments||[]).map(a=>a.document_id))}</div><button class="btn secondary" onclick="saveLaunchAttachments(${lot.id})">Сохранить вложения до подготовки КП</button></section>`)};
+async function saveLaunchAttachments(id){try{await launchJson(`/api/launch/lots/${id}/attachments`,'PUT',{document_ids:chosenAttachments($('#tenderAttachmentChoices'))});await openLot(id);toast('Вложения заявки сохранены')}catch(e){toast(e.message,true)}}
 render();

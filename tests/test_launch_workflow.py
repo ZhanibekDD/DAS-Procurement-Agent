@@ -108,6 +108,20 @@ def test_previews_cross_user_denied_atomic_concurrent_apply(workflow):
     assert all(r==results[0] for r in results) and len(service.list_suppliers())==2
 
 
+@pytest.mark.parametrize('status',['draft','confirmed'])
+def test_import_rollback_blocks_financial_history_reference_atomically(workflow,status):
+    db,service,w=workflow
+    p=w.supplier_preview(read_table((FIXTURES/'suppliers.csv').read_bytes(),'suppliers.csv'))
+    w.apply_import(p['preview_id'],True)
+    sid=service.list_suppliers()[0]['id']
+    with db.connection() as conn:
+        conn.execute('INSERT INTO price_history_entries(supplier_id,item_name,normalized_name,unit_price,status,created_at) VALUES (?,?,?,?,?,?)',
+            (sid,'ТЕСТ материал','тест материал','100',status,'2026-09-26'))
+    with pytest.raises(ConflictError,match='уже используется'):w.rollback_import(p['preview_id'],True)
+    assert len(service.list_suppliers())==2
+    assert db.one('SELECT status FROM launch_previews WHERE id=?',(p['preview_id'],))['status']=='applied'
+
+
 def test_sheet_review_corrections_source_attachments_campaign_snapshot(workflow):
     db,service,w=workflow
     pr=project(service); content=(FIXTURES/'items.xlsx').read_bytes()
