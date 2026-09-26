@@ -4,6 +4,14 @@ const fs=require('node:fs');
 const vm=require('node:vm');
 const source=fs.readFileSync('procurement/static/launch.js','utf8');
 test('full launch script parses',()=>new vm.Script(source));
+
+test('real email and sandbox notices do not contradict each other',()=>{
+  const html=fs.readFileSync('procurement/static/index.html','utf8');
+  assert.ok(html.includes('Реальная email-отправка с вложениями выполняется отдельным подтверждённым действием'));
+  assert.ok(html.includes('MAX / Telegram остаются в sandbox'));
+  assert.ok(!html.includes('Email / MAX / Telegram работают только в sandbox'));
+  assert.ok(!html.includes('Sandbox-квитанции пока нет. Внешняя отправка не выполнялась.'));
+});
 test('SQLite boolean verified preserves both true and false in select',()=>{
   for(const [stored,expected] of [[1,'true'],[0,'false'],[true,'true'],[false,'false']])assert.equal(String(!!stored),expected);
   assert.ok(source.includes("field==='verified'?!!s[field]:s[field]"));
