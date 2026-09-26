@@ -25,6 +25,11 @@ def workbook(item='ТЕСТ кабель'):
     return buffer.getvalue()
 
 
+# A duplicate means identical bytes, not a newly serialized workbook whose ZIP
+# timestamps/core properties can change across a wall-clock second boundary.
+SYNTHETIC_PRICELIST = workbook()
+
+
 def replace_part(content, name, payload):
     buffer = io.BytesIO()
     with zipfile.ZipFile(io.BytesIO(content)) as source, zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as target:
@@ -58,7 +63,7 @@ def workflow(tmp_path):
     db = Database(str(tmp_path / 'bounded.sqlite3'))
     db.initialize()
     service = ProcurementService(db)
-    batch = service.create_import_batch([('synthetic.xlsx', workbook())])
+    batch = service.create_import_batch([('synthetic.xlsx', SYNTHETIC_PRICELIST)])
     assert len(batch['supplier_drafts']) == 1 and len(batch['price_history_entries']) == 1
     return db, service, batch
 
@@ -121,7 +126,7 @@ def test_duplicate_source_is_done_not_empty_review_and_keeps_original_rows(workf
         service.confirm_supplier_draft(batch['supplier_drafts'][0]['id'], confirmation())
         service.confirm_batch_entries(batch['id'], [batch['price_history_entries'][0]['id']], 'ТЕСТ reviewer')
     before = db.all('SELECT * FROM price_history_entries')
-    repeated = service.create_import_batch([('renamed.xlsx', workbook())])
+    repeated = service.create_import_batch([('renamed.xlsx', SYNTHETIC_PRICELIST)])
     assert repeated['status'] == 'done' and not repeated['price_history_entries'] and not repeated['supplier_drafts']
     assert db.all('SELECT * FROM price_history_entries') == before
 
