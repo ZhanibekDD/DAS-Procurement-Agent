@@ -63,6 +63,25 @@ def test_auth_csrf_read_only_download_get_head_range_and_actor(http_boundary):
     assert {r['actor'] for r in db.all("SELECT * FROM audit_log WHERE action='previewed'")}=={ALICE}
 
 
+def test_price_rejection_requires_session_csrf_and_write_permission(http_boundary):
+    from test_launch_import_review import SYNTHETIC_PRICELIST
+    client,authority,settings,db=http_boundary
+    alice=login(client,authority);h=headers(alice)
+    batch=client.post('/api/imports/batch',headers=h,files={'files':('synthetic.xlsx',SYNTHETIC_PRICELIST)}).json()
+    entry=batch['price_history_entries'][0]['id'];url=f"/api/launch/imports/{batch['id']}/reject"
+    payload={'entry_ids':[entry],'rejected_by':'forged'}
+    assert client.post(url,json=payload).status_code==403
+    assert client.post(url,headers=h,json={**payload,'entry_ids':[True]}).status_code==422
+    authority.users[ALICE]['read_only']=True
+    assert client.post(url,headers=h,json=payload).status_code==403
+    authority.users[ALICE]['read_only']=False
+    response=client.post(url,headers=h,json=payload)
+    assert response.status_code==200 and response.json()=={'rejected':1}
+    assert db.one("SELECT actor FROM audit_log WHERE action='entries_rejected'")['actor']==ALICE
+    client.cookies.clear()
+    assert client.post(url,headers={'X-OpenWebUI-User-Id':ALICE},json=payload).status_code==401
+
+
 def test_http_mapping_confirmation_sheet_review_and_source_validation(http_boundary):
     client,authority,settings,db=http_boundary
     alice=login(client,authority);h=headers(alice)

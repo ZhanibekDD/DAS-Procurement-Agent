@@ -79,6 +79,8 @@ class Settings:
             raise RuntimeError("PROCUREMENT_API_KEY is required in production")
         if settings.outbox_mode != "draft_only":
             raise RuntimeError("MVP supports only PROCUREMENT_OUTBOX_MODE=draft_only")
+        if not 300 <= settings.session_ttl_seconds <= 86_400:
+            raise RuntimeError("PROCUREMENT_SESSION_TTL_SECONDS must be between 300 and 86400")
 
         if settings.sso_enabled:
             from .sso import validate_config
@@ -117,9 +119,5 @@ class Settings:
         ):
             raise RuntimeError(
                 "standalone Procurement authentication is required in production"
-            )
-        if not 300 <= settings.session_ttl_seconds <= 86_400:
-            raise RuntimeError(
-                "PROCUREMENT_SESSION_TTL_SECONDS must be between 300 and 86400"
             )
         return settings

@@ -421,10 +421,23 @@ async function openBatch(id){
       ${sso?'<p>Проверяющий определяется вашей сессией DAS.</p>':'<label class="field-label">ФИО проверяющего<input type="text" id="batchConfirmBy"></label>'}
       <div class="table-wrap"><table><thead><tr><th>Проверено</th><th>Позиция</th><th>Количество / ед.</th><th>Цена / валюта</th><th>НДС</th><th>Источник</th><th>Статус</th></tr></thead><tbody>${importedPriceRows(entries,true)}</tbody></table></div>
       <p id="batchSelectionCount">Выбрано: 0</p>
+      <button type="button" class="btn" id="batchReject" disabled>Отклонить отмеченные строки</button>
     `;
     const button=$('#modalSubmit');button.textContent='Подтвердить выбранное';button.disabled=true;
     const selection=()=>[...document.querySelectorAll('input[name=batchEntry]:checked')].map(e=>e.value);
-    document.querySelectorAll('input[name=batchEntry]').forEach(checkbox=>checkbox.onchange=()=>{const count=selection().length;$('#batchSelectionCount').textContent=`Выбрано: ${count}`;button.disabled=!count});
+    const rejectButton=$('#batchReject');rejectButton.disabled=true;
+    document.querySelectorAll('input[name=batchEntry]').forEach(checkbox=>checkbox.onchange=()=>{const count=selection().length;$('#batchSelectionCount').textContent=`Выбрано: ${count}`;button.disabled=!count;rejectButton.disabled=!count});
+    rejectButton.onclick=async()=>{
+      try{
+        const ids=selectedImportIds(entries,selection());
+        const rejectedBy=sso?'session':$('#batchConfirmBy').value.trim();
+        if(!rejectedBy)throw new Error('Укажите проверяющего');
+        if(!confirm(`Отклонить ${ids.length} отмеченных строк? Они не попадут в подтверждённый архив цен.`))return;
+        rejectButton.disabled=true;button.disabled=true;
+        const result=await api(`/api/launch/imports/${id}/reject`,{method:'POST',body:JSON.stringify({rejected_by:rejectedBy,entry_ids:ids})});
+        toast(`Отклонено строк: ${result.rejected}`);$('#modal').close();await loadArchive();renderArchive();
+      }catch(e){toast(e.message,true)}finally{rejectButton.disabled=!selection().length;button.disabled=!selection().length}
+    };
     button.onclick=async()=>{
       try{
         const ids=selectedImportIds(entries,selection());

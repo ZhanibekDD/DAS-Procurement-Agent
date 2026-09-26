@@ -8,7 +8,7 @@ from pathlib import Path
 from fastapi import Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from starlette.concurrency import run_in_threadpool
-from pydantic import Field
+from pydantic import Field, StrictInt
 from .models import StrictModel, SupplierCreate, LotCreate
 from .table_ingest import read_table, MAX_FILE
 
@@ -31,6 +31,11 @@ class AttachmentChoice(StrictModel):
 
 class SheetConfirm(Confirm):
     lot: LotCreate
+
+
+class PriceRejection(StrictModel):
+    entry_ids: list[StrictInt] = Field(min_length=1, max_length=500)
+    rejected_by: str = Field(min_length=1, max_length=128)
 
 
 def install(app, settings, service, launch, require_access, session_claims, domain_error):
@@ -63,6 +68,10 @@ def install(app, settings, service, launch, require_access, session_claims, doma
         return {'smtp_ready':bool(os.getenv('PROCUREMENT_SMTP_HOST') and os.getenv('PROCUREMENT_SMTP_FROM')),
                 'read_only':bool(getattr(request.state,'das_principal',{}).get('read_only',False)),
                 'max_file_bytes':MAX_FILE}
+
+    @app.post('/api/launch/imports/{batch_id}/reject', dependencies=[Depends(write_access)])
+    def reject_prices(batch_id: int, data: PriceRejection):
+        return call(service.reject_batch_entries, batch_id, data.entry_ids, data.rejected_by)
 
     @app.get('/api/launch/suppliers', dependencies=[Depends(require_access)])
     def deleted_suppliers():

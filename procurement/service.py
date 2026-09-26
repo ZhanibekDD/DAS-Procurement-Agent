@@ -1668,6 +1668,12 @@ class ProcurementService:
         entry_ids: list[int],
         confirmed_by: str,
     ) -> dict[str, Any]:
+        return self._review_batch_entries(batch_id, entry_ids, confirmed_by, 'confirmed')
+
+    def reject_batch_entries(self, batch_id: int, entry_ids: list[int], rejected_by: str) -> dict[str, Any]:
+        return self._review_batch_entries(batch_id, entry_ids, rejected_by, 'rejected')
+
+    def _review_batch_entries(self, batch_id, entry_ids, confirmed_by, target):
         confirmed_by = trusted_actor(confirmed_by)
         self.get_import_batch(batch_id)
         if not entry_ids or len(entry_ids) > 500 or any(type(eid) is not int or eid <= 0 for eid in entry_ids):
@@ -1684,27 +1690,27 @@ class ProcurementService:
                 ).fetchone()
                 if not row:
                     raise NotFoundError(f"price_history_entry {eid} not in batch {batch_id}")
-                if row["status"] not in {"draft", "confirmed"}:
-                    raise ConflictError("only draft or already confirmed entries may be reviewed")
+                if row["status"] not in {"draft", target}:
+                    raise ConflictError("only draft or already " + target + " entries may be reviewed")
                 if row["status"] == "draft":
                     selected.append(eid)
             for eid in selected:
                 conn.execute(
-                    "UPDATE price_history_entries SET status='confirmed', confirmed_by=?, confirmed_at=? WHERE id=? AND status='draft'",
-                    (confirmed_by, now, eid),
+                    "UPDATE price_history_entries SET status=?, confirmed_by=?, confirmed_at=? WHERE id=? AND status='draft'",
+                    (target, confirmed_by, now, eid),
                 )
             confirmed = len(selected)
             if confirmed:
-                self.db.audit("entries_confirmed", "import_batch", batch_id, actor=confirmed_by,
-                              details={"entry_ids": selected, "confirmed": confirmed, "paid_purchase": False}, conn=conn)
+                self.db.audit("entries_" + target, "import_batch", batch_id, actor=confirmed_by,
+                              details={"entry_ids": selected, target: confirmed, "paid_purchase": False}, conn=conn)
                 remaining = conn.execute(
                     "SELECT COUNT(*) AS n FROM price_history_entries WHERE import_batch_id=? AND status='draft'", (batch_id,)
                 ).fetchone()
                 if remaining["n"] == 0:
                     conn.execute("UPDATE import_batches SET status='done', reviewed_at=? WHERE id=?", (now, batch_id))
                     self.db.audit("completed", "import_batch", batch_id, actor=confirmed_by,
-                                  details={"confirmed": confirmed}, conn=conn)
-        return {"confirmed": confirmed}
+                                  details={target: confirmed}, conn=conn)
+        return {target: confirmed}
 
     def list_supplier_drafts(
         self, status: str = "", batch_id: int | None = None

@@ -135,3 +135,91 @@ def test_lot_item_source_must_belong_to_project_and_match_bytes(service,source):
         with pytest.raises((ValueError,ConflictError)):service.create_lot(LotCreate(**payload))
         assert not service.list_lots() and not service.db.all('SELECT * FROM lot_items')
         assert service.db.all('SELECT * FROM audit_log')==before
+
+
+@pytest.mark.parametrize('heading',[
+    '', 'RUB', 'без НДС', 'USD EUR без НДС', 'RUB с НДС и без НДС',
+])
+def test_xlsx_missing_or_conflicting_financial_basis_has_no_rows(service,heading):
+    from test_import_money_safety import workbook_bytes
+    content=workbook_bytes([('Prices',[(heading,),('Наименование','Цена'),('ТЕСТ кабель','100')])])
+    result=extract_document(content,'synthetic.xlsx')
+    assert result.errors and not result.items and result.currency==''
+    batch=service.create_import_batch([('synthetic.xlsx',content)])
+    assert batch['status']=='failed' and batch['errors']
+    assert not batch['supplier_drafts'] and not batch['price_history_entries']
+    assert not service.list_source_documents()
+
+
+def test_xlsx_financial_basis_is_not_inherited_from_another_sheet():
+    from test_import_money_safety import workbook_bytes
+    content=workbook_bytes([
+        ('Valid',[('USD без НДС',),('Наименование','Цена'),('ТЕСТ A','100')]),
+        ('Missing',[('без НДС',),('Наименование','Цена'),('ТЕСТ B','200')]),
+    ])
+    result=extract_document(content,'synthetic.xlsx')
+    assert result.errors and len(result.items)==1
+    assert result.items[0].item_name=='ТЕСТ A' and result.items[0].currency=='USD'
+
+
+def test_reject_selected_price_rows_completes_batch_without_confirming_them(service):
+    from test_review_ui_backend import synthetic_workbook
+    batch=service.create_import_batch([('synthetic.xlsx',synthetic_workbook())])
+    good,bad=[row['id'] for row in batch['price_history_entries']]
+    assert service.confirm_batch_entries(batch['id'],[good],'ТЕСТ reviewer')=={'confirmed':1}
+    assert service.get_import_batch(batch['id'])['status']=='needs_review'
+    assert service.reject_batch_entries(batch['id'],[bad],'ТЕСТ rejecting')=={'rejected':1}
+    assert service.get_import_batch(batch['id'])['status']=='done'
+    assert [r['id'] for r in service.list_price_history_entries(status='confirmed')]==[good]
+    before={t:service.db.all('SELECT * FROM '+t) for t in ('price_history_entries','import_batches','audit_log')}
+    assert service.reject_batch_entries(batch['id'],[bad,bad],'ТЕСТ stale')=={'rejected':0}
+    with pytest.raises(ConflictError):service.confirm_batch_entries(batch['id'],[bad],'ТЕСТ stale')
+    with pytest.raises(ConflictError):service.reject_batch_entries(batch['id'],[good],'ТЕСТ stale')
+    assert all(service.db.all('SELECT * FROM '+t)==rows for t,rows in before.items())
+    audit=service.db.one("SELECT * FROM audit_log WHERE action='entries_rejected'")
+    assert audit['actor']=='ТЕСТ rejecting'
+
+
+def test_reject_foreign_price_row_is_atomic(service):
+    from test_review_ui_backend import synthetic_workbook
+    own=service.create_import_batch([('own.xlsx',synthetic_workbook())])
+    other=service.create_import_batch([('other.xlsx',synthetic_workbook(' another'))])
+    ids=[own['price_history_entries'][0]['id'],other['price_history_entries'][0]['id']]
+    before={t:service.db.all('SELECT * FROM '+t) for t in ('price_history_entries','import_batches','audit_log')}
+    with pytest.raises(Exception,match='not in batch'):service.reject_batch_entries(own['id'],ids,'ТЕСТ')
+    assert all(service.db.all('SELECT * FROM '+t)==rows for t,rows in before.items())
+
+
+def test_parallel_confirm_or_reject_price_rows_has_one_winner(service):
+    from concurrent.futures import ThreadPoolExecutor
+    batch=service.create_import_batch([('synthetic.xlsx',SYNTHETIC_PRICELIST)])
+    ids=[batch['price_history_entries'][0]['id']]
+    def review(n):
+        try:
+            fn=service.confirm_batch_entries if n%2 else service.reject_batch_entries
+            result=fn(batch['id'],ids,'ТЕСТ')
+            return sum(result.values())
+        except ConflictError:return 0
+    with ThreadPoolExecutor(max_workers=8) as pool:assert sum(pool.map(review,range(32)))==1
+    assert service.get_import_batch(batch['id'])['status']=='done'
+    assert service.db.one("SELECT count(*) n FROM audit_log WHERE action IN ('entries_confirmed','entries_rejected')")['n']==1
+
+
+@pytest.mark.parametrize('ttl',[-1,0,299,300,86400,86401])
+def test_sso_session_ttl_is_validated_before_startup(monkeypatch,ttl):
+    import os
+    from procurement.config import Settings
+    from test_sso_adapter import DAS,BASE
+    for key in list(os.environ):
+        if key.startswith(('PROCUREMENT_','DAS_SSO_')):monkeypatch.delenv(key)
+    for key,value in {
+        'DAS_SSO_AUTHORIZE_URL':DAS+'/access/sso/authorize/',
+        'DAS_SSO_INTERNAL_BASE_URL':'http://das-identity.test:8000',
+        'DAS_SSO_CLIENT_ID':'procurement','DAS_SSO_CLIENT_SECRET':'test-service-'+'x'*32,
+        'DAS_SSO_REDIRECT_URI':BASE+'/auth/sso/callback',
+        'PROCUREMENT_AUTH_SECRET':'test-state-'+'s'*32,'PROCUREMENT_ENV':'production',
+        'PROCUREMENT_SESSION_TTL_SECONDS':str(ttl),
+    }.items():monkeypatch.setenv(key,value)
+    if ttl in (300,86400):assert Settings.from_env().session_ttl_seconds==ttl
+    else:
+        with pytest.raises(RuntimeError,match='between 300 and 86400'):Settings.from_env()

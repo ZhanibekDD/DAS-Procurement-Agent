@@ -730,12 +730,11 @@ def _extract_bounded_xlsx(wb, filename: str, sha256: str) -> DocumentExtractResu
         header_text_parts.append(header_text)
         sheets.append((sheet_name, header_idx, headers, header_text))
 
-    workbook_currencies = _explicit_currencies(' '.join(header_text_parts))
     for sheet_name, header_idx, headers, sheet_header in sheets:
         sheet_currencies = _explicit_currencies(sheet_header)
-        currencies = sheet_currencies or workbook_currencies or {'RUB'}
+        currencies = sheet_currencies
         if len(currencies) != 1:
-            errors.append(f'Sheet {sheet_name!r}: ambiguous currency requires review')
+            errors.append(f'Sheet {sheet_name!r}: missing or ambiguous currency requires review')
             continue
         sheet_currency = next(iter(currencies))
         try:
@@ -744,7 +743,10 @@ def _extract_bounded_xlsx(wb, filename: str, sha256: str) -> DocumentExtractResu
         except ValueError as exc:
             errors.append(f'Sheet {sheet_name!r}: {exc}')
             continue
-        sheet_vat = True if explicit_vat is None else explicit_vat
+        if explicit_vat is None:
+            errors.append(f'Sheet {sheet_name!r}: missing VAT basis requires review')
+            continue
+        sheet_vat = explicit_vat
 
         name_col = _col_index(headers, _NAME_COL_NAMES)
         price_col = _col_index(headers, _PRICE_COL_NAMES)
@@ -799,7 +801,7 @@ def _extract_bounded_xlsx(wb, filename: str, sha256: str) -> DocumentExtractResu
     doc_type = _classify_document(header_text)
     item_currencies = {item.currency for item in all_items}
     currency = (next(iter(item_currencies)) if len(item_currencies) == 1
-                else 'MIXED' if len(item_currencies) > 1 else detect_currency(header_text))
+                else 'MIXED' if len(item_currencies) > 1 else '')
     # Per-item values are authoritative; the document summary is not used for persistence.
     vat_included = all(item.vat_included for item in all_items) if all_items else False
     doc_date = extract_date(header_text)

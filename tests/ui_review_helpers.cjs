@@ -76,7 +76,7 @@ test('missing VAT or payment is not fabricated',()=>{
   assert.ok(output.includes('Не указан')&&output.includes('Не указаны')&&!output.includes('RUB'));
 });
 test('actual batch handler submits selected row only, not all drafts',async()=>{
-  const nodes={};for(const key of ['#modalTitle','#modalBody','#modalSubmit','#batchConfirmBy','#batchSelectionCount'])nodes[key]={value:'Synthetic reviewer'};
+  const nodes={};for(const key of ['#modalTitle','#modalBody','#modalSubmit','#batchConfirmBy','#batchSelectionCount','#batchReject'])nodes[key]={value:'Synthetic reviewer'};
   nodes['#modal']={showModal(){},close(){}};
   const checkboxes=[{value:'1',checked:false},{value:'3',checked:true}];
   const calls=[];
@@ -91,6 +91,18 @@ test('actual batch handler submits selected row only, not all drafts',async()=>{
   assert.equal(nodes['#modalSubmit'].disabled,false);
   await nodes['#modalSubmit'].onclick();
   assert.deepEqual(calls,[['/api/imports/4/confirm',{confirmed_by:'Synthetic reviewer',entry_ids:[3]}]]);
+});
+for(const allowed of [false,true])test(`explicit rejection requires confirmation ${allowed}`,async()=>{
+  const nodes={};for(const key of ['#modalTitle','#modalBody','#modalSubmit','#batchConfirmBy','#batchSelectionCount','#batchReject'])nodes[key]={value:'Synthetic reviewer'};
+  nodes['#modal']={showModal(){},close(){}};
+  const checkbox={value:'3',checked:true};const calls=[];
+  const ctx=context({$:s=>nodes[s],confirm:()=>allowed,
+    document:{querySelector:()=>null,querySelectorAll:()=>[checkbox]},
+    api:async(url,options)=>{if(!options)return {filenames:['synthetic.xlsx'],price_history_entries:entries};calls.push([url,JSON.parse(options.body)]);return {rejected:1}},
+    toast(){},loadArchive:async()=>{},renderArchive(){}});
+  vm.runInContext(script.slice(script.indexOf('async function openBatch(id)'),script.indexOf('function updateDraftConfirmState')),ctx);
+  await ctx.openBatch(4);checkbox.onchange();await nodes['#batchReject'].onclick();
+  assert.deepEqual(calls,allowed?[['/api/launch/imports/4/reject',{rejected_by:'Synthetic reviewer',entry_ids:[3]}]]:[]);
 });
 test('approval and simulation stay separate user actions',()=>{
   const approval=script.slice(script.indexOf('function approveMessage(id)'),script.indexOf('async function simulateMessage'));

@@ -329,7 +329,7 @@ def test_async_import_creator_and_confirmation_actor_are_server_subject(boundary
     client, authority, _, database = boundary
     identity = login(client, authority)
     workbook = Workbook()
-    workbook.active.append(["Наименование", "Цена"])
+    workbook.active.append(["Наименование", "Цена RUB без НДС"])
     workbook.active.append(["Synthetic cable", 10])
     output = io.BytesIO()
     workbook.save(output)

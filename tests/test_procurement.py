@@ -591,7 +591,7 @@ class BatchImportTestCase(unittest.TestCase):
         """Build a minimal XLSX price-list with header + data rows."""
         wb = Workbook()
         ws = wb.active
-        ws.append(["Наименование", "Цена", "Кол-во", "Ед.изм"])
+        ws.append(["Наименование", "Цена RUB без НДС", "Кол-во", "Ед.изм"])
         for row in rows:
             ws.append(list(row))
         buf = io.BytesIO()
@@ -1095,7 +1095,7 @@ class BatchImportApiTestCase(unittest.TestCase):
     def _xlsx_bytes(self, rows: list[tuple]) -> bytes:
         wb = Workbook()
         ws = wb.active
-        ws.append(["Наименование", "Цена", "Ед.изм"])
+        ws.append(["Наименование", "Цена RUB без НДС", "Ед.изм"])
         for row in rows:
             ws.append(list(row))
         buf = io.BytesIO(); wb.save(buf)
