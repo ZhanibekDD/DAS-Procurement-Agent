@@ -28,6 +28,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, FileResponse
+from starlette.concurrency import run_in_threadpool
 from pydantic import Field
 
 from .auth import TokenError, issue_token, verify_token
@@ -851,7 +852,7 @@ async def batch_import(
             raise HTTPException(status_code=413, detail='batch exceeds 50 MB aggregate limit')
         file_pairs.append((f.filename or "unnamed", content))
     try:
-        return service.create_import_batch(file_pairs, created_by=created_by)
+        return await run_in_threadpool(service.create_import_batch, file_pairs, created_by=created_by)
     except Exception as exc:
         raise handle_domain_error(exc) from exc
 

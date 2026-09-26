@@ -170,6 +170,8 @@ class ProcurementService:
         with self.db.connection() as conn:
             from .launch_workflow import LaunchWorkflow
             LaunchWorkflow(self)._documents(conn, data.project_id, data.attachment_document_ids)
+            LaunchWorkflow(self)._documents(conn, data.project_id,
+                [item.source_document_id for item in data.items if item.source_document_id is not None])
             cursor = conn.execute(
                 """
                 INSERT INTO lots(
@@ -1525,7 +1527,9 @@ class ProcurementService:
             sha256_map[filename] = result.sha256
             errors.extend(f"{filename}: {error}"[:2000] for error in result.errors[:100])
             # A wholly failed extraction has no reviewable supplier/price rows.
-            if result.errors and not result.items:
+            if not result.items:
+                if not result.errors:
+                    errors.append(f'{filename}: no price items extracted; nothing imported')
                 continue
             prepared.append((filename, content, result))
 
@@ -1723,7 +1727,12 @@ class ProcurementService:
             "FROM suppliers WHERE active = 1"
         )
         for draft in drafts:
-            matched = self._match_existing_supplier(draft, suppliers)
+            draft['match_error'] = ''
+            try:
+                matched = self._match_existing_supplier(draft, suppliers)
+            except ConflictError as exc:
+                matched = None
+                draft['match_error'] = str(exc)
             draft["matched_supplier_id"] = matched["id"] if matched else None
             draft["matched_supplier_name"] = matched["name"] if matched else ""
             draft["suggested_region"] = draft["region"] or (
@@ -1742,27 +1751,28 @@ class ProcurementService:
     def _match_existing_supplier(
         draft: dict[str, Any], suppliers: list[dict[str, Any]]
     ) -> dict[str, Any] | None:
-        """Match deterministically: tax id, then email, then exact normalised name."""
+        """Unique evidence only; never pick an arbitrary row on ambiguity."""
+        def unique(matches):
+            if len(matches)>1:
+                raise ConflictError('ambiguous supplier match; resolve supplier identity before approval')
+            return matches[0] if matches else None
         draft_tax_id = re.sub(r"\D", "", str(draft.get("tax_id", "")))
         if draft_tax_id:
-            for supplier in suppliers:
-                if re.sub(r"\D", "", str(supplier.get("tax_id", ""))) == draft_tax_id:
-                    return supplier
+            # An explicit INN must not fall back to another person's email/name.
+            return unique([s for s in suppliers if re.sub(r'\D','',str(s.get('tax_id','')))==draft_tax_id])
 
         draft_email = str(draft.get("email", "")).strip().casefold()
         if draft_email:
-            for supplier in suppliers:
-                if str(supplier.get("email", "")).strip().casefold() == draft_email:
-                    return supplier
+            matches=[s for s in suppliers if str(s.get('email','')).strip().casefold()==draft_email]
+            if matches:
+                return unique(matches)
 
         normalise_name = lambda value: " ".join(
             re.findall(r"[0-9a-zа-я]+", str(value).casefold().replace("ё", "е"))
         )
         draft_name = normalise_name(draft.get("name", ""))
         if draft_name:
-            for supplier in suppliers:
-                if normalise_name(supplier.get("name", "")) == draft_name:
-                    return supplier
+            return unique([s for s in suppliers if normalise_name(s.get('name',''))==draft_name])
         return None
 
     def confirm_supplier_draft(

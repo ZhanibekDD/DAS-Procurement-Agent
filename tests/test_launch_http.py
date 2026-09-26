@@ -82,3 +82,32 @@ def test_http_mapping_confirmation_sheet_review_and_source_validation(http_bound
     assert db.one('SELECT count(*) n FROM lots')['n']==1
     assert client.post('/api/launch/supplier-import/preview',headers=h,files={'file':('../a.xlsx',b'PKfake')}).status_code==422
     assert client.post('/api/launch/supplier-import/preview',headers=h,data={'mapping':json.dumps({'name':0,'email':0})},files={'file':('suppliers.csv',(FIXTURES/'suppliers.csv').read_bytes())}).json()['report']['error']==4
+
+
+def test_batch_worker_keeps_health_responsive_and_preserves_actor(http_boundary,monkeypatch):
+    import asyncio,time,httpx
+    from threading import Event,Timer
+    from procurement.identity import trusted_actor
+    client,authority,settings,db=http_boundary
+    alice=login(client,authority);h=headers(alice)
+    entered,release=Event(),Event();actors=[]
+    def block(*args,**kwargs):
+        actors.append(trusted_actor());entered.set();release.wait(timeout=3)
+        return {'status':'test'}
+    monkeypatch.setattr(application.service,'create_import_batch',block)
+    timer=Timer(3,release.set);timer.daemon=True;timer.start()
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=client.app),base_url=BASE,cookies=client.cookies) as session:
+            task=asyncio.create_task(session.post('/api/imports/batch',headers=h,files={'files':('synthetic.xlsx',b'PKfake')}))
+            try:
+                assert await asyncio.to_thread(entered.wait,2)
+                assert not task.done(), 'extraction blocked the event loop'
+                started=time.monotonic()
+                assert (await asyncio.wait_for(session.get('/health'),0.5)).status_code==200
+                assert time.monotonic()-started<0.5
+            finally:
+                release.set();response=await task
+            assert response.status_code==201
+    try:asyncio.run(exercise())
+    finally:release.set();timer.cancel()
+    assert actors==[ALICE]

@@ -520,10 +520,7 @@ def _extract_items_from_pdf_tables(
                             .replace(' ', '')
                             .replace(',', '.')
                         )
-                        try:
-                            float(price_clean)
-                        except ValueError:
-                            continue  # not a parseable decimal — skip row
+                        price_clean = _decimal_price(price_clean)
                         raw_qty = ''
                         if qty_col is not None and qty_col < len(row):
                             raw_qty = str(row[qty_col] or '').strip()
@@ -581,6 +578,7 @@ def _extract_items_from_pdf_text(
                 .replace(' ', '')
                 .replace(',', '.')
             )
+            price_raw = _decimal_price(price_raw)
             norm = re.sub(r'[^а-яa-z0-9 ]+', ' ', name_raw.casefold()).strip()
             items.append(ExtractedItem(
                 item_name=name_raw,

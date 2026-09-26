@@ -340,7 +340,7 @@ function renderArchive(){
       <th>Наименование</th><th>ИНН</th><th>Регион</th><th>Кластер</th><th>Статус</th><th>Действия</th>
     </tr></thead><tbody>
     ${drafts.map(d=>{const draftRegion=d.suggested_region||d.region||'',draftCluster=d.suggested_cluster||d.cluster||'';return `<tr data-draft-id="${d.id}">
-      <td><b>${esc(d.name)}</b><br><small class="muted">${esc(d.email)}</small>${d.matched_supplier_id?`<br><span class="badge green">Найден в базе: ${esc(d.matched_supplier_name)}</span>`:''}</td>
+      <td><b>${esc(d.name)}</b><br><small class="muted">${esc(d.email)}</small>${d.matched_supplier_id?`<br><span class="badge green">Найден в базе: ${esc(d.matched_supplier_name)}</span>`:''}${d.match_error?`<br><span class="guard">${esc(d.match_error)}</span>`:''}</td>
       <td>${esc(d.tax_id)||'—'}</td>
       <td><input class="draft-field draft-region" value="${esc(draftRegion)}" placeholder="Укажите регион" oninput="updateDraftConfirmState(${d.id})"></td>
       <td><select class="draft-field draft-cluster" onchange="updateDraftConfirmState(${d.id})">
