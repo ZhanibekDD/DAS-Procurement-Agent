@@ -1002,6 +1002,7 @@ class ProcurementService:
         content_type: str = "application/octet-stream",
         project_id: int | None = None,
         supplier_id: int | None = None,
+        _price_import: bool = False,
     ) -> dict[str, Any]:
         allowed_types = {"paid_invoice", "tender_table", "project_section", "commercial_offer",
                          "invoice", "price_list", "unknown"}
@@ -1051,8 +1052,8 @@ class ProcurementService:
                 """
                 INSERT INTO source_documents(
                     project_id, supplier_id, document_type, filename, content_type,
-                    size_bytes, sha256, storage_path, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    size_bytes, sha256, storage_path, created_at, extraction_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     project_id,
@@ -1064,6 +1065,7 @@ class ProcurementService:
                     digest,
                     str(storage_path),
                     utcnow(),
+                    'extracted_needs_review' if _price_import else 'pending_ai_extraction',
                 ),
             )
             document_id = cursor.lastrowid
@@ -1555,7 +1557,8 @@ class ProcurementService:
                     source = self.register_source_document(
                         filename=filename, content=content, document_type=result.document_type,
                         content_type='application/pdf' if Path(filename).suffix.lower()=='.pdf'
-                        else 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+                        else 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                        _price_import=True)
                     doc_id = int(source['id'])
 
                 # One bounded transaction per source (<=10000 rows across the
@@ -1574,6 +1577,17 @@ class ProcurementService:
                         existing_draft = conn.execute(
                             'SELECT id,status,approved_supplier_id FROM supplier_drafts WHERE dedup_key=?',
                             (dedup_key,)).fetchone()
+                        superseded_id = None
+                        if existing_draft and existing_draft['status']=='rejected':
+                            # Keep the rejected decision, evidence and old price
+                            # links intact. Retire only its active identity key;
+                            # corrected evidence gets a fresh reviewable record.
+                            superseded_id = existing_draft['id']
+                            retired_key = hashlib.sha256(
+                                f'{dedup_key}:rejected:{superseded_id}'.encode()).hexdigest()
+                            conn.execute("UPDATE supplier_drafts SET dedup_key=? WHERE id=? AND status='rejected'",
+                                         (retired_key,superseded_id))
+                            existing_draft = None
                         if existing_draft:
                             draft_id = existing_draft['id']
                             if existing_draft['status']=='approved':
@@ -1597,6 +1611,10 @@ class ProcurementService:
                                   json.dumps(raw,ensure_ascii=False),dedup_key,cluster_status,utcnow()))
                             draft_id = cursor.lastrowid
                             created_draft = True
+                            if superseded_id is not None:
+                                self.db.audit('superseded','supplier_draft',superseded_id,actor=created_by,
+                                              details={'new_draft_id':draft_id,'source_document_id':doc_id,
+                                                       'old_decision_preserved':True},conn=conn)
                     now = utcnow()
                     validity = price_validity_state(result.valid_until)
                     rows = [(
@@ -1612,8 +1630,6 @@ class ProcurementService:
                             source_text,status,created_at)
                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """, rows)
-                    conn.execute("UPDATE source_documents SET extraction_status='extracted_needs_review' WHERE id=?",
-                                 (doc_id,))
                 # Count only committed rows/claims, not rolled-back attempts.
                 inserted_count += len(rows)
                 new_drafts = new_drafts or created_draft

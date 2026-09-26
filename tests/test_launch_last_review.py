@@ -223,3 +223,88 @@ def test_sso_session_ttl_is_validated_before_startup(monkeypatch,ttl):
     if ttl in (300,86400):assert Settings.from_env().session_ttl_seconds==ttl
     else:
         with pytest.raises(RuntimeError,match='between 300 and 86400'):Settings.from_env()
+
+
+@pytest.mark.parametrize('kind,status',[
+    ('paid_invoice','approved'),('project_section','approved'),
+    ('project_section','needs_review'),('invoice','pending_ai_extraction'),
+])
+def test_price_import_preserves_reused_document_workflow(service,kind,status):
+    document=service.register_source_document(filename='synthetic.xlsx',content=SYNTHETIC_PRICELIST,document_type=kind)
+    with service.db.connection() as conn:conn.execute('UPDATE source_documents SET extraction_status=? WHERE id=?',(status,document['id']))
+    before=service.db.one('SELECT * FROM source_documents WHERE id=?',(document['id'],))
+    original=Path(before['storage_path']).read_bytes()
+    batch=service.create_import_batch([('renamed.xlsx',SYNTHETIC_PRICELIST)])
+    assert batch['status']=='needs_review' and len(batch['price_history_entries'])==1
+    assert service.db.one('SELECT * FROM source_documents WHERE id=?',(document['id'],))==before
+    assert Path(before['storage_path']).read_bytes()==original
+    service.confirm_batch_entries(batch['id'],[batch['price_history_entries'][0]['id']],'ТЕСТ')
+    assert service.db.one('SELECT * FROM source_documents WHERE id=?',(document['id'],))==before
+
+
+def test_source_created_concurrently_is_not_reclassified_by_price_import(service,monkeypatch):
+    document=service.register_source_document(filename='synthetic.xlsx',content=SYNTHETIC_PRICELIST,document_type='paid_invoice')
+    with service.db.connection() as conn:conn.execute("UPDATE source_documents SET extraction_status='approved' WHERE id=?",(document['id'],))
+    before=service.db.one('SELECT * FROM source_documents')
+    one=service.db.one
+    def lookup(sql,*args):
+        # Simulate another registration winning between the optimistic lookup
+        # and the locked register_source_document lookup.
+        if sql=='SELECT id FROM source_documents WHERE sha256=?':return None
+        return one(sql,*args)
+    monkeypatch.setattr(service.db,'one',lookup)
+    batch=service.create_import_batch([('renamed.xlsx',SYNTHETIC_PRICELIST)])
+    assert batch['status']=='needs_review' and len(batch['price_history_entries'])==1
+    assert one('SELECT * FROM source_documents')==before
+
+
+def rejected_batch(service):
+    from procurement.models import SupplierDraftReject
+    batch=service.create_import_batch([('old.xlsx',SYNTHETIC_PRICELIST)])
+    draft=batch['supplier_drafts'][0]
+    service.reject_supplier_draft(draft['id'],SupplierDraftReject(rejected_by='ТЕСТ',review_notes='Недостоверные старые данные'))
+    return batch,service.db.one('SELECT * FROM supplier_drafts WHERE id=?',(draft['id'],))
+
+
+def test_corrected_source_gets_fresh_review_without_reusing_rejected_draft(service):
+    from test_launch_import_review import workbook,confirmation
+    old,rejected=rejected_batch(service)
+    old_rows=service.db.all('SELECT * FROM price_history_entries')
+    new=service.create_import_batch([('corrected.xlsx',workbook('ТЕСТ исправлено'))])
+    fresh=new['supplier_drafts'][0]
+    assert fresh['id']!=rejected['id'] and fresh['status']=='needs_review'
+    assert new['price_history_entries'][0]['supplier_draft_id']==fresh['id']
+    after=service.db.one('SELECT * FROM supplier_drafts WHERE id=?',(rejected['id'],))
+    assert all(after[k]==value for k,value in rejected.items() if k!='dedup_key')
+    assert service.db.all('SELECT * FROM price_history_entries WHERE import_batch_id=?',(old['id'],))==old_rows
+    supplier=service.confirm_supplier_draft(fresh['id'],confirmation())
+    third=service.create_import_batch([('third.xlsx',workbook('ТЕСТ третий документ'))])
+    assert not third['supplier_drafts'] and third['price_history_entries'][0]['supplier_id']==supplier['id']
+    assert service.db.one("SELECT count(*) n FROM audit_log WHERE action='superseded' AND entity_type='supplier_draft'")['n']==1
+    assert service.db.one('SELECT supplier_id FROM price_history_entries WHERE import_batch_id=?',(old['id'],))['supplier_id'] is None
+
+
+def test_parallel_corrected_sources_create_one_new_supplier_review(service):
+    from concurrent.futures import ThreadPoolExecutor
+    from test_launch_import_review import workbook
+    _,rejected=rejected_batch(service);content=workbook('ТЕСТ исправлено')
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results=list(pool.map(lambda n:service.create_import_batch([(f'corrected-{n}.xlsx',content)]),range(8)))
+    assert sum(len(b['price_history_entries']) for b in results)==1
+    assert sum(len(b['supplier_drafts']) for b in results)==1
+    assert service.db.one("SELECT count(*) n FROM supplier_drafts WHERE status='needs_review'")['n']==1
+    assert service.db.one('SELECT status FROM supplier_drafts WHERE id=?',(rejected['id'],))['status']=='rejected'
+    assert service.db.one("SELECT count(*) n FROM audit_log WHERE action='superseded'")['n']==1
+
+
+def test_failed_corrected_import_preserves_rejection_and_key_atomically(service):
+    from test_launch_import_review import workbook
+    _,rejected=rejected_batch(service)
+    before=service.db.all('SELECT * FROM price_history_entries')
+    with service.db.connection() as conn:
+        conn.execute("CREATE TRIGGER synthetic_failure BEFORE INSERT ON price_history_entries BEGIN SELECT RAISE(ABORT,'synthetic'); END")
+    batch=service.create_import_batch([('corrected.xlsx',workbook('ТЕСТ исправлено'))])
+    assert batch['status']=='failed' and not batch['supplier_drafts']
+    assert service.db.all('SELECT * FROM supplier_drafts')==[rejected]
+    assert service.db.all('SELECT * FROM price_history_entries')==before
+    assert not service.db.all("SELECT * FROM audit_log WHERE action='superseded'")
