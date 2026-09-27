@@ -89,6 +89,8 @@ def accept(url, credentials):
             for method in ('GET','HEAD'):
                 check('anonymous source denied '+method,httpx.request(method,url+path).status_code==403)
             check('forged source Range denied',httpx.get(url+path,headers={'Range':'bytes=0-15','X-OpenWebUI-User-Id':'admin'}).status_code==403)
-        check('unauthenticated memory denied',httpx.get(url+'/api/procurement/price-memory').status_code==401)
+        # This canary uses the same legacy session contour as Production (403).
+        # The separately tested SSO adapter returns 401 before route dispatch.
+        check('unauthenticated memory denied',httpx.get(url+'/api/procurement/price-memory').status_code==403)
         check('memory service health',c.get('/health').status_code==200)
     return checks
