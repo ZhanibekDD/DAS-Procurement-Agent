@@ -300,6 +300,64 @@ def test_ordered_decision_is_immutable_and_same_order_is_idempotent(http_boundar
     assert db.one('SELECT * FROM procurement_decisions WHERE lot_id=?',(lot['id'],))==original
     assert db.all("SELECT * FROM audit_log WHERE action LIKE 'procurement_%'")==audit
     assert app.service.get_lot(lot['id'])['status']=='ordered'
+    # Late price intake and a new RFQ do not reopen human decisions.
+    app.service.add_quote(lot['id'],QuoteCreate(supplier_id=supplier['id'],currency='RUB',vat_included=True,
+        items=[{'lot_item_id':item['id'],'unit_price':90} for item in lot['items']]))
+    campaign(app.service,lot,supplier)
+    for automatic in ('rfq_draft','rfq_sent','quotes_received','comparison'):
+        with db.connection() as conn:
+            app.service._set_lot_progress(conn,lot['id'],automatic)
+        assert app.service.get_lot(lot['id'])['status']=='ordered'
+        assert db.one('SELECT * FROM procurement_decisions WHERE lot_id=?',(lot['id'],))==original
+
+
+@pytest.mark.parametrize('kind,expected',[('partial',True),('complete',False),('short_quantity',True),('noncompliant',True),('delivery_over_threshold',True)])
+def test_amount_threshold_requires_complete_compliant_quantity_coverage(workflow,kind,expected):
+    from procurement.models import QuoteCreate
+    db,s,w=workflow;lot,supplier=fbs(s)
+    items=[{'lot_item_id':item['id'],'unit_price':100} for item in lot['items']]
+    if kind=='partial':items=items[:1]
+    if kind=='short_quantity':items[0]['offered_quantity']=1
+    if kind=='noncompliant':items[0]['compliant']=False
+    s.add_quote(lot['id'],QuoteCreate(supplier_id=supplier['id'],currency='RUB',vat_included=True,items=items,
+        delivery_cost=60000 if kind=='delivery_over_threshold' else 0))
+    with db.connection() as conn:
+        conn.execute("INSERT INTO procurement_policy VALUES(1,'100000','RUB','[]','test')")
+        assert ProcurementFlow(s).approval_required(conn,lot['id'],'staff') is expected
+
+
+@pytest.mark.parametrize('kind',['csv','xlsx','pdf','mail'])
+def test_global_price_import_reuses_provided_owned_bytes_without_reassigning_acl(http_boundary,monkeypatch,kind):
+    import procurement.app as app
+    from procurement.launch_workflow import LaunchWorkflow
+    client,a,settings,db=http_boundary;u=login(client,a);h=headers(u)
+    pr=project(app.service);supplier=app.service.create_supplier(SupplierCreate(name='Владелец исходника',region='Воронеж'))
+    raw=price_csv();name='owned.csv'
+    if kind=='xlsx':
+        import csv
+        book=Workbook()
+        for row in csv.reader(io.StringIO(raw.decode()),delimiter=';'):book.active.append(row)
+        stream=io.BytesIO();book.save(stream);raw=stream.getvalue();name='owned.xlsx'
+    if kind=='pdf':
+        raw=(FIXTURES/'russian_scan.pdf').read_bytes();name='owned.pdf'
+        # Ownership test does not replace the separate actual Linux OCR gate.
+        from types import SimpleNamespace
+        monkeypatch.setattr('procurement.imports.extract_document',lambda *args:SimpleNamespace(items=[],errors=['Прайс требует проверки']))
+    doc=app.service.register_source_document(filename=name,content=raw,document_type='price_list',project_id=pr['id'],supplier_id=supplier['id'])
+    original=db.one('SELECT * FROM source_documents WHERE id=?',(doc['id'],))
+    if kind=='mail':
+        email=EmailMessage();email['From']='controlled@example.test';email.set_content('Тест прайса')
+        email.add_attachment(raw,maintype='text',subtype='csv',filename=name)
+        response=client.post('/api/procurement/catalog/incoming-mail',headers=h,files={'file':('owned.eml',email.as_bytes())})
+        assert response.status_code==200,response.text
+        preview=response.json()['previews'][0]
+    else:
+        response=client.post('/api/procurement/catalog/preview',headers=h,files={'file':(name,raw)})
+        assert response.status_code==200,response.text
+        preview=response.json()
+    assert preview['document_id']==doc['id']
+    assert db.one('SELECT * FROM source_documents WHERE id=?',(doc['id'],))==original
+    assert LaunchWorkflow(app.service).document_file(doc).path.read_bytes()==raw
 
 
 def test_http_mail_catalog_workbook_views_acl_range(http_boundary):

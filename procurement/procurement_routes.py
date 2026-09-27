@@ -117,7 +117,7 @@ def install(app,settings,service,launch,require_access,write_access,session_clai
         if not data.confirmed:raise HTTPException(422,'Подтвердите переход к сравнению')
         with service.db.connection() as conn:
             if not conn.execute('SELECT 1 FROM quotes WHERE lot_id=?',(lid,)).fetchone():raise HTTPException(409,'Для сравнения нужны полученные цены')
-            conn.execute("UPDATE lots SET status='comparison' WHERE id=? AND status NOT IN ('awarded','ordered')",(lid,))
+            service._set_lot_progress(conn,lid,'comparison')
             service.db.audit('comparison_opened','lot',lid,conn=conn)
         return service.get_lot(lid)
 
@@ -163,10 +163,10 @@ def install(app,settings,service,launch,require_access,write_access,session_clai
             if suffix=='.pdf':
                 from .imports import extract_document
                 result=await run_in_threadpool(call,extract_document,content,file.filename)
-                doc=await run_in_threadpool(call,lambda:service.register_source_document(filename=file.filename,content=content,document_type='price_list'))
+                doc=await run_in_threadpool(call,lambda:service.register_source_document(filename=file.filename,content=content,document_type='price_list',_price_import=True))
                 return await run_in_threadpool(call,catalog.extracted_price_preview,doc,result)
             table=await run_in_threadpool(call,read_table,content,file.filename,sheet,header_row)
-            doc=await run_in_threadpool(call,lambda:service.register_source_document(filename=file.filename,content=content,document_type='price_list'))
+            doc=await run_in_threadpool(call,lambda:service.register_source_document(filename=file.filename,content=content,document_type='price_list',_price_import=True))
             return await run_in_threadpool(call,catalog.price_preview,doc,table,json.loads(mapping) if mapping else None)
 
     @app.post('/api/procurement/catalog/{pid}/apply',dependencies=[Depends(write_access)])
@@ -197,7 +197,7 @@ def install(app,settings,service,launch,require_access,write_access,session_clai
                 if len(result)>=20:raise HTTPException(422,'Не больше 20 вложений')
                 raw=part.get_payload(decode=True)
                 call(safe_upload,raw,name,{'.pdf','.xlsx','.csv'})
-                doc=await run_in_threadpool(call,lambda:service.register_source_document(filename=name,content=raw,document_type='price_list'))
+                doc=await run_in_threadpool(call,lambda:service.register_source_document(filename=name,content=raw,document_type='price_list',_price_import=True))
                 if Path(name).suffix.lower()=='.pdf':
                     extraction=await run_in_threadpool(call,extract_document,raw,name)
                     preview=await run_in_threadpool(call,catalog.extracted_price_preview,doc,extraction)

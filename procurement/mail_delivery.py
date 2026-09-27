@@ -246,7 +246,7 @@ def send(workflow, mid, confirmed):
             accepted_recipients_json=? WHERE message_id=?''',
             (now,receipt['smtp_code'],receipt['smtp_reply'],encode(receipt['accepted_recipients']),mid))
         conn.execute("UPDATE outbox_messages SET status='sent' WHERE id=?",(mid,))
-        conn.execute("UPDATE lots SET status='rfq_sent' WHERE id=?",(message['lot_id'],))
+        service._set_lot_progress(conn,message['lot_id'],'rfq_sent')
         event(db,conn,mid,'mail_sent',message_id=rfc_id,sender=sender,**receipt,attachment_count=len(attachments))
     copy_sent(workflow,mid,confirmed=True)
     return result(db,mid)

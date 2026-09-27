@@ -477,7 +477,7 @@ class ProcurementService:
                 conn.executemany('INSERT INTO outbox_attachments VALUES (?,?,?,?,?)',
                     [(message_id,a['document_id'],a['filename'],a['sha256'],a['size_bytes']) for a in lot.get('attachments',[])])
             bind_campaign(conn,campaign_id,snapshot)
-            conn.execute("UPDATE lots SET status = 'rfq_draft' WHERE id = ?", (lot_id,))
+            self._set_lot_progress(conn,lot_id,'rfq_draft')
             self.db.audit(
                 "drafted",
                 "campaign",
@@ -700,9 +700,19 @@ class ProcurementService:
                         str(item.minimum_batch) if item.minimum_batch is not None else '',
                     ),
                 )
-            conn.execute("UPDATE lots SET status = 'quotes_received' WHERE id = ?", (lot_id,))
+            self._set_lot_progress(conn,lot_id,'quotes_received')
             self.db.audit("received", "quote", quote_id, details={"lot_id": lot_id}, conn=conn)
         return self.db.one("SELECT * FROM quotes WHERE id = ?", (quote_id,)) or {}
+
+    @staticmethod
+    def _set_lot_progress(conn, lot_id: int, stage: str) -> None:
+        """Automatic intake/send cannot undo a human award or finalized order."""
+        if stage not in {'rfq_draft','rfq_sent','quotes_received','comparison'}:
+            raise ValueError('unsupported automatic lot stage')
+        conn.execute('''UPDATE lots SET status=CASE
+            WHEN EXISTS(SELECT 1 FROM procurement_decisions WHERE lot_id=lots.id AND stage='ordered') THEN 'ordered'
+            WHEN EXISTS(SELECT 1 FROM procurement_decisions WHERE lot_id=lots.id AND stage='awarded') THEN 'awarded'
+            WHEN status IN ('awarded','ordered') THEN status ELSE ? END WHERE id=?''',(stage,lot_id))
 
     @staticmethod
     def _normalized_item_name(value: str) -> str:

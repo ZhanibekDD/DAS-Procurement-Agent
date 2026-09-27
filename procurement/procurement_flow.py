@@ -114,10 +114,15 @@ class ProcurementFlow:
             quotes = self.service.list_quotes(lot_id)
             if not quotes:
                 return True
+            quantities={i['id']:Decimal(i['quantity']) for i in self.service.get_lot(lot_id)['items']}
             for quote in quotes:
                 if quote['currency'] != policy['currency']:
                     return True
-                quantities={i['id']:Decimal(i['quantity']) for i in self.service.get_lot(lot_id)['items']}
+                if {i['lot_item_id'] for i in quote['items']} != set(quantities):
+                    return True
+                if any(not i['compliant'] or (i['offered_quantity'] is not None and
+                       Decimal(i['offered_quantity'])<quantities[i['lot_item_id']]) for i in quote['items']):
+                    return True
                 amount = Decimal(quote['delivery_cost']) + sum(Decimal(i['unit_price'])*quantities[i['lot_item_id']] for i in quote['items'])
                 if amount >= Decimal(policy['amount_threshold']):
                     return True
