@@ -55,6 +55,13 @@ def normalize(value):
     return ' '.join(str(value).lower().replace('ё','е').split())
 
 
+def comparable_basis(row):
+    vat=normalize(row['vat'])
+    known_vat=bool(re.fullmatch(r'(?:с ндс|без ндс|ндс включен|ндс не включен|(?:ндс\s*)?\d{1,2}(?:[.,]\d+)?\s*%)',vat))
+    delivery=normalize(row['delivery'])
+    return known_vat and bool(delivery) and delivery not in {'не указано','не определено','неизвестно','по согласованию'} and bool(row['valid_until']) and bool(row['minimum_batch'])
+
+
 def workbook_rows(content,filename):
     from openpyxl import load_workbook
     safe_upload(content,filename,{'.xlsx'})
@@ -110,6 +117,7 @@ class Catalog:
                         date.fromisoformat(values[field])
                 if not values['price_date'] or not values['region']:
                     raise ValueError('Нужны дата прайса и регион')
+                SupplierCreate(name=values['supplier_name'],tax_id=values['tax_id'],email=values['email'],phone=values['phone'],region=values['region'],categories=[values['category']] if values['category'] else [])
                 rows.append({'source_row':source['row'],**values})
             except (ValueError,TypeError) as exc:
                 errors.append({'row':source['row'],'error':str(exc)})
@@ -190,7 +198,7 @@ class Catalog:
                 continue
             r['current']=key not in seen and bool(r['active']) and (not r['valid_until'] or r['valid_until']>=date.today().isoformat())
             seen.add(key)
-            if r['current'] and r['vat'] and r['delivery'] and r['valid_until']:current[key]=r
+            if r['current'] and comparable_basis(r):current[key]=r
         groups={}
         for key,r in current.items():
             groups.setdefault(key[1:],[]).append(Decimal(r['unit_price']))

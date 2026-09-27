@@ -145,6 +145,17 @@ def test_unknown_basis_does_not_duplicate_current_or_fake_market(workflow):
     assert all(r['market_median'] is None for r in rows)
 
 
+@pytest.mark.parametrize('unknown',['vat','minimum_batch','delivery'])
+def test_market_index_not_computed_for_explicit_unknown_conditions(workflow,unknown):
+    db,s,w=workflow
+    for name,email in [('Поставщик A','a@example.test'),('Поставщик B','b@example.test')]:
+        raw=price_csv(name,email).decode()
+        lines=raw.splitlines();keys=lines[0].split(';');values=lines[1].split(';')
+        values[keys.index(unknown)]='' if unknown=='minimum_batch' else 'не определено'
+        cat,_,_,_=import_price(s,w,(lines[0]+'\n'+';'.join(values)+'\n').encode())
+    assert all(r['price_index_pct'] is None for r in cat.prices())
+
+
 def test_price_reimport_changed_payload_corrupt_source_and_cross_owner(workflow):
     from procurement.identity import authenticated_actor
     db,s,w=workflow;cat,doc,p,_=import_price(s,w,price_csv())
