@@ -1,5 +1,6 @@
 """Authenticated procurement workflow, catalog, portfolio and document views."""
 import json
+import re
 from pathlib import Path
 from fastapi import Depends,File,Form,HTTPException,Request,UploadFile
 from fastapi.responses import HTMLResponse,FileResponse
@@ -13,6 +14,7 @@ from .table_ingest import read_table
 from .db import utcnow
 from .identity import trusted_actor
 from .launch_routes import Confirm
+from .price_memory import PriceMemory
 
 
 class Send(StrictModel):
@@ -40,9 +42,13 @@ class Budget(StrictModel):
 class ReviewedPriceRows(StrictModel):
     rows:list[dict[str,str]]=Field(min_length=1,max_length=500)
 
+class ReadAlerts(StrictModel):
+    event_ids:list[str]=Field(min_length=1,max_length=100)
+
 
 def install(app,settings,service,launch,require_access,write_access,session_claims,domain_error):
     flow=ProcurementFlow(service);catalog=Catalog(service,launch)
+    memory=PriceMemory(service)
     def call(fn,*args):
         try:return fn(*args)
         except Exception as exc:raise domain_error(exc) from None
@@ -53,6 +59,24 @@ def install(app,settings,service,launch,require_access,write_access,session_clai
 
     @app.get('/assets/procurement.js',dependencies=[Depends(require_access)])
     def script():return FileResponse(Path(__file__).parent/'static/procurement.js',media_type='application/javascript')
+
+    @app.get('/assets/price-memory.js',dependencies=[Depends(require_access)])
+    def memory_script():return FileResponse(Path(__file__).parent/'static/price-memory.js',media_type='application/javascript')
+
+    @app.get('/api/procurement/price-memory',dependencies=[Depends(require_access)])
+    def price_memory(q:str='',specification:str='',region:str='',days:int=90,project_id:int|None=None,offset:int=0,limit:int=100):
+        return call(memory.search,q,specification,region,days,project_id,offset,limit)
+
+    @app.post('/api/procurement/price-memory/alerts/read',dependencies=[Depends(write_access)])
+    def read_alerts(data:ReadAlerts):
+        if any(not re.fullmatch('[a-f0-9]{64}',eid) for eid in data.event_ids):
+            raise HTTPException(422,'Некорректный ID уведомления')
+        actor=trusted_actor()
+        with service.db.connection() as conn:
+            for eid in data.event_ids:
+                conn.execute('INSERT OR IGNORE INTO price_memory_alert_reads VALUES (?,?,?)',(actor,eid,utcnow()))
+            service.db.audit('price_alerts_read','price_memory',actor,details={'count':len(data.event_ids)},conn=conn)
+        return {'read':len(set(data.event_ids))}
 
     @app.post('/api/procurement/lots/{lid}/preview',dependencies=[Depends(write_access)])
     def preview(lid:int,data:CampaignCreate):return call(flow.preview,lid,data)

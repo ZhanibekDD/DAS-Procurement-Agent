@@ -123,6 +123,7 @@ class QuoteItemCreate(StrictModel):
     offered_quantity: Decimal | None = Field(default=None, gt=0)
     compliant: bool = True
     note: str = Field(default="", max_length=2000)
+    minimum_batch: Decimal | None = Field(default=None, ge=0)
 
 
 class QuoteCreate(StrictModel):
@@ -136,6 +137,9 @@ class QuoteCreate(StrictModel):
     warranty: str = Field(default="", max_length=1000)
     valid_until: date | None = None
     source_filename: str = Field(default="", max_length=255)
+    source_document_id: int | None = Field(default=None, gt=0)
+    price_date: date | None = None
+    delivery_basis: Literal["included", "pickup", "extra", ""] = ""
     items: list[QuoteItemCreate] = Field(min_length=1, max_length=500)
 
 

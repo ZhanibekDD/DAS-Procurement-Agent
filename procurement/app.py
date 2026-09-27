@@ -120,7 +120,7 @@ _READ_ONLY_GET = (
     r"/api/imports(?:/\d+)?", r"/api/supplier-drafts", r"/api/price-history-entries", r"/assets/[^/]+",
     r"/api/launch/config", r"/api/launch/suppliers(?:/\d+)?", r"/api/launch/imports",
     r"/api/launch/documents/\d+/download",
-    r"/api/procurement/(?:catalog|policy|projects/\d+|documents/\d+/view)",
+    r"/api/procurement/(?:catalog|price-memory|policy|projects/\d+|documents/\d+/view)",
 )
 
 
@@ -498,6 +498,8 @@ def index(
                               'src="/assets/launch.js?v=' + launch_digest + '"')
     flow_digest = hashlib.sha256((path.parent / 'procurement.js').read_bytes()).hexdigest()
     content = content.replace('src="/assets/procurement.js"','src="/assets/procurement.js?v='+flow_digest+'"')
+    memory_digest = hashlib.sha256((path.parent / 'price-memory.js').read_bytes()).hexdigest()
+    content = content.replace('src="/assets/price-memory.js"','src="/assets/price-memory.js?v='+memory_digest+'"')
     if not settings.sso_enabled and session_token:
         csrf = hmac.new(settings.auth_secret.encode(), ('launch:' + session_token).encode(), hashlib.sha256).hexdigest()
         content = content.replace('<head>', '<head><meta name="procurement-launch-csrf" content="' + csrf + '">')

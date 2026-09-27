@@ -632,6 +632,8 @@ class ProcurementService:
         submitted_ids = {item.lot_item_id for item in data.items}
         if not submitted_ids.issubset(lot_item_ids):
             raise ValueError("quote contains an item from another lot")
+        if data.price_date and data.valid_until and data.valid_until < data.price_date:
+            raise ValueError("Срок действия КП раньше даты цены")
         with self.db.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             current = conn.execute("""SELECT l.cluster AS lot_cluster,p.cluster AS project_cluster,l.currency
@@ -644,12 +646,19 @@ class ProcurementService:
             if not current_supplier:
                 raise NotFoundError("supplier not found")
             self._supplier_cluster(dict(current_supplier), cluster)
+            if data.source_document_id is not None:
+                source = conn.execute('SELECT * FROM source_documents WHERE id=?', (data.source_document_id,)).fetchone()
+                if not source or source['document_type'] not in {'commercial_offer','price_list'}:
+                    raise ValueError('Нужен исходный прайс или КП с подтверждённым ID')
+                if source['project_id'] not in (None,lot['project_id']) or source['supplier_id'] not in (None,data.supplier_id):
+                    raise ValueError('Исходное КП принадлежит другому объекту или поставщику')
             cursor = conn.execute(
                 """
                 INSERT INTO quotes(
                     lot_id, supplier_id, currency, vat_included, delivery_cost,
-                    lead_days, payment_terms, warranty, valid_until, source_filename, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    lead_days, payment_terms, warranty, valid_until, source_filename, created_at,
+                    source_document_id, price_date, delivery_basis
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     lot_id,
@@ -663,6 +672,9 @@ class ProcurementService:
                     data.valid_until.isoformat() if data.valid_until else None,
                     data.source_filename,
                     utcnow(),
+                    data.source_document_id,
+                    data.price_date.isoformat() if data.price_date else None,
+                    data.delivery_basis,
                 ),
             )
             quote_id = cursor.lastrowid
@@ -670,8 +682,8 @@ class ProcurementService:
                 conn.execute(
                     """
                     INSERT INTO quote_items(
-                        quote_id, lot_item_id, unit_price, offered_quantity, compliant, note
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                        quote_id, lot_item_id, unit_price, offered_quantity, compliant, note, minimum_batch
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         quote_id,
@@ -680,6 +692,7 @@ class ProcurementService:
                         str(item.offered_quantity) if item.offered_quantity is not None else None,
                         int(item.compliant),
                         item.note,
+                        str(item.minimum_batch) if item.minimum_batch is not None else '',
                     ),
                 )
             conn.execute("UPDATE lots SET status = 'quotes_received' WHERE id = ?", (lot_id,))
