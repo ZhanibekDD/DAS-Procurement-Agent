@@ -103,6 +103,22 @@ def test_pb_with_fbs_in_description_never_in_fbs_search(workflow):
     assert PriceMemory(s).search('ФБС 24.4.6',today=TODAY)['total']==0
 
 
+def test_project_material_mark_in_specification_filters_global_history(workflow):
+    db,s,w=workflow;lot,_=fbs(s)
+    item=next(i for i in lot['items'] if i['name']=='ФБС 24.4.6')
+    with db.connection() as conn:
+        conn.execute("UPDATE lot_items SET name='Блок фундаментный',specification='ФБС 24.4.6' WHERE id=?",(item['id'],))
+    price(workflow,'ФБС 24.4.6',amount='100',supplier='A')
+    price(workflow,'ПБ 24.4.6',amount='1',supplier='B')
+    price(workflow,'Блок фундаментный',amount='2',supplier='D',specification='ПБ 24.4.6')
+    price(workflow,'ФБС 12.4.6',amount='90',supplier='C')
+    result=PriceMemory(s).search(project_id=lot['project_id'],today=TODAY)
+    names={r['item_name'] for r in result['records']}
+    assert 'ФБС 24.4.6' in names and 'ПБ 24.4.6' not in names
+    assert not any(r['supplier_name']=='ТЕСТ D' for r in result['records'])
+    assert 'ФБС 12.4.6' in names  # second exact lot item still belongs to project
+
+
 @pytest.mark.parametrize('mark',['24.4.6','12.4.6','9.4.6'])
 def test_quote_plus_catalog_source_history_and_project_filter(workflow,mark):
     db,s,w=workflow;lot,supplier=fbs(s)

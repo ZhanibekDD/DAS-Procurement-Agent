@@ -16,7 +16,7 @@ from smtp_capture import CaptureSMTP
 from imap_capture import CaptureIMAP
 from procurement.mail_delivery import copy_sent, journal, COPY_WARNING
 from procurement.service import ConflictError
-from procurement.mail_delivery import COPY_LEASE_SECONDS, smtp_failure_receipt
+from procurement.mail_delivery import COPY_LEASE_SECONDS, QUEUE_LEASE_SECONDS, smtp_failure_receipt
 
 
 def imap_env(monkeypatch, server, tmp_path):
@@ -94,6 +94,79 @@ def test_unavailable_smtp_safe_retry_with_same_message_id(workflow,monkeypatch):
         assert r['delivery']['spool_sha256']==first['spool_sha256']
         assert r['delivery']['attempt']==2 and len(smtp.messages)==1
         assert w.send(m['id'],True)['duplicate'] and len(smtp.messages)==1
+
+
+def test_abandoned_pre_smtp_queue_recovers_once_without_new_message_id(workflow,monkeypatch):
+    db,s,w=workflow;m,_=prepare(workflow)
+    import procurement.mail_delivery as delivery
+    original=delivery.spool_message
+    def crash_before_spool(*args):
+        raise KeyboardInterrupt('worker exited before SMTP')
+    with CaptureSMTP() as smtp:
+        smtp_env(monkeypatch,smtp)
+        monkeypatch.setattr(delivery,'spool_message',crash_before_spool)
+        with pytest.raises(KeyboardInterrupt):w.send(m['id'],True)
+        first=journal(db,m['id'])
+        assert first['status']=='queued' and not first['retry_allowed'] and not smtp.messages
+        with pytest.raises(ConflictError,match='повтор запрещён'):w.send(m['id'],True)
+        started=(datetime.now(UTC)-timedelta(seconds=QUEUE_LEASE_SECONDS+1)).isoformat()
+        with db.connection() as conn:
+            conn.execute('UPDATE mail_receipts SET started_at=? WHERE message_id=?',(started,m['id']))
+        assert journal(db,m['id'])['retry_allowed']
+        monkeypatch.setattr(delivery,'spool_message',original)
+        result=w.send(m['id'],True)
+        assert result['status']=='sent' and result['delivery']['attempt']==2
+        assert result['delivery']['rfc_message_id']==first['rfc_message_id']
+        assert len(smtp.messages)==1 and w.send(m['id'],True)['duplicate']
+
+
+def test_stale_queued_worker_is_fenced_before_smtp(workflow,monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    import procurement.mail_delivery as delivery
+    db,s,w=workflow;m,_=prepare(workflow)
+    original=delivery.spool_message
+    entered,resume=Event(),Event()
+    calls=[0]
+    def delayed_spool(*args):
+        calls[0]+=1
+        if calls[0]==1:
+            entered.set()
+            assert resume.wait(10)
+        return original(*args)
+    with CaptureSMTP() as smtp, ThreadPoolExecutor(max_workers=2) as pool:
+        smtp_env(monkeypatch,smtp)
+        monkeypatch.setattr(delivery,'spool_message',delayed_spool)
+        first=pool.submit(w.send,m['id'],True)
+        assert entered.wait(10)
+        with db.connection() as conn:
+            conn.execute('UPDATE mail_receipts SET started_at=? WHERE message_id=?',
+                         ((datetime.now(UTC)-timedelta(seconds=QUEUE_LEASE_SECONDS+1)).isoformat(),m['id']))
+        second=pool.submit(w.send,m['id'],True)
+        assert second.result(timeout=20)['status']=='sent'
+        resume.set()
+        with pytest.raises(ConflictError,match='другой работник'):first.result(timeout=20)
+        assert len(smtp.messages)==1 and journal(db,m['id'])['attempt']==2
+
+
+def test_abandoned_sending_is_never_retried_automatically(workflow,monkeypatch):
+    db,s,w=workflow;m,_=prepare(workflow)
+    import procurement.mail_delivery as delivery
+    original=delivery.submit_spool
+    def crash_after_sending(*args):
+        raise KeyboardInterrupt('SMTP outcome unknown')
+    with CaptureSMTP() as smtp:
+        smtp_env(monkeypatch,smtp)
+        monkeypatch.setattr(delivery,'submit_spool',crash_after_sending)
+        with pytest.raises(KeyboardInterrupt):w.send(m['id'],True)
+        assert journal(db,m['id'])['status']=='sending'
+        with db.connection() as conn:
+            conn.execute('UPDATE mail_receipts SET started_at=? WHERE message_id=?',
+                         ((datetime.now(UTC)-timedelta(days=1)).isoformat(),m['id']))
+        assert not journal(db,m['id'])['retry_allowed']
+        monkeypatch.setattr(delivery,'submit_spool',original)
+        with pytest.raises(ConflictError,match='повтор запрещён'):w.send(m['id'],True)
+        assert not smtp.messages
 
 
 def test_imap_failure_warns_and_copy_retry_never_resends(workflow,monkeypatch,tmp_path):

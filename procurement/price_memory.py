@@ -34,6 +34,19 @@ def material_key(value):
     return ' '.join(filter(None, (before, mark, value[match.end():].strip())))
 
 
+def designation_key(name, specification=''):
+    """Use an explicit product family and full mark, including marks in specifications."""
+    pattern = r'(?<!\w)(фбс|пб|фл)\s*[-–—]?\s*(\d+)\s*[.хx×-]\s*(\d+)\s*[.хx×-]\s*(\d+)(?!\d)'
+    family = re.search(r'(?<!\w)(фбс|пб|фл)(?!\w)', normalized(name))
+    for value in (name, specification):
+        found = re.search(pattern, normalized(value))
+        if found:
+            if family and family[1] != found[1]:
+                return None  # Contradictory item name and specification.
+            return found[1] + ' ' + '.'.join(str(int(found[i])) for i in (2, 3, 4))
+    return None
+
+
 def unit_key(value):
     value = normalized(value).rstrip('.')
     return {'штука':'шт', 'штуки':'шт', 'штук':'шт', 'pcs':'шт', 'pc':'шт',
@@ -138,17 +151,18 @@ class PriceMemory:
             self.service.get_project(project_id)
             # Includes reviewed reference workbook materials, not only procurement lots.
             data = Catalog(self.service,None).portfolio(project_id)
-            project_materials = {material_key(i['name']) for i in data['materials']}
+            project_materials = {(material_key(i['name']), designation_key(i['name'],i.get('specification','')))
+                                 for i in data['materials']}
         query_key = material_key(query)
         family_query = re.search(r'(?<!\w)(фбс|пб|фл)(?!\w)', query_key)
         def matches(name, spec, reg):
             key = material_key(name)
             combined = material_key(str(name)+' '+str(spec))
-            if project_materials is not None and key not in project_materials:
-                # A structured brand may be in specification rather than name.
-                # Exact designation only; no substring/fuzzy project association.
-                designated = material_key(spec)
-                if designated not in project_materials:return False
+            if project_materials is not None:
+                designation = designation_key(name,spec)
+                if not any((designation == project_mark if designation or project_mark else key == project_name)
+                           for project_name,project_mark in project_materials):
+                    return False
             if family_query:
                 primary = re.search(r'(?<!\w)(фбс|пб|фл)(?!\w)', combined)
                 if not primary or primary[1] != family_query[1]:return False

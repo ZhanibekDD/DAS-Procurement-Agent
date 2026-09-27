@@ -37,6 +37,21 @@ CREATE TABLE IF NOT EXISTS mail_events (
 
 COPY_WARNING = 'SMTP принял письмо, но копия в “Отправленных” не сохранена'
 COPY_LEASE_SECONDS = 600
+QUEUE_LEASE_SECONDS = 600
+
+
+class SupersededQueue(Exception):
+    """Another worker owns this pre-SMTP attempt; never change its state."""
+
+
+def queued_lease_expired(row):
+    if not row or row['status'] != 'queued':
+        return False
+    try:
+        started = datetime.fromisoformat(row['started_at'])
+        return started.tzinfo is not None and datetime.now(UTC) - started >= timedelta(seconds=QUEUE_LEASE_SECONDS)
+    except (TypeError, ValueError):
+        return False
 
 
 def copy_lease_expired(row):
@@ -101,7 +116,7 @@ def journal(db, mid):
     row.pop('sent_copy_lease')
     for key in ('recipients', 'accepted_recipients', 'attachments'):
         row[key] = json.loads(row.pop(key + '_json'))
-    row['retry_allowed'] = row['status'] == 'failed'
+    row['retry_allowed'] = row['status'] == 'failed' or queued_lease_expired(row)
     row['copy_retry_allowed'] = row['status'] == 'sent' and (row['sent_copy_status'] in {'pending','failed','unknown'} or expired)
     row['copy_reconcile_only'] = row['sent_copy_status'] == 'unknown' or expired
     row['warning'] = COPY_WARNING if row['status'] == 'sent' and row['sent_copy_status'] != 'saved' else None
@@ -136,14 +151,16 @@ def send(workflow, mid, confirmed):
         if previous:
             if previous['status'] == 'sent' and previous['payload_sha256'] == fingerprint:
                 return result(db, mid, duplicate=True)
-            if previous['status'] != 'failed' or previous['payload_sha256'] != fingerprint:
+            recover_queued = previous['status'] == 'queued' and queued_lease_expired(
+                conn.execute('SELECT status,started_at FROM mail_receipts WHERE message_id=?', (mid,)).fetchone())
+            if (previous['status'] != 'failed' and not recover_queued) or previous['payload_sha256'] != fingerprint:
                 raise ConflictError('Исход отправки не подтверждён либо отправка выполняется; повтор запрещён до проверки сервера')
         flow=ProcurementFlow(service)
         from .identity import trusted_role
         if flow.approval_required(conn,message['lot_id'],trusted_role()) and not flow.admin_approval_valid(conn,message):
             raise ConflictError('Требуется согласование текущего правила закупки администратором')
         approval = conn.execute('SELECT * FROM outbox_approvals WHERE message_id=?', (mid,)).fetchone()
-        if (message['channel'] != 'email' or message['status'] not in {'approved','failed'} or not approval
+        if (message['channel'] != 'email' or message['status'] not in {'approved','failed','queued'} or not approval
                 or approval['payload_sha256'] != fingerprint or approval['approved_by'] != message['approved_by']
                 or approval['approved_at'] != message['approved_at']):
             raise ConflictError('Необходим неизменённый черновик с подтверждением сотрудника')
@@ -172,14 +189,17 @@ def send(workflow, mid, confirmed):
                 started_at,attachments_json) VALUES (?,?,?,?,?,'queued',1,?,?)''',
                 (mid,rfc_id,sender,encode([message['recipient']]),host,now,encode(message.get('attachments',[]))))
         conn.execute("UPDATE outbox_messages SET status='queued' WHERE id=?", (mid,))
+        attempt = conn.execute('SELECT attempt FROM mail_receipts WHERE message_id=?', (mid,)).fetchone()['attempt']
         event(db,conn,mid,'mail_queued',message_id=rfc_id,recipients=[message['recipient']],attachment_count=len(attachments))
     smtp = None
     user, credential = '', None
     try:
         current = db.one('SELECT * FROM mail_receipts WHERE message_id=?', (mid,))
-        path = Path(db.path).resolve().parent / 'mail-spool' / (key + '.eml')
+        if current['status'] != 'queued' or current['attempt'] != attempt:
+            raise SupersededQueue()
+        path = Path(current['spool_path']) if current['spool_path'] else Path(db.path).resolve().parent / 'mail-spool' / (key + '-' + str(attempt) + '.eml')
         if current['spool_path']:
-            if str(path) != current['spool_path'] or file_digest(path) != current['spool_sha256']:
+            if file_digest(path) != current['spool_sha256']:
                 raise ValueError('SHA письма изменился; отправка заблокирована')
         else:
             path.parent.mkdir(mode=0o700, exist_ok=True)
@@ -189,10 +209,16 @@ def send(workflow, mid, confirmed):
             email.set_content(message['body'])
             spool_message(path,email,attachments)
             with db.connection() as conn:
-                conn.execute('UPDATE mail_receipts SET spool_path=?,spool_sha256=? WHERE message_id=?', (str(path),file_digest(path),mid))
+                updated = conn.execute("UPDATE mail_receipts SET spool_path=?,spool_sha256=? WHERE message_id=? AND status='queued' AND attempt=? AND spool_path IS NULL",
+                                       (str(path),file_digest(path),mid,attempt)).rowcount
+                if not updated:
+                    raise SupersededQueue()
         with db.connection() as conn:
-            conn.execute("UPDATE mail_deliveries SET status='sending',updated_at=? WHERE message_id=?",(utcnow(),mid))
-            conn.execute("UPDATE mail_receipts SET status='sending' WHERE message_id=?",(mid,))
+            conn.execute('BEGIN IMMEDIATE')
+            updated = conn.execute("UPDATE mail_receipts SET status='sending' WHERE message_id=? AND status='queued' AND attempt=?",(mid,attempt)).rowcount
+            if not updated:
+                raise SupersededQueue()
+            conn.execute("UPDATE mail_deliveries SET status='sending',updated_at=? WHERE message_id=? AND status='queued'",(utcnow(),mid))
             conn.execute("UPDATE outbox_messages SET status='sending' WHERE id=?",(mid,))
             event(db,conn,mid,'mail_send_started',message_id=rfc_id)
         port = int(os.getenv('PROCUREMENT_SMTP_PORT','587'))
@@ -211,6 +237,8 @@ def send(workflow, mid, confirmed):
             smtp.login(user,credential)
         receipt = submit_spool(smtp,path,sender,message['recipient'])
     except Exception as exc:
+        if isinstance(exc, SupersededQueue) or db.one('SELECT attempt FROM mail_receipts WHERE message_id=?', (mid,))['attempt'] != attempt:
+            raise ConflictError('Эту очередь уже обрабатывает другой работник; повтор SMTP не выполнялся') from None
         uncertain = isinstance(exc, SubmissionUncertain)
         status = 'unknown' if uncertain else 'failed'
         reason = 'Письмо не принято почтовым сервером; доступен безопасный повтор.'
