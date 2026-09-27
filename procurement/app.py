@@ -491,6 +491,10 @@ def index(
         return RedirectResponse(url="/login", status_code=303)
     path = Path(__file__).parent / "static" / "index.html"
     content = path.read_text(encoding="utf-8")
+    # A no-store HTML page must not reuse yesterday's cached workflow script.
+    launch_digest = hashlib.sha256((path.parent / "launch.js").read_bytes()).hexdigest()
+    content = content.replace('src="/assets/launch.js"',
+                              'src="/assets/launch.js?v=' + launch_digest + '"')
     if not settings.sso_enabled and session_token:
         csrf = hmac.new(settings.auth_secret.encode(), ('launch:' + session_token).encode(), hashlib.sha256).hexdigest()
         content = content.replace('<head>', '<head><meta name="procurement-launch-csrf" content="' + csrf + '">')

@@ -1,5 +1,7 @@
 """The real application routes and identity middleware on isolated test DBs."""
 import json
+import hashlib
+from pathlib import Path
 from dataclasses import replace
 
 import pytest
@@ -30,6 +32,24 @@ def http_boundary(tmp_path,monkeypatch):
     app.router.routes.extend(r for r in application.app.router.routes if not r.path.startswith('/api/launch/') and r.path!='/assets/launch.js')
     install(app,settings,service,launch,application.require_access,application._session_claims,application.handle_domain_error)
     with TestClient(app,base_url=BASE) as client:yield client,authority,settings,db
+
+
+def test_authenticated_html_uses_content_versioned_workflow_script(http_boundary, monkeypatch):
+    client,authority,settings,db=http_boundary
+    login(client,authority)
+    script=Path(application.__file__).parent/'static/launch.js'
+    digest=hashlib.sha256(script.read_bytes()).hexdigest()
+    response=client.get('/')
+    assert response.status_code==200
+    assert response.headers['cache-control']=='no-store'
+    assert f'src="/assets/launch.js?v={digest}"' in response.text
+    assert 'src="/assets/launch.js"' not in response.text
+    read_bytes=Path.read_bytes
+    monkeypatch.setattr(Path,'read_bytes',lambda p: read_bytes(p)+b'\n// new workflow' if p==script else read_bytes(p))
+    refreshed=client.get('/')
+    assert f'src="/assets/launch.js?v={digest}"' not in refreshed.text
+    new_digest=hashlib.sha256(script.read_bytes()).hexdigest()
+    assert f'src="/assets/launch.js?v={new_digest}"' in refreshed.text
 
 
 def test_auth_csrf_read_only_download_get_head_range_and_actor(http_boundary):
