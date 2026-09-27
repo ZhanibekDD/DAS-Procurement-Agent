@@ -109,7 +109,7 @@ def test_immutable_ids_are_strict(field,value):
     with pytest.raises(ValidationError):CampaignCreate(**{'supplier_ids':[1],field:[value]})
 
 
-def price_csv(supplier='Поставщик A',email='a@example.test',price='112',date='2026-09-27',vat='с НДС',until='2099-01-01'):
+def price_csv(supplier='Поставщик A',email='a@example.test',price='112',date='2020-01-01',vat='с НДС',until='2099-01-01'):
     keys=list(ALIASES)
     row=dict(item_name='ФБС 24.4.6',specification='бетон B7.5',category='ФБС',unit='шт',unit_price=price,currency='RUB',vat=vat,delivery='доставка включена',region='Воронежская область',minimum_batch='10',price_date=date,valid_until=until,supplier_name=supplier,email=email)
     return (';'.join(keys)+'\n'+';'.join(row.get(k,'') for k in keys)+'\n').encode()
@@ -130,7 +130,7 @@ def test_prices_exact_dedupe_history_median_not_reliability(workflow):
     prices=cat.prices('ФБС','B7.5');assert len(prices)==2
     assert {p['price_index_pct'] for p in prices}=={12.0,-12.0}
     assert all(p['market_median']=='100' for p in prices)
-    import_price(s,w,price_csv(price='124',date='2026-09-28'))
+    import_price(s,w,price_csv(price='124',date='2020-01-02'))
     assert len(s.list_suppliers())==2 and s.list_suppliers()[0]['rating']==rating
     history=cat.prices();assert len(history)==3 and sum(p['current'] for p in history)==2
     assert db.one('SELECT unit_price FROM supplier_catalog_prices WHERE id=1')['unit_price']=='112'
@@ -140,7 +140,7 @@ def test_prices_exact_dedupe_history_median_not_reliability(workflow):
 def test_unknown_basis_does_not_duplicate_current_or_fake_market(workflow):
     db,s,w=workflow
     cat,_,_,_=import_price(s,w,price_csv(vat='',until=''))
-    import_price(s,w,price_csv(price='125',date='2026-09-28',vat='',until=''))
+    import_price(s,w,price_csv(price='125',date='2020-01-02',vat='',until=''))
     rows=cat.prices();assert sum(r['current'] for r in rows)==1
     assert all(r['market_median'] is None for r in rows)
 
@@ -165,7 +165,7 @@ def test_catalog_xlsx_exact_conflicting_identifiers_and_parallel_import(workflow
     stream=io.BytesIO();b.save(stream)
     cat,doc,p,_=import_price(s,w,stream.getvalue(),'price.xlsx')
     assert cat.prices()[0]['source_sheet']=='Прайс'
-    raw=price_csv(price='100',date='2026-09-28')
+    raw=price_csv(price='100',date='2020-01-02')
     doc=s.register_source_document(filename='new.csv',content=raw,document_type='price_list')
     preview=cat.price_preview(doc,read_table(raw,'new.csv'))
     def apply(_):
@@ -193,6 +193,15 @@ def test_pdf_catalog_requires_human_review_reuses_strict_validator(workflow):
     checked=cat.review_pdf(p['preview_id'],[row]);assert not checked['errors']
     assert cat.apply_prices(checked['preview_id'],True)['added']==1
     assert cat.prices()[0]['source_document_id']==doc['id']
+
+
+def test_price_dates_not_import_order_and_future_prices_not_current(workflow):
+    db,s,w=workflow
+    cat,_,_,_=import_price(s,w,price_csv(price='200',date='2020-01-02'))
+    import_price(s,w,price_csv(price='100',date='2020-01-01'))
+    import_price(s,w,price_csv(price='999',date='2099-01-01'))
+    rows=cat.prices()
+    assert [r['unit_price'] for r in rows if r['current']]==['200']
 
 
 def test_fbs_custom_template_wrong_content_blocked(workflow):

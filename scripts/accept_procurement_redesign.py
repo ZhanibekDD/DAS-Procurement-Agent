@@ -67,10 +67,10 @@ def accept(url,credentials,capture,reference):
         from procurement.catalog import ALIASES
         from email.message import EmailMessage
         keys=list(ALIASES)
-        def csv(price='112',email='a@example.test',name='ТЕСТ Прайс A',date='2026-09-27'):
+        def csv(price='112',email='a@example.test',name='ТЕСТ Прайс A',date='2020-01-01'):
             row=dict(item_name='ФБС 24.4.6',specification='B7.5',category='ФБС',unit='шт',unit_price=price,currency='RUB',vat='с НДС',delivery='доставка включена',region='Воронежская область',minimum_batch='10',price_date=date,valid_until='2099-01-01',supplier_name=name,email=email)
             return (';'.join(keys)+'\n'+';'.join(row.get(k,'') for k in keys)+'\n').encode()
-        for price,email,name,date in [('112','a@example.test','ТЕСТ Прайс A','2026-09-27'),('88','b@example.test','ТЕСТ Прайс B','2026-09-27'),('125','a@example.test','ТЕСТ Прайс A','2026-09-28')]:
+        for price,email,name,date in [('112','a@example.test','ТЕСТ Прайс A','2020-01-01'),('88','b@example.test','ТЕСТ Прайс B','2020-01-01'),('125','a@example.test','ТЕСТ Прайс A','2020-01-02')]:
             preview=request('POST','/api/procurement/catalog/preview',files={'file':('price.csv',csv(price,email,name,date))})
             check('all financial fields validated',len(preview['rows'])==1 and not preview['errors'])
             applied=request('POST',f"/api/procurement/catalog/{preview['preview_id']}/apply",json={'confirmed':True})
@@ -93,6 +93,8 @@ def accept(url,credentials,capture,reference):
         image=io.BytesIO();Image.new('RGB',(20,20),'white').save(image,'PNG')
         word=io.BytesIO()
         with zipfile.ZipFile(word,'w') as z:
+            z.writestr('[Content_Types].xml','<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>')
+            z.writestr('_rels/.rels','<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>')
             z.writestr('word/document.xml','<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>001230040500 — 0 — 10</w:t></w:r></w:p></w:body></w:document>')
         pdf=Path(__file__).parents[1]/'tests/fixtures/russian_scan.pdf'
         for name,data,marker in [('original.png',image.getvalue(),None),('original.docx',word.getvalue(),'001230040500'),('original.pdf',pdf.read_bytes(),None)]:

@@ -3,7 +3,7 @@ const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('nod
 const source=fs.readFileSync('procurement/static/procurement.js','utf8');
 const noop=()=>{},nodes={};
 const ctx={pages:{},state:{selectedLot:2,outbox:[{id:1,lot_id:3,body:'ПБ'},{id:2,lot_id:2,body:'ФБС'}]},
-  showView:noop,renderLots:noop,renderProjects:noop,openLot:noop,renderRfq:noop,renderDocuments:noop,renderPricebook:noop,showModalForm:noop,
+  showView:noop,renderOverview:noop,renderLots:noop,renderProjects:noop,openLot:noop,renderRfq:noop,renderDocuments:noop,renderPricebook:noop,showModalForm:noop,
   document:{querySelectorAll:()=>[],querySelector:()=>null},$:k=>nodes[k],esc:s=>String(s),console};
 vm.createContext(ctx);vm.runInContext(source,ctx);
 assert.deepEqual(JSON.parse(JSON.stringify(ctx.filteredProcurementMessages(2))),[{id:2,lot_id:2,body:'ФБС'}]);

@@ -175,12 +175,15 @@ class Catalog:
 
     def prices(self,query='',specification=''):
         rows=self.db.all('''SELECT p.*,s.name AS supplier_name,s.rating AS reliability,s.active
-            FROM supplier_catalog_prices p JOIN suppliers s ON s.id=p.supplier_id ORDER BY p.id DESC LIMIT 5000''')
+            FROM supplier_catalog_prices p JOIN suppliers s ON s.id=p.supplier_id ORDER BY p.price_date DESC,p.id DESC LIMIT 5000''')
         rows=[r for r in rows if normalize(query) in normalize(r['item_name']+' '+r['category']) and normalize(specification) in normalize(r['specification'])]
         # One current offer per supplier; older prices remain visible as history.
         current={};seen=set()
         for r in rows:
             key=(r['supplier_id'],normalize(r['item_name']),normalize(r['specification']),normalize(r['unit']),r['currency'],r['vat'],normalize(r['region']),normalize(r['delivery']),r['minimum_batch'])
+            if r['price_date']>date.today().isoformat():
+                r['current']=False
+                continue
             r['current']=key not in seen and bool(r['active']) and (not r['valid_until'] or r['valid_until']>=date.today().isoformat())
             seen.add(key)
             if r['current'] and r['vat'] and r['delivery'] and r['valid_until']:current[key]=r
