@@ -165,15 +165,23 @@ class Catalog:
             doc=conn.execute('SELECT * FROM source_documents WHERE id=?',(data['document_id'],)).fetchone()
             if not doc:raise ConflictError('Исходный прайс отсутствует')
             self.launch.document_file(dict(doc))
+            owner=conn.execute('SELECT * FROM suppliers WHERE id=?',(doc['supplier_id'],)).fetchone() if doc['supplier_id'] else None
+            if doc['supplier_id'] and not owner:raise ConflictError('Владелец исходного прайса отсутствует')
             report={'added':0,'skipped':0,'errors':data['errors']}
             fields=('item_name','specification','category','unit','unit_price','currency','vat','delivery','region','minimum_batch','price_date','valid_until')
             for values in data['rows']:
+                if owner:
+                    if normalize(values['supplier_name'])!=normalize(owner['name']) or any(
+                        values[field] and normalize(values[field])!=normalize(owner[field])
+                        for field in ('tax_id','email')) or (values['phone'] and
+                        re.sub(r'\D','',values['phone'])!=re.sub(r'\D','',owner['phone'])):
+                        raise ConflictError('Поставщик в строке не совпадает с владельцем исходного прайса; нужна ручная проверка')
                 previous=conn.execute('SELECT * FROM supplier_catalog_prices WHERE source_document_id=? AND source_sheet=? AND source_row=?',(data['document_id'],data['sheet'],values['source_row'])).fetchone()
                 if previous:
                     if any(previous[k]!=values[k] for k in fields):
                         raise ConflictError('Строка этого исходника уже импортирована с другими данными; загрузите новую версию прайса')
                     report['skipped']+=1;continue
-                sid=self._supplier(conn,values)
+                sid=owner['id'] if owner else self._supplier(conn,values)
                 conn.execute('INSERT INTO supplier_catalog_prices(supplier_id,source_document_id,source_sheet,source_row,'+','.join(fields)+',created_at) VALUES ('+','.join('?' for _ in range(len(fields)+5))+')',
                     (sid,data['document_id'],data['sheet'],values['source_row'],*(values[k] for k in fields),utcnow()))
                 report['added']+=1

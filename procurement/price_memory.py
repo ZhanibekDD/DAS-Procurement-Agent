@@ -186,7 +186,7 @@ class PriceMemory:
             source_offers=defaultdict(list)
             for h in history:
                 if h[0]['source_document_id']:
-                    source_offers[(h[0]['supplier_id'],h[0]['source_document_id'],h[1])].append(h)
+                    source_offers[(h[0]['supplier_id'],h[0]['source_document_id'])].append(h)
             duplicate_ids=set(); ambiguous_source_ids=set()
             for offers in source_offers.values():
                 # One original is not a new price event just because another

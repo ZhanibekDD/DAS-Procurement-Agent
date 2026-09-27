@@ -139,7 +139,8 @@ def send(workflow, mid, confirmed):
             if previous['status'] != 'failed' or previous['payload_sha256'] != fingerprint:
                 raise ConflictError('Исход отправки не подтверждён либо отправка выполняется; повтор запрещён до проверки сервера')
         flow=ProcurementFlow(service)
-        if flow.approval_required(conn,message['lot_id'],'staff') and not flow.admin_approval_valid(conn,message):
+        from .identity import trusted_role
+        if flow.approval_required(conn,message['lot_id'],trusted_role()) and not flow.admin_approval_valid(conn,message):
             raise ConflictError('Требуется согласование текущего правила закупки администратором')
         approval = conn.execute('SELECT * FROM outbox_approvals WHERE message_id=?', (mid,)).fetchone()
         if (message['channel'] != 'email' or message['status'] not in {'approved','failed'} or not approval

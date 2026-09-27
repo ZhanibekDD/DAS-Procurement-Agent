@@ -355,6 +355,25 @@ def test_current_rule_rejects_stale_staff_approval_until_admin_reconfirms(workfl
         assert len(smtp.messages)==1
 
 
+def test_final_smtp_guard_uses_verified_current_admin_role(workflow,monkeypatch):
+    from procurement.identity import authenticated_role
+    db,s,w=workflow;lot,supplier=fbs(s);p,c=campaign(s,lot,supplier);mid=c['messages'][0]['id']
+    s.approve_message(mid,'staff-a')
+    with db.connection() as conn:
+        conn.execute("INSERT INTO procurement_policy VALUES(1,NULL,'RUB','[\"admin\"]','current')")
+    with CaptureSMTP() as smtp:
+        smtp_env(monkeypatch,smtp)
+        context=authenticated_role.set('admin')
+        try:
+            with pytest.raises(ConflictError,match='администратором'):w.send(mid,True)
+            assert not smtp.messages
+            s.approve_message(mid,'admin',admin_policy_approval=True)
+            assert w.send(mid,True)['accepted_by_smtp']
+            assert len(smtp.messages)==1
+        finally:
+            authenticated_role.reset(context)
+
+
 @pytest.mark.parametrize('kind',['csv','xlsx','pdf','mail'])
 def test_global_price_import_reuses_provided_owned_bytes_without_reassigning_acl(http_boundary,monkeypatch,kind):
     import procurement.app as app
@@ -387,6 +406,29 @@ def test_global_price_import_reuses_provided_owned_bytes_without_reassigning_acl
     assert preview['document_id']==doc['id']
     assert db.one('SELECT * FROM source_documents WHERE id=?',(doc['id'],))==original
     assert LaunchWorkflow(app.service).document_file(doc).path.read_bytes()==raw
+
+
+@pytest.mark.parametrize('supplier_name,email,allowed',[
+    ('Поставщик A','a@example.test',True),
+    ('Поставщик B','b@example.test',False),
+    ('Поставщик A','b@example.test',False),
+])
+def test_owned_price_source_cannot_be_assigned_to_another_supplier(workflow,supplier_name,email,allowed):
+    db,s,w=workflow
+    owner=s.create_supplier(SupplierCreate(name='Поставщик A',email='a@example.test',region='Воронежская область'))
+    raw=price_csv(supplier=supplier_name,email=email)
+    doc=s.register_source_document(filename='owned-price.csv',content=raw,document_type='price_list',supplier_id=owner['id'])
+    catalog=Catalog(s,w);preview=catalog.price_preview(doc,read_table(raw,'owned-price.csv'))
+    assert not preview['errors']
+    if allowed:
+        assert catalog.apply_prices(preview['preview_id'],True)['added']==1
+        assert db.one('SELECT supplier_id FROM supplier_catalog_prices')['supplier_id']==owner['id']
+    else:
+        with pytest.raises(ConflictError,match='владельцем исходного прайса'):
+            catalog.apply_prices(preview['preview_id'],True)
+        assert not db.one('SELECT * FROM supplier_catalog_prices')
+        if email!='a@example.test':assert not db.one('SELECT * FROM suppliers WHERE email=?',(email,))
+    assert db.one('SELECT supplier_id FROM source_documents WHERE id=?',(doc['id'],))['supplier_id']==owner['id']
 
 
 def test_http_mail_catalog_workbook_views_acl_range(http_boundary):

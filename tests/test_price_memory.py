@@ -142,7 +142,7 @@ def test_same_source_registered_twice_is_not_a_new_price_event(workflow,second_p
     db,s,w=workflow;price(workflow,pdate='2026-09-01')
     with db.connection() as conn:
         row=dict(conn.execute('SELECT * FROM supplier_catalog_prices').fetchone())
-        row.pop('id');row['unit_price']=second_price;row['created_at']='2026-09-20T00:00:00+00:00';row['source_row']=int(row['source_row'])+1
+        row.pop('id');row['unit_price']=second_price;row['created_at']='2026-09-20T00:00:00+00:00';row['source_row']=int(row['source_row'])+1;row['price_date']='2026-09-20'
         conn.execute('INSERT INTO supplier_catalog_prices('+','.join(row)+') VALUES('+','.join('?' for _ in row)+')',tuple(row.values()))
     result=PriceMemory(s).search('ФБС',today=TODAY)
     assert result['total']==2 and not result['alerts']

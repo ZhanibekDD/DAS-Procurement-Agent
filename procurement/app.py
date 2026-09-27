@@ -60,7 +60,7 @@ from .table_ingest import MAX_FILE, read_table
 from .upload_io import staged_upload, UploadBodyLimit, upload_request, UploadTooLarge, MAX_BATCH
 from .passwords import verify_password
 from .service import ConflictError, NotFoundError, ProcurementService
-from .identity import authenticated_actor, trusted_actor
+from .identity import authenticated_actor, authenticated_role, trusted_actor
 from . import sso
 
 
@@ -136,10 +136,12 @@ async def das_identity_boundary(request: Request, call_next):
         if upload_request(request.scope) and not actor and (settings.environment=='production' or settings.api_key or settings.local_auth_configured):
             return JSONResponse({'detail':'access denied'},status_code=403)
         context = authenticated_actor.set(actor)
+        role_context=authenticated_role.set(claims.get('role','staff') if claims else 'staff')
         try:
             return await call_next(request)
         finally:
             authenticated_actor.reset(context)
+            authenticated_role.reset(role_context)
     path = request.url.path
     if path in {"/login", "/auth/login"}:
         return JSONResponse({"detail": "local login is disabled; use DAS SSO"}, status_code=404)
@@ -171,10 +173,12 @@ async def das_identity_boundary(request: Request, call_next):
                     or not hmac.compare_digest(principal["csrf"], csrf)):
                 raise sso.SSOError(403)
         context = authenticated_actor.set(principal["sub"])
+        role_context=authenticated_role.set(principal.get('role','staff'))
         try:
             response = await call_next(request)
         finally:
             authenticated_actor.reset(context)
+            authenticated_role.reset(role_context)
         if not getattr(request.state, "sso_logout", False):
             _set_sso_session(response, principal)
         response.headers["Cache-Control"] = "no-store"
