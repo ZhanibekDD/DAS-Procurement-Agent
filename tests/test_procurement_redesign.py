@@ -280,6 +280,28 @@ def test_real_http_preview_send_inline_policy_deny_and_wrong_lot(http_boundary,m
     assert client.post(f'/api/outbox/{mid2}/approve',headers=h,json={'approved_by':'forged admin'}).status_code==409
 
 
+def test_ordered_decision_is_immutable_and_same_order_is_idempotent(http_boundary):
+    from procurement.models import QuoteCreate
+    import procurement.app as app
+    client,a,settings,db=http_boundary;u=login(client,a);h=headers(u)
+    lot,supplier=fbs(app.service)
+    quotes=[app.service.add_quote(lot['id'],QuoteCreate(supplier_id=supplier['id'],currency='RUB',vat_included=True,
+            items=[{'lot_item_id':item['id'],'unit_price':price} for item in lot['items']])) for price in (100,120)]
+    path=f"/api/procurement/lots/{lot['id']}/decision"
+    chosen={'quote_id':quotes[0]['id']}
+    assert client.post(path,headers=h,json={**chosen,'stage':'awarded'}).status_code==200
+    assert client.post(path,headers=h,json={**chosen,'stage':'ordered'}).status_code==200
+    original=db.one('SELECT * FROM procurement_decisions WHERE lot_id=?',(lot['id'],))
+    audit=db.all("SELECT * FROM audit_log WHERE action LIKE 'procurement_%'")
+    for qid,stage in ((quotes[0]['id'],'awarded'),(quotes[1]['id'],'awarded'),(quotes[1]['id'],'ordered')):
+        response=client.post(path,headers=h,json={'quote_id':qid,'stage':stage})
+        assert response.status_code==409 and 'Заказ уже зафиксирован' in response.json()['detail']
+    assert client.post(path,headers=h,json={**chosen,'stage':'ordered'}).status_code==200
+    assert db.one('SELECT * FROM procurement_decisions WHERE lot_id=?',(lot['id'],))==original
+    assert db.all("SELECT * FROM audit_log WHERE action LIKE 'procurement_%'")==audit
+    assert app.service.get_lot(lot['id'])['status']=='ordered'
+
+
 def test_http_mail_catalog_workbook_views_acl_range(http_boundary):
     client,a,settings,db=http_boundary;u=login(client,a);h=headers(u)
     mail=EmailMessage();mail['From']='untrusted@example.test';mail['To']='test@example.test';mail.set_content('Прайс')

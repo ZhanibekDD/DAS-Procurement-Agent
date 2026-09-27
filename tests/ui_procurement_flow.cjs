@@ -8,6 +8,9 @@ const ctx={pages:{},state:{selectedLot:2,outbox:[{id:1,lot_id:3,body:'ПБ'},{id
 vm.createContext(ctx);vm.runInContext(source,ctx);
 assert.deepEqual(JSON.parse(JSON.stringify(ctx.filteredProcurementMessages(2))),[{id:2,lot_id:2,body:'ФБС'}]);
 assert.equal(ctx.procurementStage({status:'ordered'}),5);assert.equal(ctx.procurementStage({status:'rfq_sent'}),1);
+assert(!ctx.procurementDecisionControls({id:2,status:'ordered'},[{id:1,supplier_name:'Тест'}]).includes('onclick'));
+assert(ctx.procurementDecisionControls({id:2,status:'ordered'},[]).includes('Заказ уже зафиксирован'));
+assert(ctx.procurementDecisionControls({id:2,status:'comparison'},[{id:1,supplier_name:'Тест'}]).includes('chooseProcurement'));
 for(const s of ['snapshot_sha256:p.snapshot_sha256','preview_sha256:p.preview_sha256','p.items.some(i=>i.lot_id!==lid)','epoch!==purchasing.epoch','lid!==state.selectedLot',"fd.set('expected_sha256',preview.sha256)",'data-price-remove','Подтверждаю корректные строки'])assert(source.includes(s),s);
 assert(!source.includes('showPdfPricePreview({...${JSON.stringify'));
 const index=fs.readFileSync('procurement/static/index.html','utf8');

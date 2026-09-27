@@ -143,6 +143,10 @@ def install(app,settings,service,launch,require_access,write_access,session_clai
             conn.execute('BEGIN IMMEDIATE')
             if not conn.execute('SELECT 1 FROM quotes WHERE id=? AND lot_id=?',(data.quote_id,lid)).fetchone():raise HTTPException(409,'КП не принадлежит закупке')
             previous=conn.execute('SELECT * FROM procurement_decisions WHERE lot_id=?',(lid,)).fetchone()
+            if previous and previous['stage']=='ordered':
+                if data.stage=='ordered' and previous['quote_id']==data.quote_id:
+                    return service.get_lot(lid)  # idempotent, no rewritten order/audit
+                raise HTTPException(409,'Заказ уже зафиксирован. Изменение поставщика или отмена требуют отдельной подтверждённой корректировки')
             if data.stage=='ordered' and (not previous or previous['quote_id']!=data.quote_id):raise HTTPException(409,'Сначала выберите поставщика')
             conn.execute('INSERT OR REPLACE INTO procurement_decisions VALUES (?,?,?,?,?)',(lid,data.quote_id,data.stage,trusted_actor(),utcnow()))
             conn.execute('UPDATE lots SET status=? WHERE id=?',(data.stage,lid))
