@@ -120,6 +120,7 @@ _READ_ONLY_GET = (
     r"/api/imports(?:/\d+)?", r"/api/supplier-drafts", r"/api/price-history-entries", r"/assets/[^/]+",
     r"/api/launch/config", r"/api/launch/suppliers(?:/\d+)?", r"/api/launch/imports",
     r"/api/launch/documents/\d+/download",
+    r"/api/procurement/(?:catalog|policy|projects/\d+|documents/\d+/view)",
 )
 
 
@@ -495,6 +496,8 @@ def index(
     launch_digest = hashlib.sha256((path.parent / "launch.js").read_bytes()).hexdigest()
     content = content.replace('src="/assets/launch.js"',
                               'src="/assets/launch.js?v=' + launch_digest + '"')
+    flow_digest = hashlib.sha256((path.parent / 'procurement.js').read_bytes()).hexdigest()
+    content = content.replace('src="/assets/procurement.js"','src="/assets/procurement.js?v='+flow_digest+'"')
     if not settings.sso_enabled and session_token:
         csrf = hmac.new(settings.auth_secret.encode(), ('launch:' + session_token).encode(), hashlib.sha256).hexdigest()
         content = content.replace('<head>', '<head><meta name="procurement-launch-csrf" content="' + csrf + '">')
@@ -748,8 +751,14 @@ def list_outbox(
 
 
 @app.post("/api/outbox/{message_id}/approve", dependencies=[Depends(require_access)])
-def approve_message(message_id: int, decision: ApprovalDecision):
+def approve_message(message_id: int, decision: ApprovalDecision, request: Request):
     try:
+        from .procurement_flow import ProcurementFlow
+        principal=getattr(request.state,'das_principal',{}) or _session_claims(request.cookies.get('procurement_session','')) or {}
+        with service.db.connection() as conn:
+            message=service._outbox_context(conn,message_id)
+            if ProcurementFlow(service).approval_required(conn,message['lot_id'],'staff') and principal.get('role')!='admin':
+                raise ConflictError('Согласование правила закупки доступно администратору')
         return service.approve_message(message_id, decision.approved_by, decision.comment)
     except Exception as exc:
         raise handle_domain_error(exc) from exc

@@ -400,6 +400,8 @@ class LaunchWorkflow:
         with self.db.connection() as conn:
             conn.execute('BEGIN IMMEDIATE')
             message = self.service._outbox_context(conn,message_id)
+            from .procurement_flow import validate_message
+            validate_message(conn,message)
             fingerprint = message_fingerprint(message)
             previous = conn.execute('SELECT * FROM mail_deliveries WHERE message_id=?',(message_id,)).fetchone()
             if previous:
@@ -456,5 +458,6 @@ class LaunchWorkflow:
         with self.db.connection() as conn:
             conn.execute("UPDATE mail_deliveries SET status='sent',updated_at=? WHERE message_id=?",(utcnow(),message_id))
             conn.execute("UPDATE outbox_messages SET status='sent' WHERE id=?",(message_id,))
+            conn.execute("UPDATE lots SET status='rfq_sent' WHERE id=(SELECT lot_id FROM campaigns WHERE id=?)",(message['campaign_id'],))
             self.db.audit('mail_sent','outbox_message',message_id,details={'attachment_count':len(message.get('attachments',[]))},conn=conn)
         return {'status':'sent','message_id':message_id,'attachment_count':len(message.get('attachments',[])),'accepted_by_smtp':True}

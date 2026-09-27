@@ -25,7 +25,7 @@ jobs:
       - name: Run unit tests
         run: python -m pytest -q
       - name: Check launch JavaScript
-        run: node --check procurement/static/launch.js && node tests/ui_launch_guards.cjs && node tests/ui_review_helpers.cjs && node tests/ui_refresh_guard.cjs && node tests/ui_upload_limit.cjs && node tests/ui_supplier_ocr.cjs
+        run: node --check procurement/static/launch.js && node --check procurement/static/procurement.js && node tests/ui_launch_guards.cjs && node tests/ui_review_helpers.cjs && node tests/ui_refresh_guard.cjs && node tests/ui_upload_limit.cjs && node tests/ui_supplier_ocr.cjs && node tests/ui_procurement_flow.cjs
       - name: Compile Python sources
         run: python -m compileall -q procurement tests
 

@@ -317,7 +317,17 @@ class ProcurementService:
         return self.db.all("SELECT * FROM templates ORDER BY code")
 
     def create_campaign(self, lot_id: int, data: CampaignCreate) -> dict[str, Any]:
+        from .procurement_flow import lot_snapshot, items_text as snapshot_items_text, bind_campaign, validate_rendered_items
+        if data.preview_sha256:
+            from .procurement_flow import ProcurementFlow
+            if ProcurementFlow(self).preview(lot_id,data)['preview_sha256'] != data.preview_sha256:
+                raise ConflictError('Предпросмотр изменился; проверьте новый текст и получателей')
+        with self.db.connection() as snapshot_conn:
+            snapshot = lot_snapshot(snapshot_conn,lot_id,data.item_ids)
+        if data.snapshot_sha256 and payload_sha256(snapshot) != data.snapshot_sha256:
+            raise ConflictError('Выбранный лот изменился; обновите предпросмотр')
         lot = self.get_lot(lot_id)
+        lot['items'] = snapshot['items']
         project = self.get_project(lot["project_id"])
         cluster = self._confirmed_cluster(lot["cluster"], project["cluster"])
         template = self.db.one("SELECT * FROM templates WHERE code = ?", (data.template_code,))
@@ -380,6 +390,10 @@ class ProcurementService:
                     render_template(template["body"], context),
                 )
             )
+        items_text_current = snapshot_items_text(snapshot)
+        if items_text_current != items_text:
+            raise ConflictError('Состав запроса не совпадает с immutable snapshot')
+        for _,_,_,body in prepared:validate_rendered_items(snapshot,body)
         fingerprint = payload_sha256({"lot_id": lot_id, "project_id": project["id"], "cluster": cluster,
             "template_code": data.template_code, "template_version": template["version"], "channel": data.channel,
             "attachments": lot.get('attachments', []),
@@ -389,6 +403,8 @@ class ProcurementService:
         expected_messages = sorted((supplier["id"], recipient, subject, body) for supplier, recipient, subject, body in prepared)
         with self.db.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            if payload_sha256(lot_snapshot(conn,lot_id,[i['id'] for i in snapshot['items']])) != payload_sha256(snapshot):
+                raise ConflictError('Лот изменился во время формирования запроса')
             current = conn.execute("""SELECT l.cluster AS lot_cluster,p.cluster AS project_cluster
                 FROM lots l JOIN projects p ON p.id=l.project_id WHERE l.id=?""", (lot_id,)).fetchone()
             if not current or self._confirmed_cluster(current["lot_cluster"], current["project_cluster"]) != cluster:
@@ -398,10 +414,15 @@ class ProcurementService:
             if sorted(lot.get('attachments',[]),key=lambda a:a['document_id']) != current_attachments:
                 raise ConflictError('Вложения изменились; обновите черновик')
             for supplier in suppliers:
-                current_supplier = conn.execute("SELECT cluster,active FROM suppliers WHERE id=?", (supplier["id"],)).fetchone()
+                current_supplier = conn.execute("SELECT * FROM suppliers WHERE id=?", (supplier["id"],)).fetchone()
                 if not current_supplier:
                     raise NotFoundError("supplier not found")
                 self._supplier_cluster(dict(current_supplier), cluster)
+                if any(current_supplier[k] != supplier[k] for k in ('name','email','telegram','max_contact')):
+                    raise ConflictError('Реквизиты поставщика изменились; обновите предпросмотр')
+            current_template = conn.execute('SELECT * FROM templates WHERE code=?',(data.template_code,)).fetchone()
+            if not current_template or any(current_template[k] != template[k] for k in ('subject','body','version')):
+                raise ConflictError('Шаблон изменился; обновите предпросмотр')
 
             def reuse(campaign_id):
                 existing_campaign = conn.execute("SELECT lot_id,template_code,channel FROM campaigns WHERE id=?", (campaign_id,)).fetchone()
@@ -410,6 +431,12 @@ class ProcurementService:
                 if (not existing_campaign or tuple(existing_campaign) != (lot_id, data.template_code, data.channel)
                         or stored_messages != expected_messages):
                     raise ConflictError("stored campaign content changed; fresh human review is required")
+                if not conn.execute('SELECT 1 FROM rfq_snapshots WHERE campaign_id=?',(campaign_id,)).fetchone():
+                    statuses=[r[0] for r in conn.execute('SELECT status FROM outbox_messages WHERE campaign_id=?',(campaign_id,))]
+                    if not data.preview_sha256 or not data.snapshot_sha256 or any(s!='draft' for s in statuses):
+                        raise ConflictError('Архивный запрос требует нового подтверждённого предпросмотра')
+                    bind_campaign(conn,campaign_id,snapshot)
+                    self.db.audit('legacy_draft_reviewed','campaign',campaign_id,conn=conn)
                 return self.get_campaign(campaign_id)
 
             existing = conn.execute("SELECT * FROM campaign_requests WHERE request_key=?", (request_key,)).fetchone()
@@ -449,6 +476,7 @@ class ProcurementService:
                 ).lastrowid
                 conn.executemany('INSERT INTO outbox_attachments VALUES (?,?,?,?,?)',
                     [(message_id,a['document_id'],a['filename'],a['sha256'],a['size_bytes']) for a in lot.get('attachments',[])])
+            bind_campaign(conn,campaign_id,snapshot)
             conn.execute("UPDATE lots SET status = 'rfq_draft' WHERE id = ?", (lot_id,))
             self.db.audit(
                 "drafted",
@@ -1013,7 +1041,7 @@ class ProcurementService:
         if not len(content):raise ValueError('Файл пуст')
         suffix = Path(filename).suffix.lower()
         from .table_ingest import safe_upload
-        if suffix not in {".pdf", ".xlsx", ".csv", ".docx"}:
+        if suffix not in {".pdf", ".xlsx", ".csv", ".docx", '.png', '.jpg', '.jpeg'}:
             raise ValueError("only PDF, DOCX, XLSX and CSV documents are supported")
         if suffix == ".pdf" and not content.startswith(b"%PDF-"):
             raise ValueError("invalid PDF payload")
@@ -1021,7 +1049,14 @@ class ProcurementService:
             raise ValueError("invalid Office document payload")
         # Legacy batch callers supply source-relative names, never destinations.
         filename = filename.replace('\\', '/').rsplit('/', 1)[-1]
-        safe_upload(content, filename, {'.pdf','.xlsx','.csv','.docx'})
+        safe_upload(content, filename, {'.pdf','.xlsx','.csv','.docx','.png','.jpg','.jpeg'})
+        if suffix in {'.png','.jpg','.jpeg'}:
+            from PIL import Image
+            from .upload_io import open_payload
+            with open_payload(content) as image_stream, Image.open(image_stream) as image:
+                if image.format not in {'PNG','JPEG'} or image.width*image.height>40_000_000:
+                    raise ValueError('Недопустимое или слишком большое изображение')
+                image.verify()
         if project_id is not None:
             self.get_project(project_id)
         if supplier_id is not None:

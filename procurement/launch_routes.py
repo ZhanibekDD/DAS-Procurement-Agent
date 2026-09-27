@@ -169,3 +169,6 @@ def install(app, settings, service, launch, require_access, session_claims, doma
         if not getattr(request.state,'das_principal',None) and not session_claims(request.cookies.get('procurement_session','')):
             raise HTTPException(403,'Отправка требует личной сессии сотрудника')
         return call(launch.send,mid,data.confirmed)
+
+    from .procurement_routes import install as install_procurement_routes
+    install_procurement_routes(app,settings,service,launch,require_access,write_access,session_claims,domain_error)
