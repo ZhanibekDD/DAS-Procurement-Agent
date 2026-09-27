@@ -109,6 +109,23 @@ def test_global_variant_separator_aliases_share_one_price_history(workflow):
     assert PriceMemory(s).search('ПБ 9.4.6-Т',today=TODAY)['total']==1
 
 
+def test_specification_variant_separator_aliases_share_one_price_history(workflow):
+    _,s,_=workflow
+    for spec,amount,supplier in [('ФБС 9.4.6-Т','100','A'),('ФБС 9.4.6 - Т','110','B'),
+                                 ('ФБС 9.4.6—Т','120','C'),('ФБС 9.4.6-П','1','D'),
+                                 ('ПБ 9.4.6-Т','2','E')]:
+        price(workflow,'Блок фундаментный',amount,supplier,specification=spec)
+    for query in ('ФБС 9.4.6-Т','ФБС 9.4.6 - Т','ФБС 9.4.6—Т'):
+        result=PriceMemory(s).search(query,today=TODAY)
+        assert result['total']==3
+        assert len(result['groups'])==1
+        assert result['groups'][0]['current_stats']==dict(count=3,min='100',median='110',max='120')
+        assert {row['supplier_name'] for row in result['records']}=={'ТЕСТ A','ТЕСТ B','ТЕСТ C'}
+        assert PriceMemory(s).search(specification=query,today=TODAY)['total']==3
+    assert PriceMemory(s).search('ФБС 9.4.6-П',today=TODAY)['total']==1
+    assert PriceMemory(s).search('ПБ 9.4.6-Т',today=TODAY)['total']==1
+
+
 @pytest.mark.parametrize('name,spec,expected',[
     ('ФБС 9.4.6-Т','', 'фбс 9.4.6-т'),
     ('Блок фундаментный','ФБС 9.4.6-П', 'фбс 9.4.6-п'),

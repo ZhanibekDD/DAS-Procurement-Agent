@@ -92,7 +92,7 @@ def stats(values):
 
 
 def basis(row):
-    return (material_key(row['item_name']), normalized(row['specification']), unit_key(row['unit']),
+    return (material_key(row['item_name']), material_key(row['specification']), unit_key(row['unit']),
             row['currency'], vat_key(row['vat']), normalized(row['region']),
             delivery_key(row['delivery']), format(decimal(row['minimum_batch']).normalize(),'f') if decimal(row['minimum_batch']) is not None else '')
 
@@ -177,7 +177,7 @@ class PriceMemory:
             if family_query:
                 primary = re.search(r'(?<!\w)(фбс|пб|фл)(?!\w)', combined)
                 if not primary or primary[1] != family_query[1]:return False
-            return (not query_key or query_key == key or re.search(r'(?<!\w)'+re.escape(query_key)+r'(?!\w)',combined) is not None) and normalized(specification) in normalized(spec) and (not region or normalized(region)==normalized(reg))
+            return (not query_key or query_key == key or re.search(r'(?<!\w)'+re.escape(query_key)+r'(?!\w)',combined) is not None) and material_key(specification) in material_key(spec) and (not region or normalized(region)==normalized(reg))
         records=[]; groups=defaultdict(list); total=0; unread=[]
         with self.db.connection() as conn:
             conn.create_function('memory_matches',3,lambda n,s,r:int(matches(n,s,r)),deterministic=True)
