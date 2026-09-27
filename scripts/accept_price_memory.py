@@ -52,7 +52,7 @@ def accept(url, credentials):
             sources[p['document_id']] = raw
         suppliers = request('GET','/api/suppliers')
         sid = next(s['id'] for s in suppliers if s['email'] == 'memory-b@example.test')
-        project = request('POST','/api/projects',201,json={'name':'ТЕСТ Память ФБС','region':'Воронежская область'})
+        project = request('POST','/api/projects',201,json={'name':'ТЕСТ Память ФБС','region':'Воронежская область','delivery_address':'Тестовый адрес'})
         lot = request('POST','/api/lots',201,json={'project_id':project['id'],'title':'ТЕСТ Память ФБС',
             'region':'Воронежская область','delivery_address':'Тестовый адрес','response_deadline':expiry,
             'items':[{'name':n,'quantity':q,'unit':'шт','specification':'ГОСТ 13579-2018'} for n,q in zip(marks,['218','95','128'])]})
