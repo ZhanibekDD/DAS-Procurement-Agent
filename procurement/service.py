@@ -561,7 +561,7 @@ class ProcurementService:
             row['delivery'] = journal(self.db, row['id'])
         return rows
 
-    def _outbox_context(self, conn, message_id: int) -> dict:
+    def _outbox_record(self, conn, message_id: int) -> dict:
         row = conn.execute("""
             SELECT m.*, c.lot_id, l.cluster AS lot_cluster, p.cluster AS project_cluster,
                    s.cluster AS supplier_cluster, s.active AS supplier_active
@@ -573,6 +573,10 @@ class ProcurementService:
             raise NotFoundError("outbox message not found")
         message = dict(row)
         message['attachments'] = [dict(r) for r in conn.execute('SELECT document_id,filename,sha256,size_bytes FROM outbox_attachments WHERE message_id=? ORDER BY document_id',(message_id,))]
+        return message
+
+    def _outbox_context(self, conn, message_id: int) -> dict:
+        message = self._outbox_record(conn, message_id)
         cluster = self._confirmed_cluster(message["lot_cluster"], message["project_cluster"])
         self._supplier_cluster({"cluster": message["supplier_cluster"], "active": message["supplier_active"]}, cluster)
         return message

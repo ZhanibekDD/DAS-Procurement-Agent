@@ -16,6 +16,7 @@ class CaptureSMTP(socketserver.ThreadingTCPServer):
         self.drop_after_data=drop_after_data
         self.reject_recipient=reject_recipient
         self.quit_failure=quit_failure
+        self.rejection_reply=b'451 test rejection'
         super().__init__(('127.0.0.1',0),SMTPHandler)
 
     def __enter__(self):
@@ -50,7 +51,7 @@ class SMTPHandler(socketserver.StreamRequestHandler):
                     if data==b'.\r\n':break
                     if not data:return
                     lines.append(data[1:] if data.startswith(b'..') else data)
-                if self.server.reject:reply(b'451 test rejection')
+                if self.server.reject:reply(self.server.rejection_reply)
                 else:
                     self.server.raw_messages.append(b''.join(lines))
                     self.server.messages.append(BytesParser(policy=policy.default).parsebytes(b''.join(lines)))

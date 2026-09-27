@@ -4,6 +4,9 @@ import os
 import smtplib
 import ssl
 import uuid
+import base64
+import re
+from datetime import datetime, UTC, timedelta
 from email.message import EmailMessage
 from email.utils import formatdate
 from pathlib import Path
@@ -25,6 +28,7 @@ CREATE TABLE IF NOT EXISTS mail_receipts (
  accepted_recipients_json TEXT NOT NULL DEFAULT '[]', attachments_json TEXT NOT NULL,
  spool_path TEXT, spool_sha256 TEXT, error TEXT,
  sent_copy_status TEXT NOT NULL DEFAULT 'pending', sent_copy_uid TEXT,
+ sent_copy_started_at TEXT, sent_copy_lease TEXT,
  delivery_status TEXT NOT NULL DEFAULT 'unconfirmed');
 CREATE TABLE IF NOT EXISTS mail_events (
  id INTEGER PRIMARY KEY AUTOINCREMENT, message_id INTEGER NOT NULL REFERENCES outbox_messages(id),
@@ -32,6 +36,42 @@ CREATE TABLE IF NOT EXISTS mail_events (
 '''
 
 COPY_WARNING = 'SMTP принял письмо, но копия в “Отправленных” не сохранена'
+COPY_LEASE_SECONDS = 600
+
+
+def copy_lease_expired(row):
+    if row['sent_copy_status'] != 'saving':
+        return False
+    try:
+        started = datetime.fromisoformat(row['sent_copy_started_at'])
+        if started.tzinfo is None:
+            return True
+        return datetime.now(UTC) - started >= timedelta(seconds=COPY_LEASE_SECONDS)
+    except (TypeError, ValueError):
+        # Old interrupted records have no timestamp. Reconcile, never APPEND.
+        return True
+
+
+def smtp_failure_receipt(exc, user='', password=None):
+    """Keep bounded protocol evidence, never AUTH replies/credential echoes."""
+    if isinstance(exc, smtplib.SMTPAuthenticationError):
+        return exc.smtp_code, 'Ответ авторизации скрыт'
+    if isinstance(exc, smtplib.SMTPRecipientsRefused):
+        if len(exc.recipients) != 1:
+            return None, None
+        code, reply = next(iter(exc.recipients.values()))
+    elif isinstance(exc, smtplib.SMTPResponseException):
+        code, reply = exc.smtp_code, exc.smtp_error
+    else:
+        return None, None
+    reply = reply[:4096].decode('utf-8', 'replace') if isinstance(reply, bytes) else str(reply)[:4096]
+    if password:
+        sensitive = [password, base64.b64encode(password.encode()).decode(),
+                     base64.b64encode(('\x00' + user + '\x00' + password).encode()).decode()]
+        for value in sorted(sensitive, key=len, reverse=True):
+            reply = reply.replace(value, '[скрыто]')
+    reply = re.sub(r'[\x00-\x1f\x7f]', ' ', reply)
+    return code, reply[:1000]
 
 
 def encode(value):
@@ -57,10 +97,13 @@ def journal(db, mid):
                 'events': []}
     row.pop('spool_path')  # private disk paths never exposed to the browser
     row.pop('message_id')
+    expired = copy_lease_expired(row)
+    row.pop('sent_copy_lease')
     for key in ('recipients', 'accepted_recipients', 'attachments'):
         row[key] = json.loads(row.pop(key + '_json'))
     row['retry_allowed'] = row['status'] == 'failed'
-    row['copy_retry_allowed'] = row['status'] == 'sent' and row['sent_copy_status'] in {'failed','unknown'}
+    row['copy_retry_allowed'] = row['status'] == 'sent' and (row['sent_copy_status'] in {'failed','unknown'} or expired)
+    row['copy_reconcile_only'] = row['sent_copy_status'] == 'unknown' or expired
     row['warning'] = COPY_WARNING if row['status'] == 'sent' and row['sent_copy_status'] != 'saved' else None
     row['events'] = []
     for item in db.all('SELECT created_at,actor,event,details_json FROM mail_events WHERE message_id=? ORDER BY id', (mid,)):
@@ -127,6 +170,7 @@ def send(workflow, mid, confirmed):
         conn.execute("UPDATE outbox_messages SET status='queued' WHERE id=?", (mid,))
         event(db,conn,mid,'mail_queued',message_id=rfc_id,recipients=[message['recipient']],attachment_count=len(attachments))
     smtp = None
+    user, credential = '', None
     try:
         current = db.one('SELECT * FROM mail_receipts WHERE message_id=?', (mid,))
         path = Path(db.path).resolve().parent / 'mail-spool' / (key + '.eml')
@@ -159,7 +203,8 @@ def send(workflow, mid, confirmed):
             smtp.starttls(context=ssl.create_default_context())
         user = os.getenv('PROCUREMENT_SMTP_USER','')
         if user:
-            smtp.login(user,secret('PROCUREMENT_SMTP'))
+            credential = secret('PROCUREMENT_SMTP')
+            smtp.login(user,credential)
         receipt = submit_spool(smtp,path,sender,message['recipient'])
     except Exception as exc:
         uncertain = isinstance(exc, SubmissionUncertain)
@@ -175,13 +220,14 @@ def send(workflow, mid, confirmed):
             reason = f'SMTP отклонил письмо (код {exc.smtp_code}); письмо не отправлено. Доступен безопасный повтор.'
         elif isinstance(exc, (OSError, smtplib.SMTPServerDisconnected)):
             reason = 'SMTP недоступен или время соединения истекло; письмо не отправлено. Доступен безопасный повтор.'
+        code, reply = smtp_failure_receipt(exc,user,credential)
         with db.connection() as conn:
             conn.execute('UPDATE mail_deliveries SET status=?,updated_at=? WHERE message_id=?',(status,utcnow(),mid))
-            conn.execute('UPDATE mail_receipts SET status=?,error=?,smtp_code=? WHERE message_id=?',
-                         (status,reason,getattr(exc,'smtp_code',None),mid))
+            conn.execute('UPDATE mail_receipts SET status=?,error=?,smtp_code=?,smtp_reply=? WHERE message_id=?',
+                         (status,reason,code,reply,mid))
             conn.execute("UPDATE outbox_messages SET status='failed' WHERE id=?",(mid,))
             event(db,conn,mid,'mail_send_unconfirmed' if uncertain else 'mail_send_failed',
-                  error=reason,error_type=type(exc).__name__,smtp_code=getattr(exc,'smtp_code',None),retry=not uncertain)
+                  error=reason,error_type=type(exc).__name__,smtp_code=code,smtp_reply=reply,retry=not uncertain)
         raise ConflictError(reason) from None
     finally:
         if smtp:
@@ -212,22 +258,30 @@ def copy_sent(workflow, mid, confirmed):
     db = workflow.db
     with db.connection() as conn:
         conn.execute('BEGIN IMMEDIATE')
-        workflow.service._outbox_context(conn, mid)  # existing ACL, never a standalone mail bypass
+        # Route auth/CSRF remains mandatory. Historical archiving is not a new
+        # supplier contact: current outbound eligibility must not block it.
+        workflow.service._outbox_record(conn, mid)
         row = conn.execute('SELECT * FROM mail_receipts WHERE message_id=?', (mid,)).fetchone()
         if not row or row['status'] != 'sent':
             raise ConflictError('Нет сохранённого оригинала принятого SMTP письма; повторная отправка запрещена')
         if row['sent_copy_status'] == 'saved':
             return result(db,mid,duplicate=True)
-        if row['sent_copy_status'] == 'saving':
+        expired = copy_lease_expired(row)
+        if row['sent_copy_status'] == 'saving' and not expired:
             raise ConflictError('Сохранение копии уже выполняется; SMTP-повтор запрещён')
-        reconcile = row['sent_copy_status'] == 'unknown'
-        conn.execute("UPDATE mail_receipts SET sent_copy_status='saving' WHERE message_id=?",(mid,))
+        reconcile = row['sent_copy_status'] == 'unknown' or expired
+        lease = uuid.uuid4().hex
+        conn.execute("UPDATE mail_receipts SET sent_copy_status='saving',sent_copy_started_at=?,sent_copy_lease=? WHERE message_id=?",
+                     (utcnow(),lease,mid))
+        if expired:
+            event(db,conn,mid,'mail_sent_copy_reconcile',append_allowed=False,smtp_resend=False)
     try:
         outcome = archive_sent(row['spool_path'],row['spool_sha256'],row['rfc_message_id'],reconcile_only=reconcile)
     except Exception as exc:
         outcome = {'status': 'unknown' if isinstance(exc, ArchiveUncertain) or reconcile else 'failed','uid':None}
     with db.connection() as conn:
-        conn.execute('UPDATE mail_receipts SET sent_copy_status=?,sent_copy_uid=? WHERE message_id=?',
-                     (outcome['status'],outcome['uid'],mid))
-        event(db,conn,mid,'mail_sent_copy',status=outcome['status'],smtp_resend=False)
+        changed = conn.execute('UPDATE mail_receipts SET sent_copy_status=?,sent_copy_uid=?,sent_copy_lease=NULL WHERE message_id=? AND sent_copy_lease=?',
+                     (outcome['status'],outcome['uid'],mid,lease)).rowcount
+        if changed:
+            event(db,conn,mid,'mail_sent_copy',status=outcome['status'],smtp_resend=False)
     return result(db,mid)

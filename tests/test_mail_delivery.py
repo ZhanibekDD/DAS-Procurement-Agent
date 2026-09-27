@@ -2,6 +2,8 @@ import hashlib
 import json
 import socket
 import os
+import smtplib
+from datetime import datetime, UTC, timedelta
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path
@@ -14,6 +16,7 @@ from smtp_capture import CaptureSMTP
 from imap_capture import CaptureIMAP
 from procurement.mail_delivery import copy_sent, journal, COPY_WARNING
 from procurement.service import ConflictError
+from procurement.mail_delivery import COPY_LEASE_SECONDS, smtp_failure_receipt
 
 
 def imap_env(monkeypatch, server, tmp_path):
@@ -121,6 +124,87 @@ def test_recipient_rejected_means_no_submission(workflow,monkeypatch):
         smtp_env(monkeypatch,smtp)
         with pytest.raises(ConflictError,match='отклонил получателя'):w.send(m['id'],True)
         assert journal(db,m['id'])['status']=='failed' and not smtp.messages
+        assert journal(db,m['id'])['smtp_code']==550
+        assert journal(db,m['id'])['smtp_reply']=='recipient refused'
+
+
+@pytest.mark.parametrize('server_already_saved',[False,True])
+def test_abandoned_copy_lease_only_searches_never_appends(workflow,monkeypatch,tmp_path,server_already_saved):
+    db,s,w=workflow;m,_=prepare(workflow)
+    with CaptureSMTP() as smtp,CaptureIMAP(reject_append=not server_already_saved) as imap:
+        smtp_env(monkeypatch,smtp);imap_env(monkeypatch,imap,tmp_path)
+        w.send(m['id'],True)
+        previous_appends=imap.append_calls
+        started=(datetime.now(UTC)-timedelta(seconds=COPY_LEASE_SECONDS+1)).isoformat()
+        with db.connection() as conn:
+            conn.execute("UPDATE mail_receipts SET sent_copy_status='saving',sent_copy_started_at=?,sent_copy_lease='dead-worker'",(started,))
+        assert journal(db,m['id'])['copy_retry_allowed']
+        imap.reject_append=False
+        value=copy_sent(w,m['id'],True)
+        assert value['delivery']['sent_copy_status']==('saved' if server_already_saved else 'unknown')
+        assert imap.append_calls==previous_appends and len(smtp.messages)==1
+        assert 'sent_copy_lease' not in value['delivery']
+
+
+def test_active_copy_lease_blocked_and_legacy_abandoned_copy_recoverable(workflow,monkeypatch,tmp_path):
+    db,s,w=workflow;m,_=prepare(workflow)
+    with CaptureSMTP() as smtp,CaptureIMAP() as imap:
+        smtp_env(monkeypatch,smtp);imap_env(monkeypatch,imap,tmp_path);w.send(m['id'],True)
+        with db.connection() as conn:
+            conn.execute("UPDATE mail_receipts SET sent_copy_status='saving',sent_copy_started_at=?,sent_copy_lease='live-worker'",(datetime.now(UTC).isoformat(),))
+        assert not journal(db,m['id'])['copy_retry_allowed']
+        with pytest.raises(ConflictError,match='уже выполняется'):copy_sent(w,m['id'],True)
+        with db.connection() as conn:conn.execute('UPDATE mail_receipts SET sent_copy_started_at=NULL')
+        assert copy_sent(w,m['id'],True)['delivery']['sent_copy_status']=='saved'
+        assert imap.append_calls==1 and len(smtp.messages)==1
+
+
+def test_copy_after_supplier_soft_delete_does_not_relax_send(workflow,monkeypatch,tmp_path):
+    db,s,w=workflow;m,_=prepare(workflow)
+    with CaptureSMTP() as smtp,CaptureIMAP(reject_append=True) as imap:
+        smtp_env(monkeypatch,smtp);imap_env(monkeypatch,imap,tmp_path)
+        w.send(m['id'],True)
+        current=w.supplier(m['supplier_id'])
+        w.supplier_state(m['supplier_id'],False,current['revision'],True)
+        imap.reject_append=False
+        assert copy_sent(w,m['id'],True)['delivery']['sent_copy_status']=='saved'
+        assert len(smtp.messages)==len(imap.messages)==1
+        with pytest.raises(ValueError,match='inactive supplier'):w.send(m['id'],True)
+
+
+def test_definite_data_failure_retains_bounded_reply_in_receipt_and_audit(workflow,monkeypatch):
+    db,s,w=workflow;m,_=prepare(workflow)
+    with CaptureSMTP(reject=True) as smtp:
+        smtp.rejection_reply=b'451 temporary queue rejection '+b'x'*1500
+        smtp_env(monkeypatch,smtp)
+        with pytest.raises(ConflictError,match='451'):w.send(m['id'],True)
+        info=journal(db,m['id'])
+        assert info['smtp_code']==451 and info['smtp_reply'].startswith('temporary queue rejection')
+        assert len(info['smtp_reply'])==1000 and info['retry_allowed']
+        failure=next(e for e in info['events'] if e['event']=='mail_send_failed')
+        assert failure['details']['smtp_reply']==info['smtp_reply']
+
+
+def test_smtp_protocol_receipt_never_exposes_auth_reply_or_secret_echo():
+    import base64
+    password='secret-provider-test'
+    assert smtp_failure_receipt(smtplib.SMTPAuthenticationError(535,password.encode()))==(535,'Ответ авторизации скрыт')
+    encoded=base64.b64encode(password.encode()).decode()
+    code,reply=smtp_failure_receipt(smtplib.SMTPDataError(451,f'rejected {password} {encoded}\x00'.encode()),'staff',password)
+    assert code==451 and password not in reply and encoded not in reply and '\x00' not in reply
+
+
+def test_copy_lease_migration_preserves_existing_receipt(workflow,monkeypatch):
+    db,s,w=workflow;m,_=prepare(workflow)
+    with CaptureSMTP() as smtp:
+        smtp_env(monkeypatch,smtp);w.send(m['id'],True)
+        original=journal(db,m['id'])['rfc_message_id']
+    with db.connection() as conn:
+        conn.execute('ALTER TABLE mail_receipts DROP COLUMN sent_copy_started_at')
+        conn.execute('ALTER TABLE mail_receipts DROP COLUMN sent_copy_lease')
+    db.initialize()
+    assert journal(db,m['id'])['rfc_message_id']==original
+    assert db.one('PRAGMA quick_check')['quick_check']=='ok'
 
 
 def test_legacy_receipt_is_honest_and_never_resent(workflow,monkeypatch):

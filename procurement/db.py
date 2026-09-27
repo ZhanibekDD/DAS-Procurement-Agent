@@ -397,6 +397,10 @@ class Database:
     @staticmethod
     def _migrate_columns(conn: sqlite3.Connection) -> None:
         additions = {
+            "mail_receipts": (
+                ("sent_copy_started_at", "TEXT"),
+                ("sent_copy_lease", "TEXT"),
+            ),
             "quotes": (
                 ("source_document_id", "INTEGER REFERENCES source_documents(id) ON DELETE SET NULL"),
                 ("price_date", "TEXT"),
