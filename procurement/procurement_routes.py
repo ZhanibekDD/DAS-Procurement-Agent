@@ -214,6 +214,10 @@ def install(app,settings,service,launch,require_access,write_access,session_clai
         headers={'Cache-Control':'no-store','X-Content-Type-Options':'nosniff',
             'Content-Security-Policy':"default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'self'; sandbox allow-same-origin"}
         if suffix in {'.pdf','.png','.jpg','.jpeg'}:
+            # Chromium's native PDF viewer is disabled by CSP sandbox. Only
+            # immutable, validated binary types use this route; Office HTML
+            # retains the sandbox below. Auth and same-origin framing remain.
+            headers['Content-Security-Policy']="default-src 'none'; frame-ancestors 'self'"
             return FileResponse(doc['storage_path'],media_type={'.pdf':'application/pdf','.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg'}[suffix],headers=headers)
         from .document_viewer import office_html
         return HTMLResponse(call(office_html,content,doc['filename'],sheet),headers=headers)

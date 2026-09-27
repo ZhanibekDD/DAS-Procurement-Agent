@@ -295,6 +295,19 @@ def test_http_mail_catalog_workbook_views_acl_range(http_boundary):
     assert client.get(view,headers={'X-OpenWebUI-User-Id':ALICE}).status_code==401
 
 
+def test_native_pdf_view_not_plugin_sandboxed_office_is_sandboxed(http_boundary):
+    client,a,settings,db=http_boundary;u=login(client,a);h=headers(u)
+    for name,data,native in [('scan.pdf',(FIXTURES/'russian_scan.pdf').read_bytes(),True),('calc.xlsx',workbook(),False),('price.csv',price_csv(),False)]:
+        r=client.post('/api/documents',headers=h,params={'document_type':'project_section'},files={'file':(name,data)})
+        assert r.status_code==201,r.text
+        path=f"/api/procurement/documents/{r.json()['id']}/view"
+        r=client.get(path);assert r.status_code==200
+        assert "frame-ancestors 'self'" in r.headers['content-security-policy']
+        assert ('sandbox' not in r.headers['content-security-policy']) is native
+        if native:assert r.headers['content-type']=='application/pdf' and r.content==data
+        else:assert '<table>' in r.text
+
+
 @pytest.mark.parametrize('path',['/api/procurement/catalog/preview','/api/procurement/catalog/incoming-mail','/api/procurement/projects/2/workbook'])
 def test_new_uploads_share_streaming_body_limit(path):
     assert upload_request({'type':'http','method':'POST','path':path})

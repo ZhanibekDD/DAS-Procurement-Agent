@@ -10,7 +10,7 @@ from .upload_io import open_payload
 
 def office_html(content,filename,sheet=''):
     suffix=Path(filename).suffix.lower()
-    if suffix=='.xlsx':
+    if suffix in {'.xlsx','.csv'}:
         # The reader marks formulas explicitly; never evaluates or follows external links.
         table=read_table(content,filename,sheet)
         rows=[table['headers']]+[r['cells'] for r in table['rows'][:1000]]
