@@ -7,7 +7,7 @@ import pytest
 
 from procurement.catalog import ALIASES, Catalog
 from procurement.models import QuoteCreate
-from procurement.price_memory import PriceMemory, material_key, unit_key
+from procurement.price_memory import PriceMemory, material_key, unit_key, designation_key, INVALID_DESIGNATION
 from procurement.table_ingest import read_table
 from test_launch_workflow import workflow
 from test_procurement_redesign import fbs
@@ -92,6 +92,19 @@ def test_material_normalization(name,expected):
     assert material_key(name)==expected
 
 
+@pytest.mark.parametrize('name,spec,expected',[
+    ('ФБС 9.4.6-Т','', 'фбс 9.4.6-т'),
+    ('Блок фундаментный','ФБС 9.4.6-П', 'фбс 9.4.6-п'),
+    ('ФБС24.4.6','ГОСТ 13579-2018', 'фбс 24.4.6'),
+    ('ФБС 24.4.6','ФБС 24.4.6 ГОСТ 13579', 'фбс 24.4.6'),
+    ('ФБС 24.4.6','ПБ 24.4.6', INVALID_DESIGNATION),
+    ('ФБС 24.4.6','ФБС 12.4.6', INVALID_DESIGNATION),
+    ('ФБС 9.4.6-Т','ФБС 9.4.6-П', INVALID_DESIGNATION),
+])
+def test_designation_variants_and_conflicting_fields_fail_closed(name,spec,expected):
+    assert designation_key(name,spec)==expected
+
+
 def test_unit_aliases_no_false_dimension_conversion():
     assert unit_key('штук')==unit_key('шт.')=='шт'
     assert unit_key('м²')==unit_key('м2')=='м²'
@@ -117,6 +130,20 @@ def test_project_material_mark_in_specification_filters_global_history(workflow)
     assert 'ФБС 24.4.6' in names and 'ПБ 24.4.6' not in names
     assert not any(r['supplier_name']=='ТЕСТ D' for r in result['records'])
     assert 'ФБС 12.4.6' in names  # second exact lot item still belongs to project
+
+
+def test_project_suffix_and_conflicting_source_fields_are_not_mixed(workflow):
+    db,s,w=workflow;lot,_=fbs(s)
+    item=next(i for i in lot['items'] if i['name']=='ФБС 9.4.6')
+    with db.connection() as conn:
+        conn.execute("UPDATE lot_items SET name='Блок фундаментный',specification='ФБС 9.4.6-Т' WHERE id=?",(item['id'],))
+    price(workflow,'ФБС 9.4.6-Т',amount='100',supplier='A')
+    price(workflow,'ФБС 9.4.6-П',amount='1',supplier='B')
+    price(workflow,'ФБС 9.4.6-Т',amount='2',supplier='C',specification='ПБ 9.4.6-Т')
+    price(workflow,'ФБС 9.4.6-Т',amount='3',supplier='D',specification='ФБС 9.4.6-П')
+    rows=PriceMemory(s).search(project_id=lot['project_id'],today=TODAY)['records']
+    assert any(r['supplier_name']=='ТЕСТ A' for r in rows)
+    assert not any(r['supplier_name'] in {'ТЕСТ B','ТЕСТ C','ТЕСТ D'} for r in rows)
 
 
 @pytest.mark.parametrize('mark',['24.4.6','12.4.6','9.4.6'])

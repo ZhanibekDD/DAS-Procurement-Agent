@@ -34,17 +34,23 @@ def material_key(value):
     return ' '.join(filter(None, (before, mark, value[match.end():].strip())))
 
 
+INVALID_DESIGNATION = '<conflicting designation>'
+
+
 def designation_key(name, specification=''):
-    """Use an explicit product family and full mark, including marks in specifications."""
-    pattern = r'(?<!\w)(фбс|пб|фл)\s*[-–—]?\s*(\d+)\s*[.хx×-]\s*(\d+)\s*[.хx×-]\s*(\d+)(?!\d)'
-    family = re.search(r'(?<!\w)(фбс|пб|фл)(?!\w)', normalized(name))
-    for value in (name, specification):
-        found = re.search(pattern, normalized(value))
-        if found:
-            if family and family[1] != found[1]:
-                return None  # Contradictory item name and specification.
-            return found[1] + ' ' + '.'.join(str(int(found[i])) for i in (2, 3, 4))
-    return None
+    """Require one complete mark across both fields; variants and family matter."""
+    pattern = (r'(?<!\w)(фбс|пб|фл)\s*[-–—]?\s*(\d+)\s*[.хx×-]\s*(\d+)\s*[.хx×-]\s*(\d+)'
+               r'(?:\s*[-–—]\s*([а-яa-z]{1,3}))?(?!\w)')
+    fields = (normalized(name), normalized(specification))
+    found = [match for field in fields for match in re.finditer(pattern, field)]
+    families = ({match[1] for match in found}
+                | {match[1] for field in fields for match in re.finditer(r'(?<!\w)(фбс|пб|фл)(?!\w)', field)})
+    marks = {match[1] + ' ' + '.'.join(str(int(match[i])) for i in (2, 3, 4))
+             + ('-' + match[5] if match[5] else '')
+             for match in found}
+    if len(families) > 1 or len(marks) > 1 or (marks and families != {next(iter(marks)).split()[0]}):
+        return INVALID_DESIGNATION
+    return next(iter(marks)) if marks else None
 
 
 def unit_key(value):
@@ -152,7 +158,8 @@ class PriceMemory:
             # Includes reviewed reference workbook materials, not only procurement lots.
             data = Catalog(self.service,None).portfolio(project_id)
             project_materials = {(material_key(i['name']), designation_key(i['name'],i.get('specification','')))
-                                 for i in data['materials']}
+                                 for i in data['materials']
+                                 if designation_key(i['name'],i.get('specification','')) != INVALID_DESIGNATION}
         query_key = material_key(query)
         family_query = re.search(r'(?<!\w)(фбс|пб|фл)(?!\w)', query_key)
         def matches(name, spec, reg):
@@ -160,7 +167,8 @@ class PriceMemory:
             combined = material_key(str(name)+' '+str(spec))
             if project_materials is not None:
                 designation = designation_key(name,spec)
-                if not any((designation == project_mark if designation or project_mark else key == project_name)
+                if designation == INVALID_DESIGNATION or not any(
+                    (designation == project_mark if designation or project_mark else key == project_name)
                            for project_name,project_mark in project_materials):
                     return False
             if family_query:
