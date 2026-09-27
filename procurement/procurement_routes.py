@@ -99,7 +99,7 @@ def install(app,settings,service,launch,require_access,write_access,session_clai
             if message['lot_id']!=data.lot_id or snapshot['snapshot_sha256']!=data.snapshot_sha256:
                 raise HTTPException(409,'Запрос не принадлежит выбранному лоту / версии')
             needs_approval=call(flow.approval_required,conn,data.lot_id,role(request))
-            if needs_approval and message['status']=='draft':raise HTTPException(409,'Для этой закупки настроено отдельное согласование')
+            if needs_approval and not flow.admin_approval_valid(conn,message):raise HTTPException(409,'Для этой закупки настроено отдельное согласование; требуется подтверждение текущего правила администратором')
         if message['status']=='draft':call(service.approve_message,mid,trusted_actor(),'Предпросмотр подтверждён действием Отправить запрос')
         return call(launch.send,mid,True)
 
@@ -110,7 +110,7 @@ def install(app,settings,service,launch,require_access,write_access,session_clai
         with service.db.connection() as conn:
             message=call(service._outbox_context,conn,mid)
             call(validate_message,conn,message)
-        return call(service.approve_message,mid,trusted_actor(),'Согласовано по правилу закупки')
+        return call(lambda:service.approve_message(mid,trusted_actor(),'Согласовано по правилу закупки',admin_policy_approval=True))
 
     @app.post('/api/procurement/lots/{lid}/comparison',dependencies=[Depends(write_access)])
     def comparison(lid:int,data:Confirm):

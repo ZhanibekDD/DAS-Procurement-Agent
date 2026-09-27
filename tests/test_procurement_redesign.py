@@ -326,6 +326,35 @@ def test_amount_threshold_requires_complete_compliant_quantity_coverage(workflow
         assert ProcurementFlow(s).approval_required(conn,lot['id'],'staff') is expected
 
 
+@pytest.mark.parametrize('restriction',['policy','partial_quote','noncompliant','quantity'])
+def test_current_rule_rejects_stale_staff_approval_until_admin_reconfirms(workflow,monkeypatch,restriction):
+    from procurement.models import QuoteCreate
+    db,s,w=workflow;lot,supplier=fbs(s)
+    items=[{'lot_item_id':i['id'],'unit_price':100} for i in lot['items']]
+    s.add_quote(lot['id'],QuoteCreate(supplier_id=supplier['id'],currency='RUB',vat_included=True,items=items))
+    with db.connection() as conn:conn.execute("INSERT INTO procurement_policy VALUES(1,'100000','RUB','[]','before')")
+    p,c=campaign(s,lot,supplier);mid=c['messages'][0]['id']
+    s.approve_message(mid,'staff-a')
+    if restriction=='policy':
+        with db.connection() as conn:conn.execute("UPDATE procurement_policy SET required_roles_json='[\"staff\"]',updated_at='after'")
+    else:
+        if restriction=='partial_quote':items=items[:1]
+        if restriction=='noncompliant':items[0]['compliant']=False
+        if restriction=='quantity':items[0]['offered_quantity']=1
+        s.add_quote(lot['id'],QuoteCreate(supplier_id=supplier['id'],currency='RUB',vat_included=True,items=items))
+    with CaptureSMTP() as smtp:
+        smtp_env(monkeypatch,smtp)
+        with pytest.raises(ConflictError,match='администратором'):w.send(mid,True)
+        assert not smtp.messages and not db.one('SELECT * FROM mail_deliveries WHERE message_id=?',(mid,))
+        s.approve_message(mid,'admin',admin_policy_approval=True)
+        # A subsequent policy change invalidates even the admin proof.
+        with db.connection() as conn:conn.execute("UPDATE procurement_policy SET updated_at='later'")
+        with pytest.raises(ConflictError,match='администратором'):w.send(mid,True)
+        s.approve_message(mid,'admin',admin_policy_approval=True)
+        assert w.send(mid,True)['accepted_by_smtp']
+        assert len(smtp.messages)==1
+
+
 @pytest.mark.parametrize('kind',['csv','xlsx','pdf','mail'])
 def test_global_price_import_reuses_provided_owned_bytes_without_reassigning_acl(http_boundary,monkeypatch,kind):
     import procurement.app as app

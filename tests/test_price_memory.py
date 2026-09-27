@@ -137,6 +137,20 @@ def test_preview_and_rejected_import_are_not_prices(workflow):
     assert PriceMemory(s).search('ФБС',today=TODAY)['total']==1
 
 
+@pytest.mark.parametrize('second_price',['100','120'])
+def test_same_source_registered_twice_is_not_a_new_price_event(workflow,second_price):
+    db,s,w=workflow;price(workflow,pdate='2026-09-01')
+    with db.connection() as conn:
+        row=dict(conn.execute('SELECT * FROM supplier_catalog_prices').fetchone())
+        row.pop('id');row['unit_price']=second_price;row['created_at']='2026-09-20T00:00:00+00:00';row['source_row']=int(row['source_row'])+1
+        conn.execute('INSERT INTO supplier_catalog_prices('+','.join(row)+') VALUES('+','.join('?' for _ in row)+')',tuple(row.values()))
+    result=PriceMemory(s).search('ФБС',today=TODAY)
+    assert result['total']==2 and not result['alerts']
+    assert result['groups'][0]['period_stats']['count']==(1 if second_price=='100' else 0)
+    assert result['groups'][0]['change_pct'] in (None,'0.00')
+    assert sum(bool(r.get('duplicate_source')) for r in result['records'])==(1 if second_price=='100' else 0)
+
+
 def test_pagination_does_not_truncate_statistics(workflow):
     _,s,_=workflow
     for n in range(12):price(workflow,amount=str(100+n),supplier='S'+str(n))

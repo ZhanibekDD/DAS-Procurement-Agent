@@ -54,6 +54,19 @@ def test_recipient_sent_and_registry_match_message_id_and_exact_attachment(workf
     assert 'spool_path' not in r['delivery']
 
 
+def test_pending_copy_after_worker_exit_is_recoverable_without_resending(workflow,monkeypatch,tmp_path):
+    db,s,w=workflow;m,_=prepare(workflow)
+    with CaptureSMTP() as smtp, CaptureIMAP() as imap:
+        smtp_env(monkeypatch,smtp);imap_env(monkeypatch,imap,tmp_path)
+        monkeypatch.setattr('procurement.mail_delivery.copy_sent',lambda *args,**kwargs:None)
+        w.send(m['id'],True)
+        info=journal(db,m['id'])
+        assert info['status']=='sent' and info['sent_copy_status']=='pending'
+        assert info['copy_retry_allowed'] and not info['copy_reconcile_only']
+        assert copy_sent(w,m['id'],True)['delivery']['sent_copy_status']=='saved'
+        assert len(smtp.messages)==len(imap.messages)==1
+
+
 def test_lost_smtp_ack_blocks_retry_without_false_sent(workflow,monkeypatch):
     db,s,w=workflow;m,_=prepare(workflow)
     with CaptureSMTP(drop_after_data=True) as smtp:

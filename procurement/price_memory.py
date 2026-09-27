@@ -183,10 +183,26 @@ class PriceMemory:
         results=[]; alerts=[]; current_ids={}; index_by_id={}
         for key, history in groups.items():
             history.sort(key=lambda h:(h[1],h[0]['created_at'],int(h[0]['record_id'].split(':')[1]),h[0]['record_id']))
+            source_offers=defaultdict(list)
+            for h in history:
+                if h[0]['source_document_id']:
+                    source_offers[(h[0]['supplier_id'],h[0]['source_document_id'],h[1])].append(h)
+            duplicate_ids=set(); ambiguous_source_ids=set()
+            for offers in source_offers.values():
+                # One original is not a new price event just because another
+                # workflow registered it. Conflicting readings are not a trend.
+                if len({h[3] for h in offers})>1:
+                    ambiguous_source_ids.update(h[0]['record_id'] for h in offers)
+                else:
+                    duplicate_ids.update(h[0]['record_id'] for h in offers[1:])
+            for h in history:
+                h[0]['duplicate_source']=h[0]['record_id'] in duplicate_ids
+                h[0]['ambiguous_source']=h[0]['record_id'] in ambiguous_source_ids
+            history=[h for h in history if h[0]['record_id'] not in duplicate_ids]
             ties=defaultdict(list)
             for h in history:ties[(h[0]['supplier_id'],h[1],h[0]['created_at'])].append(h)
             conflicts={t for t,hs in ties.items() if len({h[0]['source_kind'] for h in hs})>1 and len({h[3] for h in hs})>1}
-            def ambiguous(h):return (h[0]['supplier_id'],h[1],h[0]['created_at']) in conflicts
+            def ambiguous(h):return h[0]['ambiguous_source'] or (h[0]['supplier_id'],h[1],h[0]['created_at']) in conflicts
             for h in history:
                 h[0]['ambiguous_order']=ambiguous(h)
             latest={}; events=defaultdict(list)
@@ -216,7 +232,7 @@ class PriceMemory:
             result={'group_id':group_id,'item_name':example['item_name'],'specification':example['specification'],
                     'unit':key[2],'currency':key[3],'vat':key[4],'region':example['region'],'delivery':key[6],
                     'minimum_batch':key[7],'current_stats':current_stat,
-                    'period_stats':stats([h[3] for h in history if start<=h[1]<=today]),'timeline':timeline,
+                    'period_stats':stats([h[3] for h in history if start<=h[1]<=today and not ambiguous(h)]),'timeline':timeline,
                     'change_pct':change,'change_from':nonempty[0]['date'] if nonempty else None,
                     'change_to':nonempty[-1]['date'] if nonempty else None,
                     'suppliers':[{'record_id':h[0]['record_id'],'supplier_id':h[0]['supplier_id'],

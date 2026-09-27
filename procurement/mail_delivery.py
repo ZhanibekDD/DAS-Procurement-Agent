@@ -102,7 +102,7 @@ def journal(db, mid):
     for key in ('recipients', 'accepted_recipients', 'attachments'):
         row[key] = json.loads(row.pop(key + '_json'))
     row['retry_allowed'] = row['status'] == 'failed'
-    row['copy_retry_allowed'] = row['status'] == 'sent' and (row['sent_copy_status'] in {'failed','unknown'} or expired)
+    row['copy_retry_allowed'] = row['status'] == 'sent' and (row['sent_copy_status'] in {'pending','failed','unknown'} or expired)
     row['copy_reconcile_only'] = row['sent_copy_status'] == 'unknown' or expired
     row['warning'] = COPY_WARNING if row['status'] == 'sent' and row['sent_copy_status'] != 'saved' else None
     row['events'] = []
@@ -129,7 +129,7 @@ def send(workflow, mid, confirmed):
     with db.connection() as conn:
         conn.execute('BEGIN IMMEDIATE')
         message = service._outbox_context(conn, mid)
-        from .procurement_flow import validate_message
+        from .procurement_flow import validate_message, ProcurementFlow
         validate_message(conn, message)
         fingerprint = message_fingerprint(message)
         previous = conn.execute('SELECT * FROM mail_deliveries WHERE message_id=?', (mid,)).fetchone()
@@ -138,6 +138,9 @@ def send(workflow, mid, confirmed):
                 return result(db, mid, duplicate=True)
             if previous['status'] != 'failed' or previous['payload_sha256'] != fingerprint:
                 raise ConflictError('Исход отправки не подтверждён либо отправка выполняется; повтор запрещён до проверки сервера')
+        flow=ProcurementFlow(service)
+        if flow.approval_required(conn,message['lot_id'],'staff') and not flow.admin_approval_valid(conn,message):
+            raise ConflictError('Требуется согласование текущего правила закупки администратором')
         approval = conn.execute('SELECT * FROM outbox_approvals WHERE message_id=?', (mid,)).fetchone()
         if (message['channel'] != 'email' or message['status'] not in {'approved','failed'} or not approval
                 or approval['payload_sha256'] != fingerprint or approval['approved_by'] != message['approved_by']

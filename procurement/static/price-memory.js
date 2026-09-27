@@ -11,7 +11,7 @@ function renderLotComparison(){
  lotRoot.insertAdjacentHTML('afterbegin','<button class="btn secondary" onclick="openLot(state.selectedLot)">← Закупка</button>');
 }
 loadComparison=async function(){if(!state.selectedLot)return toast('Выберите лот',true);try{state.comparison=await api(`/api/lots/${state.selectedLot}/comparison`);renderLotComparison()}catch(e){toast(e.message,true)}};
-openProcurementComparison=async function(lid){try{state.selectedLot=lid;showView('lotcomparison');await loadComparison();const quotes=await api(`/api/lots/${lid}/quotes`);if(quotes.length)await launchJson(`/api/procurement/lots/${lid}/comparison`,'POST',{confirmed:true});$('#lotcomparison').insertAdjacentHTML('beforeend',`<section class="panel"><h3>Решение сотрудника</h3>${quotes.map(q=>`<p>${esc(q.supplier_name)} <button class="btn secondary" onclick="chooseProcurement(${lid},${q.id},'awarded')">Выбрать поставщика</button> <button class="btn secondary" onclick="chooseProcurement(${lid},${q.id},'ordered')">Зафиксировать заказ</button></p>`).join('')}</section>`)}catch(e){toast(e.message,true)}};
+openProcurementComparison=async function(lid){try{state.selectedLot=lid;showView('lotcomparison');await loadComparison();const quotes=await api(`/api/lots/${lid}/quotes`),lot=await api(`/api/lots/${lid}`);if(quotes.length&&lot.status!=='ordered')await launchJson(`/api/procurement/lots/${lid}/comparison`,'POST',{confirmed:true});$('#lotcomparison').insertAdjacentHTML('beforeend',`<section class="panel"><h3>Решение сотрудника</h3>${procurementDecisionControls(lot,quotes)}</section>`)}catch(e){toast(e.message,true)}};
 const renderBeforeMemory=render;
 render=function(){renderBeforeMemory();if(state.view==='lotcomparison')renderLotComparison()};
 const viewBeforeMemory=showView;

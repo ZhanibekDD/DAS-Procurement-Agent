@@ -20,6 +20,9 @@ CREATE TABLE IF NOT EXISTS procurement_decisions (
 CREATE TABLE IF NOT EXISTS procurement_policy (
  id INTEGER PRIMARY KEY CHECK(id=1), amount_threshold TEXT, currency TEXT NOT NULL DEFAULT 'RUB',
  required_roles_json TEXT NOT NULL DEFAULT '[]', updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS procurement_admin_approvals (
+ message_id INTEGER PRIMARY KEY REFERENCES outbox_messages(id), payload_sha256 TEXT NOT NULL,
+ context_sha256 TEXT NOT NULL, approved_by TEXT NOT NULL, approved_at TEXT NOT NULL);
 '''
 
 
@@ -102,6 +105,17 @@ class ProcurementFlow:
                 'approval_required':self.approval_required(conn,lot_id,'staff')}
             result['preview_sha256'] = payload_sha256(result)
             return result
+
+    def approval_context(self, conn, lot_id):
+        policy = conn.execute('SELECT * FROM procurement_policy WHERE id=1').fetchone()
+        return payload_sha256({'policy':dict(policy) if policy else None,
+            'lot':lot_snapshot(conn,lot_id),'quotes':self.service.list_quotes(lot_id)})
+
+    def admin_approval_valid(self, conn, message):
+        proof=conn.execute('SELECT * FROM procurement_admin_approvals WHERE message_id=?',(message['id'],)).fetchone()
+        return bool(proof and proof['payload_sha256']==message_fingerprint(message)
+            and proof['context_sha256']==self.approval_context(conn,message['lot_id'])
+            and proof['approved_by']==message['approved_by'] and proof['approved_at']==message['approved_at'])
 
     def approval_required(self, conn, lot_id, role):
         policy = conn.execute('SELECT * FROM procurement_policy WHERE id=1').fetchone()

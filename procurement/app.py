@@ -761,7 +761,7 @@ def approve_message(message_id: int, decision: ApprovalDecision, request: Reques
             message=service._outbox_context(conn,message_id)
             if ProcurementFlow(service).approval_required(conn,message['lot_id'],'staff') and principal.get('role')!='admin':
                 raise ConflictError('Согласование правила закупки доступно администратору')
-        return service.approve_message(message_id, decision.approved_by, decision.comment)
+        return service.approve_message(message_id, decision.approved_by, decision.comment,admin_policy_approval=principal.get('role')=='admin')
     except Exception as exc:
         raise handle_domain_error(exc) from exc
 

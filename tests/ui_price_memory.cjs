@@ -22,3 +22,13 @@ assert.ok(source.includes('portfolioMemoryEpoch'));
 assert.ok(source.includes('await refreshMemoryNotice()'));
 assert.ok(context.memoryGraph({timeline:[{median:'1e999',date:'2026-09-01'}]}).includes('диапазон графика'));
 console.log('price memory UI: independent global/lot views, const safety, history chart, project scope, source links and alerts PASS');
+;(async()=>{
+ let posts=0,html='';
+ context.api=async url=>url.endsWith('/quotes')?[{id:2,supplier_name:'Тест'}]:{id:1,status:'ordered'};
+ context.launchJson=async()=>{posts++};
+ context.procurementDecisionControls=lot=>lot.status==='ordered'?'Заказ уже зафиксирован':'Выбрать поставщика';
+ context.$=()=>({insertAdjacentHTML(_position,value){html+=value}});
+ await context.openProcurementComparison(1);
+ assert.equal(posts,0);assert.ok(html.includes('Заказ уже зафиксирован'));assert.ok(!html.includes('Выбрать поставщика'));
+ console.log('final comparison override preserves ordered guard PASS');
+})().catch(error=>{console.error(error);process.exitCode=1});

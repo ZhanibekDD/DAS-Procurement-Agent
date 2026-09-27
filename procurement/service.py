@@ -581,7 +581,7 @@ class ProcurementService:
         self._supplier_cluster({"cluster": message["supplier_cluster"], "active": message["supplier_active"]}, cluster)
         return message
 
-    def approve_message(self, message_id: int, approved_by: str, comment: str = "") -> dict[str, Any]:
+    def approve_message(self, message_id: int, approved_by: str, comment: str = "", *, admin_policy_approval: bool = False) -> dict[str, Any]:
         approved_by = trusted_actor(approved_by).strip()
         if not approved_by or approved_by == "system":
             raise ValueError("a human approval actor is required")
@@ -593,14 +593,20 @@ class ProcurementService:
             if existing:
                 if message["status"] != "approved" or existing["payload_sha256"] != fingerprint:
                     raise ConflictError("approved content changed; create a new draft for human review")
-                return dict(conn.execute("SELECT * FROM outbox_messages WHERE id=?", (message_id,)).fetchone())
-            if message["status"] != "draft":
+                if not admin_policy_approval:
+                    return dict(conn.execute("SELECT * FROM outbox_messages WHERE id=?", (message_id,)).fetchone())
+            if message["status"] not in ({'draft','approved'} if admin_policy_approval else {'draft'}):
                 raise ConflictError("only draft messages with fresh human approval can be simulated")
             now = utcnow()
-            conn.execute("UPDATE outbox_messages SET status='approved', approved_by=?, approved_at=? WHERE id=? AND status='draft'",
+            conn.execute("UPDATE outbox_messages SET status='approved', approved_by=?, approved_at=? WHERE id=?",
                          (approved_by, now, message_id))
-            conn.execute("INSERT INTO outbox_approvals(message_id,payload_sha256,approved_by,approved_at) VALUES (?,?,?,?)",
+            conn.execute("INSERT OR REPLACE INTO outbox_approvals(message_id,payload_sha256,approved_by,approved_at) VALUES (?,?,?,?)",
                          (message_id, fingerprint, approved_by, now))
+            if admin_policy_approval:
+                from .procurement_flow import ProcurementFlow
+                context=ProcurementFlow(self).approval_context(conn,message['lot_id'])
+                conn.execute('INSERT OR REPLACE INTO procurement_admin_approvals VALUES(?,?,?,?,?)',
+                    (message_id,fingerprint,context,approved_by,now))
             self.db.audit("approved", "outbox_message", message_id, actor=approved_by,
                           details={"comment": comment, "dispatch": "approval_only", "payload_sha256": fingerprint}, conn=conn)
         return self.db.one("SELECT * FROM outbox_messages WHERE id = ?", (message_id,)) or {}
