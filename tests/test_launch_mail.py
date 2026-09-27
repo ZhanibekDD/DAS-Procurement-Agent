@@ -60,16 +60,17 @@ def test_parallel_send_has_at_most_one_smtp_submission(workflow,monkeypatch):
     assert db.one('SELECT count(*) n FROM mail_deliveries')['n']==1
 
 
-def test_smtp_failure_no_false_ready_no_retry(workflow,monkeypatch):
+def test_smtp_definite_rejection_safe_retry_exactly_once(workflow,monkeypatch):
     db,service,w=workflow;m,_=prepare(workflow)
     with CaptureSMTP(reject=True) as smtp:
         smtp_env(monkeypatch,smtp)
-        with pytest.raises(ConflictError,match='не подтверждена'):w.send(m['id'],True)
-        assert db.one('SELECT status FROM mail_deliveries')['status']=='unknown'
-        assert service.list_outbox()[0]['status']=='approved'
+        with pytest.raises(ConflictError,match='код 451'):w.send(m['id'],True)
+        assert db.one('SELECT status FROM mail_deliveries')['status']=='failed'
+        assert service.list_outbox()[0]['status']=='failed'
         smtp.reject=False
-        with pytest.raises(ConflictError,match='повтор запрещён'):w.send(m['id'],True)
-        assert not smtp.messages
+        assert w.send(m['id'],True)['status']=='sent'
+        assert w.send(m['id'],True)['duplicate']
+        assert len(smtp.messages)==1
 
 
 def test_missing_smtp_corrupt_file_and_unapproved_message_fail_closed(workflow,monkeypatch):

@@ -75,6 +75,11 @@ def install(app, settings, service, launch, require_access, session_claims, doma
                 'read_only':bool(getattr(request.state,'das_principal',{}).get('read_only',False)),
                 'max_file_bytes':MAX_FILE}
 
+    @app.post('/api/launch/outbox/{mid}/sent-copy', dependencies=[Depends(write_access)])
+    def sent_copy(mid: int, data: Confirm):
+        from .mail_delivery import copy_sent
+        return call(copy_sent, launch, mid, data.confirmed)
+
     @app.post('/api/launch/imports/{batch_id}/reject', dependencies=[Depends(write_access)])
     def reject_prices(batch_id: int, data: PriceRejection):
         return call(service.reject_batch_entries, batch_id, data.entry_ids, data.rejected_by)

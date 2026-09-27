@@ -529,7 +529,7 @@ class ProcurementService:
         clauses: list[str] = []
         params: list[Any] = []
         if status:
-            if status not in {"draft", "approved", "sent", "failed"}:
+            if status not in {"draft", "approved", "queued", "sending", "sent", "failed"}:
                 raise ValueError("unsupported outbox status")
             clauses.append("outbox_messages.status = ?")
             params.append(status)
@@ -557,7 +557,8 @@ class ProcurementService:
             receipt = row.pop("sandbox_receipt_json")
             row["sandbox_receipt"] = json.loads(receipt) if receipt else None
             row['attachments'] = self.db.all('SELECT document_id,filename,sha256,size_bytes FROM outbox_attachments WHERE message_id=? ORDER BY document_id',(row['id'],))
-            row['delivery'] = self.db.one('SELECT status,updated_at FROM mail_deliveries WHERE message_id=?',(row['id'],))
+            from .mail_delivery import journal
+            row['delivery'] = journal(self.db, row['id'])
         return rows
 
     def _outbox_context(self, conn, message_id: int) -> dict:

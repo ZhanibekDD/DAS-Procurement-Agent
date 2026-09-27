@@ -375,6 +375,8 @@ class Database:
             conn.executescript(SCHEMA)
             from .launch_workflow import SCHEMA as LAUNCH_SCHEMA
             conn.executescript(LAUNCH_SCHEMA)
+            from .mail_delivery import SCHEMA as MAIL_SCHEMA
+            conn.executescript(MAIL_SCHEMA)
             from .procurement_flow import SCHEMA as FLOW_SCHEMA
             conn.executescript(FLOW_SCHEMA)
             from .catalog import SCHEMA as CATALOG_SCHEMA
