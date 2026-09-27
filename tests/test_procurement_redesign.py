@@ -208,7 +208,7 @@ def test_material_search_before_history_limit_and_russian_normalization(workflow
     db,s,w=workflow;cat,_,_,_=import_price(s,w,price_csv())
     fields=[r['name'] for r in db.all('PRAGMA table_info(supplier_catalog_prices)') if r['name']!='id']
     previous=db.one('SELECT * FROM supplier_catalog_prices WHERE id=1')
-    values=[tuple((n if k=='source_row' else 'Другой материал' if k=='item_name' else 'Другая категория' if k=='category' else previous[k]) for k in fields) for n in range(2,5003)]
+    values=[tuple((n if k=='source_row' else 'Другой материал' if k=='item_name' else 'Другая категория' if k=='category' else previous[k]) for k in fields) for n in range(3,5004)]
     with db.connection() as conn:conn.executemany('INSERT INTO supplier_catalog_prices('+','.join(fields)+') VALUES ('+','.join('?' for _ in fields)+')',values)
     assert len(cat.prices('  фбс   24.4.6 ','бетон b7.5'))==1
 
