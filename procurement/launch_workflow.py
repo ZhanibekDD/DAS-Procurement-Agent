@@ -325,7 +325,12 @@ class LaunchWorkflow:
             project = conn.execute('SELECT * FROM projects WHERE id=?',(lot.project_id,)).fetchone()
             if not project:
                 raise NotFoundError('Проект не найден')
-            cluster = resolve_cluster(lot.region,lot.cluster or project['cluster'])
+            if kind == 'pdf_ocr' and not lot.cluster and lot.region == project['region'] and project['cluster']:
+                # A scan review is not a regional migration. Keep the authoritative
+                # existing project's cluster, just as its existing lots/suppliers.
+                cluster = project['cluster']
+            else:
+                cluster = resolve_cluster(lot.region,lot.cluster or project['cluster'])
             if lot.section_id and not conn.execute('SELECT 1 FROM project_sections WHERE id=? AND project_id=?',(lot.section_id,lot.project_id)).fetchone():
                 raise ValueError('Раздел принадлежит другому проекту')
             self._documents(conn, lot.project_id, lot.attachment_document_ids)

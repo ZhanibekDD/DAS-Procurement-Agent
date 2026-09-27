@@ -102,6 +102,15 @@ def test_pdf_review_requires_all_lines_corrected_items_source_and_owner(workflow
     assert db.one("SELECT * FROM audit_log WHERE action='lot_created_from_pdf_ocr'")['actor']=='staff-a'
 
 
+def test_scan_review_inherits_existing_project_cluster_without_migration(workflow):
+    db,service,launch=workflow;pr=project(service)
+    with db.connection() as conn:conn.execute("UPDATE projects SET cluster='cluster_1' WHERE id=?",(pr['id'],))
+    doc=service.register_source_document(filename='scan.pdf',content=FIXTURE.read_bytes(),document_type='project_section',project_id=pr['id'])
+    review=launch.pdf_review(doc,1,{'lines':[{'line':1,'text':'ФБС 24.4.6','confidence':.9}]})
+    lot=launch.create_sheet_lot(review['preview']['preview_id'],lot_payload(pr['id']),True,kind='pdf_ocr',reviewed_line_ids=[1])
+    assert lot['cluster']=='cluster_1' and service.get_project(pr['id'])['cluster']=='cluster_1'
+
+
 def test_missing_ocr_and_native_timeout_are_honest(monkeypatch,tmp_path):
     from procurement.pdf_ocr import _run
     import subprocess
