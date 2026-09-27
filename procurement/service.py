@@ -32,8 +32,11 @@ from .models import (
     TemplateUpsert,
 )
 from .ranking import rank_quotes
-from .regions import resolve_cluster
+from .regions import infer_region, normalize_region
+from .region_routing import infer_cluster, resolve_cluster
 from .templates import render_template
+from .identity import trusted_actor
+from .sandbox import payload_sha256, message_fingerprint, sandbox_adapter
 
 
 class NotFoundError(ValueError):
@@ -165,6 +168,10 @@ class ProcurementService:
             if not section:
                 raise NotFoundError("project section not found")
         with self.db.connection() as conn:
+            from .launch_workflow import LaunchWorkflow
+            LaunchWorkflow(self)._documents(conn, data.project_id, data.attachment_document_ids)
+            LaunchWorkflow(self)._documents(conn, data.project_id,
+                [item.source_document_id for item in data.items if item.source_document_id is not None])
             cursor = conn.execute(
                 """
                 INSERT INTO lots(
@@ -198,8 +205,8 @@ class ProcurementService:
                     """
                     INSERT INTO lot_items(
                         lot_id, name, quantity, unit, specification,
-                        source_document_id, source_page, source_reference
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        source_document_id, source_page, source_reference, delivery_date
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         lot_id,
@@ -210,8 +217,11 @@ class ProcurementService:
                         item.source_document_id,
                         item.source_page,
                         item.source_reference,
+                        str(item.delivery_date) if item.delivery_date else None,
                     ),
                 )
+            conn.executemany('INSERT INTO lot_attachments VALUES (?,?)',
+                             [(lot_id, d) for d in sorted(set(data.attachment_document_ids))])
             self.db.audit(
                 "created", "lot", lot_id, details={"project_name": project["name"]}, conn=conn
             )
@@ -223,6 +233,8 @@ class ProcurementService:
             raise NotFoundError("lot not found")
         row["rfq_requirements"] = json.loads(row.pop("rfq_requirements_json", "{}") or "{}")
         row["items"] = self.db.all("SELECT * FROM lot_items WHERE lot_id = ? ORDER BY id", (lot_id,))
+        row['attachments'] = self.db.all('''SELECT d.id AS document_id,d.filename,d.sha256,d.size_bytes
+            FROM lot_attachments a JOIN source_documents d ON d.id=a.document_id WHERE a.lot_id=?''', (lot_id,))
         return row
 
     def list_lots(self) -> list[dict[str, Any]]:
@@ -239,12 +251,32 @@ class ProcurementService:
             )
         return rows
 
+    @staticmethod
+    def _confirmed_cluster(lot_cluster: str, project_cluster: str) -> str:
+        if lot_cluster not in {"cluster_1", "cluster_2"} or project_cluster not in {"cluster_1", "cluster_2"}:
+            raise ValueError("lot and project cluster must be confirmed before procurement operations")
+        if lot_cluster != project_cluster:
+            raise ValueError("lot cluster must match project cluster")
+        return lot_cluster
+
+    def _lot_cluster(self, lot: dict) -> str:
+        project = self.get_project(lot["project_id"])
+        return self._confirmed_cluster(lot["cluster"], project["cluster"])
+
+    @staticmethod
+    def _supplier_cluster(supplier: dict, cluster: str) -> None:
+        if supplier["cluster"] != cluster:
+            raise ValueError("supplier cluster must match lot cluster")
+        if not supplier.get("active", True):
+            raise ValueError("inactive supplier cannot participate in procurement")
+
     def match_suppliers(self, lot_id: int) -> list[dict[str, Any]]:
         lot = self.get_lot(lot_id)
+        cluster = self._lot_cluster(lot)
         search_text = " ".join([lot["title"], *(item["name"] for item in lot["items"])]).casefold()
         candidates = []
         for supplier in self.list_suppliers():
-            if lot["cluster"] and supplier["cluster"] != lot["cluster"]:
+            if supplier["cluster"] != cluster:
                 continue
             region_match = lot["region"].casefold() in supplier["region"].casefold() or supplier[
                 "region"
@@ -258,7 +290,7 @@ class ProcurementService:
             if score > 0:
                 supplier["match_score"] = round(score, 2)
                 supplier["match_reasons"] = {
-                    "cluster": lot["cluster"] or "legacy_unassigned",
+                    "cluster": cluster,
                     "region": region_match,
                     "category_hits": category_hits,
                     "verified": supplier["verified"],
@@ -287,24 +319,17 @@ class ProcurementService:
     def create_campaign(self, lot_id: int, data: CampaignCreate) -> dict[str, Any]:
         lot = self.get_lot(lot_id)
         project = self.get_project(lot["project_id"])
+        cluster = self._confirmed_cluster(lot["cluster"], project["cluster"])
         template = self.db.one("SELECT * FROM templates WHERE code = ?", (data.template_code,))
         if not template:
             raise NotFoundError("template not found")
         suppliers = [self.get_supplier(supplier_id) for supplier_id in dict.fromkeys(data.supplier_ids)]
-        if lot["cluster"]:
-            invalid = [
-                supplier["id"]
-                for supplier in suppliers
-                if supplier["cluster"] != lot["cluster"]
-            ]
-            if invalid:
-                raise ValueError(
-                    "supplier cluster must match lot cluster; blocked supplier ids: "
-                    + ", ".join(str(value) for value in invalid)
-                )
+        for supplier in suppliers:
+            self._supplier_cluster(supplier, cluster)
         items_text = "\n".join(
             f"- {item['name']}: {item['quantity']} {item['unit']}"
             + (f"; {item['specification']}" if item["specification"] else "")
+            + (f"; срок {item['delivery_date']}" if item.get('delivery_date') else "")
             for item in lot["items"]
         )
         requirements = lot.get("rfq_requirements") or {}
@@ -355,21 +380,75 @@ class ProcurementService:
                     render_template(template["body"], context),
                 )
             )
+        fingerprint = payload_sha256({"lot_id": lot_id, "project_id": project["id"], "cluster": cluster,
+            "template_code": data.template_code, "template_version": template["version"], "channel": data.channel,
+            "attachments": lot.get('attachments', []),
+            "messages": sorted([(supplier["id"], recipient, subject, body)
+                                for supplier, recipient, subject, body in prepared])})
+        request_key = f"lot:{lot_id}:client:{data.idempotency_key}" if data.idempotency_key else "auto:" + fingerprint
+        expected_messages = sorted((supplier["id"], recipient, subject, body) for supplier, recipient, subject, body in prepared)
         with self.db.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute("""SELECT l.cluster AS lot_cluster,p.cluster AS project_cluster
+                FROM lots l JOIN projects p ON p.id=l.project_id WHERE l.id=?""", (lot_id,)).fetchone()
+            if not current or self._confirmed_cluster(current["lot_cluster"], current["project_cluster"]) != cluster:
+                raise ConflictError("campaign cluster context changed; retry after review")
+            current_attachments = [dict(r) for r in conn.execute('''SELECT d.id AS document_id,d.filename,d.sha256,d.size_bytes
+                FROM lot_attachments a JOIN source_documents d ON d.id=a.document_id WHERE a.lot_id=? ORDER BY d.id''',(lot_id,))]
+            if sorted(lot.get('attachments',[]),key=lambda a:a['document_id']) != current_attachments:
+                raise ConflictError('Вложения изменились; обновите черновик')
+            for supplier in suppliers:
+                current_supplier = conn.execute("SELECT cluster,active FROM suppliers WHERE id=?", (supplier["id"],)).fetchone()
+                if not current_supplier:
+                    raise NotFoundError("supplier not found")
+                self._supplier_cluster(dict(current_supplier), cluster)
+
+            def reuse(campaign_id):
+                existing_campaign = conn.execute("SELECT lot_id,template_code,channel FROM campaigns WHERE id=?", (campaign_id,)).fetchone()
+                stored_messages = sorted(tuple(row) for row in conn.execute(
+                    "SELECT supplier_id,recipient,subject,body FROM outbox_messages WHERE campaign_id=?", (campaign_id,)))
+                if (not existing_campaign or tuple(existing_campaign) != (lot_id, data.template_code, data.channel)
+                        or stored_messages != expected_messages):
+                    raise ConflictError("stored campaign content changed; fresh human review is required")
+                return self.get_campaign(campaign_id)
+
+            existing = conn.execute("SELECT * FROM campaign_requests WHERE request_key=?", (request_key,)).fetchone()
+            if existing:
+                if existing["payload_sha256"] != fingerprint:
+                    raise ConflictError("idempotency key was already used for different campaign content")
+                return reuse(existing["campaign_id"])
+            same_content = conn.execute("SELECT campaign_id FROM campaign_requests WHERE payload_sha256=? LIMIT 1", (fingerprint,)).fetchone()
+            if same_content:
+                conn.execute("INSERT INTO campaign_requests(request_key,payload_sha256,campaign_id,created_at) VALUES (?,?,?,?)",
+                             (request_key, fingerprint, same_content["campaign_id"], utcnow()))
+                return reuse(same_content["campaign_id"])
+            # Do not backfill approvals or silently duplicate pre-ledger campaigns.
+            legacy = conn.execute("""SELECT c.id FROM campaigns c LEFT JOIN campaign_requests r ON r.campaign_id=c.id
+                WHERE c.lot_id=? AND c.template_code=? AND c.channel=? AND r.campaign_id IS NULL""",
+                (lot_id, data.template_code, data.channel)).fetchall()
+            for prior in legacy:
+                prior_messages = sorted(tuple(row) for row in conn.execute(
+                    "SELECT supplier_id,recipient,subject,body FROM outbox_messages WHERE campaign_id=?", (prior["id"],)))
+                if prior_messages == expected_messages:
+                    raise ConflictError("matching legacy campaign already exists; human review is required, no duplicate was created")
             cursor = conn.execute(
                 "INSERT INTO campaigns(lot_id, template_code, channel, created_at) VALUES (?, ?, ?, ?)",
                 (lot_id, data.template_code, data.channel, utcnow()),
             )
             campaign_id = cursor.lastrowid
+            conn.execute("INSERT INTO campaign_requests(request_key,payload_sha256,campaign_id,created_at) VALUES (?,?,?,?)",
+                         (request_key, fingerprint, campaign_id, utcnow()))
             for supplier, recipient, subject, body in prepared:
-                conn.execute(
+                message_id = conn.execute(
                     """
                     INSERT INTO outbox_messages(
                         campaign_id, supplier_id, channel, recipient, subject, body, created_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (campaign_id, supplier["id"], data.channel, recipient, subject, body, utcnow()),
-                )
+                ).lastrowid
+                conn.executemany('INSERT INTO outbox_attachments VALUES (?,?,?,?,?)',
+                    [(message_id,a['document_id'],a['filename'],a['sha256'],a['size_bytes']) for a in lot.get('attachments',[])])
             conn.execute("UPDATE lots SET status = 'rfq_draft' WHERE id = ?", (lot_id,))
             self.db.audit(
                 "drafted",
@@ -392,6 +471,8 @@ class ProcurementService:
             """,
             (campaign_id,),
         )
+        for message in row['messages']:
+            message['attachments'] = self.db.all('SELECT document_id,filename,sha256,size_bytes FROM outbox_attachments WHERE message_id=? ORDER BY document_id',(message['id'],))
         return row
 
     def list_campaigns(self, lot_id: int | None = None) -> list[dict[str, Any]]:
@@ -429,49 +510,112 @@ class ProcurementService:
             clauses.append("campaigns.lot_id = ?")
             params.append(lot_id)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        return self.db.all(
+        rows = self.db.all(
             f"""
             SELECT outbox_messages.*, suppliers.name AS supplier_name,
-                   campaigns.lot_id, lots.title AS lot_title
+                   campaigns.lot_id, lots.title AS lot_title,
+                   sandbox_deliveries.receipt_json AS sandbox_receipt_json
             FROM outbox_messages
             JOIN suppliers ON suppliers.id = outbox_messages.supplier_id
             JOIN campaigns ON campaigns.id = outbox_messages.campaign_id
             JOIN lots ON lots.id = campaigns.lot_id
+            LEFT JOIN sandbox_deliveries ON sandbox_deliveries.message_id = outbox_messages.id
             {where}
             ORDER BY outbox_messages.id DESC
             """,
             tuple(params),
         )
+        for row in rows:
+            receipt = row.pop("sandbox_receipt_json")
+            row["sandbox_receipt"] = json.loads(receipt) if receipt else None
+            row['attachments'] = self.db.all('SELECT document_id,filename,sha256,size_bytes FROM outbox_attachments WHERE message_id=? ORDER BY document_id',(row['id'],))
+            row['delivery'] = self.db.one('SELECT status,updated_at FROM mail_deliveries WHERE message_id=?',(row['id'],))
+        return rows
+
+    def _outbox_context(self, conn, message_id: int) -> dict:
+        row = conn.execute("""
+            SELECT m.*, c.lot_id, l.cluster AS lot_cluster, p.cluster AS project_cluster,
+                   s.cluster AS supplier_cluster, s.active AS supplier_active
+            FROM outbox_messages m JOIN campaigns c ON c.id=m.campaign_id
+            JOIN lots l ON l.id=c.lot_id JOIN projects p ON p.id=l.project_id
+            JOIN suppliers s ON s.id=m.supplier_id WHERE m.id=?
+        """, (message_id,)).fetchone()
+        if not row:
+            raise NotFoundError("outbox message not found")
+        message = dict(row)
+        message['attachments'] = [dict(r) for r in conn.execute('SELECT document_id,filename,sha256,size_bytes FROM outbox_attachments WHERE message_id=? ORDER BY document_id',(message_id,))]
+        cluster = self._confirmed_cluster(message["lot_cluster"], message["project_cluster"])
+        self._supplier_cluster({"cluster": message["supplier_cluster"], "active": message["supplier_active"]}, cluster)
+        return message
 
     def approve_message(self, message_id: int, approved_by: str, comment: str = "") -> dict[str, Any]:
-        message = self.db.one("SELECT * FROM outbox_messages WHERE id = ?", (message_id,))
-        if not message:
-            raise NotFoundError("outbox message not found")
-        if message["status"] != "draft":
-            raise ConflictError("only draft messages can be approved")
+        approved_by = trusted_actor(approved_by).strip()
+        if not approved_by or approved_by == "system":
+            raise ValueError("a human approval actor is required")
         with self.db.connection() as conn:
-            conn.execute(
-                "UPDATE outbox_messages SET status='approved', approved_by=?, approved_at=? WHERE id=?",
-                (approved_by, utcnow(), message_id),
-            )
-            self.db.audit(
-                "approved",
-                "outbox_message",
-                message_id,
-                actor=approved_by,
-                details={"comment": comment, "dispatch": "disabled_in_mvp"},
-                conn=conn,
-            )
+            conn.execute("BEGIN IMMEDIATE")
+            message = self._outbox_context(conn, message_id)
+            fingerprint = message_fingerprint(message)
+            existing = conn.execute("SELECT * FROM outbox_approvals WHERE message_id=?", (message_id,)).fetchone()
+            if existing:
+                if message["status"] != "approved" or existing["payload_sha256"] != fingerprint:
+                    raise ConflictError("approved content changed; create a new draft for human review")
+                return dict(conn.execute("SELECT * FROM outbox_messages WHERE id=?", (message_id,)).fetchone())
+            if message["status"] != "draft":
+                raise ConflictError("only draft messages with fresh human approval can be simulated")
+            now = utcnow()
+            conn.execute("UPDATE outbox_messages SET status='approved', approved_by=?, approved_at=? WHERE id=? AND status='draft'",
+                         (approved_by, now, message_id))
+            conn.execute("INSERT INTO outbox_approvals(message_id,payload_sha256,approved_by,approved_at) VALUES (?,?,?,?)",
+                         (message_id, fingerprint, approved_by, now))
+            self.db.audit("approved", "outbox_message", message_id, actor=approved_by,
+                          details={"comment": comment, "dispatch": "approval_only", "payload_sha256": fingerprint}, conn=conn)
         return self.db.one("SELECT * FROM outbox_messages WHERE id = ?", (message_id,)) or {}
+
+    def simulate_outbox(self, message_id: int) -> dict:
+        """Explicit local simulation only. Persistent idempotency survives worker recreation."""
+        with self.db.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            message = self._outbox_context(conn, message_id)
+            fingerprint = message_fingerprint(message)
+            approval = conn.execute("SELECT * FROM outbox_approvals WHERE message_id=?", (message_id,)).fetchone()
+            if (not approval or message["status"] != "approved" or approval["payload_sha256"] != fingerprint
+                    or approval["approved_by"] != message["approved_by"] or approval["approved_at"] != message["approved_at"]):
+                raise ConflictError("unchanged content and explicit human approval are required for sandbox simulation")
+            existing = conn.execute("SELECT * FROM sandbox_deliveries WHERE message_id=?", (message_id,)).fetchone()
+            if existing:
+                if existing["payload_sha256"] != fingerprint:
+                    raise ConflictError("sandbox receipt does not match approved content")
+                return json.loads(existing["receipt_json"])
+            receipt = sandbox_adapter(message["channel"]).simulate(message, fingerprint)
+            conn.execute("""INSERT INTO sandbox_deliveries(message_id,channel,payload_sha256,receipt_json,simulated_by,simulated_at)
+                            VALUES (?,?,?,?,?,?)""", (message_id, message["channel"], fingerprint,
+                            json.dumps(receipt, sort_keys=True), trusted_actor(), utcnow()))
+            self.db.audit("simulated", "outbox_message", message_id, details=receipt, conn=conn)
+            return receipt
 
     def add_quote(self, lot_id: int, data: QuoteCreate) -> dict[str, Any]:
         lot = self.get_lot(lot_id)
-        self.get_supplier(data.supplier_id)
+        cluster = self._lot_cluster(lot)
+        if data.currency != lot["currency"]:
+            raise ValueError("quote currency must match lot currency; exchange conversion is not configured")
+        self._supplier_cluster(self.get_supplier(data.supplier_id), cluster)
         lot_item_ids = {int(item["id"]) for item in lot["items"]}
         submitted_ids = {item.lot_item_id for item in data.items}
         if not submitted_ids.issubset(lot_item_ids):
             raise ValueError("quote contains an item from another lot")
         with self.db.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute("""SELECT l.cluster AS lot_cluster,p.cluster AS project_cluster,l.currency
+                FROM lots l JOIN projects p ON p.id=l.project_id WHERE l.id=?""", (lot_id,)).fetchone()
+            if not current or self._confirmed_cluster(current["lot_cluster"], current["project_cluster"]) != cluster:
+                raise ConflictError("quote cluster context changed; retry after review")
+            if current["currency"] != data.currency:
+                raise ValueError("quote currency must match lot currency")
+            current_supplier = conn.execute("SELECT cluster,active FROM suppliers WHERE id=?", (data.supplier_id,)).fetchone()
+            if not current_supplier:
+                raise NotFoundError("supplier not found")
+            self._supplier_cluster(dict(current_supplier), cluster)
             cursor = conn.execute(
                 """
                 INSERT INTO quotes(
@@ -532,6 +676,7 @@ class ProcurementService:
         return max(token_score, containment, SequenceMatcher(None, left, right).ratio())
 
     def add_purchase_history(self, data: PurchaseHistoryCreate) -> dict[str, Any]:
+        data = data.model_copy(update={"confirmed_by": trusted_actor(data.confirmed_by)})
         if data.supplier_id is not None:
             self.get_supplier(data.supplier_id)
         if data.source_document_id is not None:
@@ -606,7 +751,8 @@ class ProcurementService:
     def get_purchase_history(self, record_id: int) -> dict[str, Any]:
         row = self.db.one(
             """
-            SELECT purchase_history.*, suppliers.name AS supplier_name
+            SELECT purchase_history.*, suppliers.name AS supplier_name,
+                   suppliers.cluster AS supplier_cluster
             FROM purchase_history
             LEFT JOIN suppliers ON suppliers.id = purchase_history.supplier_id
             WHERE purchase_history.id = ?
@@ -638,7 +784,8 @@ class ProcurementService:
         params.append(limit)
         rows = self.db.all(
             f"""
-            SELECT purchase_history.*, suppliers.name AS supplier_name
+            SELECT purchase_history.*, suppliers.name AS supplier_name,
+                   suppliers.cluster AS supplier_cluster
             FROM purchase_history
             LEFT JOIN suppliers ON suppliers.id = purchase_history.supplier_id
             WHERE {' AND '.join(clauses)}
@@ -648,17 +795,30 @@ class ProcurementService:
             tuple(params),
         )
         for row in rows:
-            row["vat_included"] = bool(row["vat_included"])
+            value = row["vat_included"]
+            row["vat_included"] = bool(value) if value in (0, 1) else None
         return rows
 
-    def lot_price_benchmark(self, lot_id: int) -> dict[str, Any]:
+    def lot_price_benchmark(self, lot_id: int, *, vat_included: bool | None = None) -> dict[str, Any]:
         lot = self.get_lot(lot_id)
+        cluster = self._lot_cluster(lot)
+        region = normalize_region(lot["region"])
         history = self.list_purchase_history(limit=500)
         items: list[dict[str, Any]] = []
         for item in lot["items"]:
             candidates = []
             for record in history:
+                # Exact normalized region is intentionally conservative: aliases,
+                # missing regions or cluster drift require explicit human review.
+                if (not region or normalize_region(record["region"]) != region
+                        or infer_cluster(record["region"]) != cluster
+                        or record["supplier_cluster"] != cluster):
+                    continue
                 if record["currency"] != lot["currency"]:
+                    continue
+                if not isinstance(record["vat_included"], bool):
+                    continue
+                if vat_included is not None and record["vat_included"] != vat_included:
                     continue
                 if self._normalized_item_name(record["unit"]) != self._normalized_item_name(
                     item["unit"]
@@ -667,6 +827,10 @@ class ProcurementService:
                 score = self._item_match_score(item["name"], record["item_name"])
                 if score >= 0.75:
                     candidates.append((score, record))
+            bases = {record["vat_included"] for _, record in candidates}
+            ambiguous_vat = vat_included is None and len(bases) > 1
+            if ambiguous_vat:
+                candidates = []
             prices = [Decimal(record["unit_price"]) for _, record in candidates]
             items.append(
                 {
@@ -674,6 +838,11 @@ class ProcurementService:
                     "item_name": item["name"],
                     "unit": item["unit"],
                     "currency": lot["currency"],
+                    "vat_included": vat_included if vat_included is not None else (
+                        next(iter(bases)) if len(bases) == 1 else None),
+                    "basis_status": "ambiguous_vat" if ambiguous_vat else (
+                        "comparable" if prices else "insufficient_comparable_history"),
+                    "source_purchase_ids": [record["id"] for _, record in candidates],
                     "history_count": len(prices),
                     "median_unit_price": float(median(prices)) if prices else None,
                     "min_unit_price": float(min(prices)) if prices else None,
@@ -687,10 +856,13 @@ class ProcurementService:
         return {
             "lot_id": lot_id,
             "currency": lot["currency"],
+            "cluster": cluster,
+            "region": lot["region"],
             "matched_items": sum(1 for item in items if item["history_count"]),
             "total_items": len(items),
             "items": items,
-            "policy": "approved_paid_invoices_same_currency_unit_match_gte_0_75",
+            "policy": "approved_purchases_same_region_cluster_currency_vat_unit_match_gte_0_75",
+            "exclusions": "Missing or ambiguous region, supplier cluster or VAT basis is excluded; no FX or financing normalization",
         }
 
     def list_quotes(self, lot_id: int) -> list[dict[str, Any]]:
@@ -725,12 +897,14 @@ class ProcurementService:
 
     def comparison(self, lot_id: int) -> dict[str, Any]:
         lot = self.get_lot(lot_id)
+        cluster = self._lot_cluster(lot)
         benchmark = self.lot_price_benchmark(lot_id)
-        benchmark_by_item = {int(item["lot_item_id"]): item for item in benchmark["items"]}
+        benchmarks_by_vat = {}
         requested = {int(item["id"]): Decimal(item["quantity"]) for item in lot["items"]}
         quotes = self.db.all(
             """
-            SELECT quotes.*, suppliers.name AS supplier_name, suppliers.rating AS supplier_rating
+            SELECT quotes.*, suppliers.name AS supplier_name, suppliers.rating AS supplier_rating,
+                   suppliers.cluster AS supplier_cluster
             FROM quotes JOIN suppliers ON suppliers.id = quotes.supplier_id
             WHERE quotes.lot_id = ? ORDER BY quotes.id
             """,
@@ -738,6 +912,17 @@ class ProcurementService:
         )
         rows = []
         for quote in quotes:
+            if quote["supplier_cluster"] != cluster:
+                raise ValueError("stored quote supplier cluster must match lot cluster before comparison")
+            if quote["currency"] != lot["currency"]:
+                raise ValueError("stored quote currency differs from lot; review is required before ranking")
+            if quote["vat_included"] not in (0, 1):
+                raise ValueError("stored quote VAT basis is ambiguous; review is required")
+            vat_basis = bool(quote["vat_included"])
+            if vat_basis not in benchmarks_by_vat:
+                benchmarks_by_vat[vat_basis] = self.lot_price_benchmark(lot_id, vat_included=vat_basis)
+            benchmark_by_item = {int(item["lot_item_id"]): item
+                for item in benchmarks_by_vat[vat_basis]["items"]}
             items = self.db.all("SELECT * FROM quote_items WHERE quote_id = ?", (quote["id"],))
             subtotal = sum(
                 requested[int(item["lot_item_id"])] * Decimal(item["unit_price"]) for item in items
@@ -817,42 +1002,63 @@ class ProcurementService:
         content_type: str = "application/octet-stream",
         project_id: int | None = None,
         supplier_id: int | None = None,
+        _price_import: bool = False,
     ) -> dict[str, Any]:
-        allowed_types = {"paid_invoice", "tender_table", "project_section", "commercial_offer"}
+        allowed_types = {"paid_invoice", "tender_table", "project_section", "commercial_offer",
+                         "invoice", "price_list", "unknown"}
         if document_type not in allowed_types:
             raise ValueError("unsupported document type")
-        if not content or len(content) > 25 * 1024 * 1024:
-            raise ValueError("document must be between 1 byte and 25 MB")
+        from .upload_io import MAX_FILE, TOO_LARGE, UploadTooLarge, chunks, payload_sha256
+        if len(content)>MAX_FILE:raise UploadTooLarge(TOO_LARGE)
+        if not len(content):raise ValueError('Файл пуст')
         suffix = Path(filename).suffix.lower()
+        from .table_ingest import safe_upload
         if suffix not in {".pdf", ".xlsx", ".csv", ".docx"}:
             raise ValueError("only PDF, DOCX, XLSX and CSV documents are supported")
         if suffix == ".pdf" and not content.startswith(b"%PDF-"):
             raise ValueError("invalid PDF payload")
         if suffix in {".xlsx", ".docx"} and not content.startswith(b"PK"):
             raise ValueError("invalid Office document payload")
+        # Legacy batch callers supply source-relative names, never destinations.
+        filename = filename.replace('\\', '/').rsplit('/', 1)[-1]
+        safe_upload(content, filename, {'.pdf','.xlsx','.csv','.docx'})
         if project_id is not None:
             self.get_project(project_id)
         if supplier_id is not None:
             self.get_supplier(supplier_id)
 
-        digest = hashlib.sha256(content).hexdigest()
-        existing = self.db.one("SELECT * FROM source_documents WHERE sha256 = ?", (digest,))
-        if existing:
-            return existing
+        digest = payload_sha256(content)
         if self.db.path == ":memory:":
             raise RuntimeError("document storage is unavailable for in-memory database")
 
         storage_dir = Path(self.db.path).resolve().parent / "uploads" / document_type
         storage_dir.mkdir(parents=True, exist_ok=True)
         storage_path = storage_dir / f"{digest}{suffix}"
-        storage_path.write_bytes(content)
         with self.db.connection() as conn:
+            # Claim the SHA before writing bytes: concurrent registrations cannot
+            # observe a half-written file or race the unique source row.
+            conn.execute('BEGIN IMMEDIATE')
+            existing = conn.execute('SELECT * FROM source_documents WHERE sha256=?', (digest,)).fetchone()
+            if existing:
+                # Price import reviews caller-provided bytes without reassigning
+                # the source's project/supplier ownership.
+                reuse_for_review = _price_import and project_id is None and supplier_id is None
+                if not reuse_for_review and (existing['project_id'] != project_id or existing['supplier_id'] != supplier_id):
+                    raise ConflictError('same file already belongs to a different project/supplier; no cross-project reuse')
+                return dict(existing)
+            try:
+                with storage_path.open('xb') as output:
+                    for part in chunks(content):output.write(part)
+            except FileExistsError:
+                from .upload_io import FilePayload
+                if payload_sha256(FilePayload(storage_path)) != digest:
+                    raise ConflictError('immutable upload conflict')
             cursor = conn.execute(
                 """
                 INSERT INTO source_documents(
                     project_id, supplier_id, document_type, filename, content_type,
-                    size_bytes, sha256, storage_path, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    size_bytes, sha256, storage_path, created_at, extraction_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     project_id,
@@ -864,6 +1070,7 @@ class ProcurementService:
                     digest,
                     str(storage_path),
                     utcnow(),
+                    'extracted_needs_review' if _price_import else 'pending_ai_extraction',
                 ),
             )
             document_id = cursor.lastrowid
@@ -886,8 +1093,14 @@ class ProcurementService:
             raise ValueError("fence schedule extraction requires a project section document")
         if document["project_id"] is None:
             raise ValueError("project section document must be linked to a project")
-        content = read_stored_pdf(document["storage_path"])
-        text = extract_pdf_page(content, page_number)
+        from .launch_workflow import LaunchWorkflow
+        from .document_analysis import extract_pdf_page_review
+        launch = LaunchWorkflow(self)
+        content = launch.document_file(document)
+        extracted = extract_pdf_page_review(content, page_number)
+        if extracted['mode'] == 'ocr':
+            return launch.pdf_review(document, page_number, extracted)
+        text = extracted['text']
         suggestion_data = extract_bulat_fence_schedule(
             text,
             page_number=page_number,
@@ -1112,6 +1325,7 @@ class ProcurementService:
     def approve_procurement_suggestion(
         self, suggestion_id: int, data: ProcurementSuggestionApproval
     ) -> dict[str, Any]:
+        data = data.model_copy(update={"approved_by": trusted_actor(data.approved_by)})
         suggestion = self.get_procurement_suggestion(suggestion_id)
         if suggestion["status"] != "needs_review":
             raise ConflictError("only suggestions awaiting review can be approved")
@@ -1122,6 +1336,8 @@ class ProcurementService:
             )
             if claimed.rowcount != 1:
                 raise ConflictError("only suggestions awaiting review can be approved")
+            from .launch_workflow import LaunchWorkflow
+            LaunchWorkflow(self)._documents(conn,suggestion['project_id'],[suggestion['source_document_id']])
             section = conn.execute(
                 "SELECT * FROM project_sections WHERE project_id=? AND code=?",
                 (suggestion["project_id"], suggestion["section_code"]),
@@ -1177,6 +1393,8 @@ class ProcurementService:
                 ),
             )
             lot_id = int(lot_cursor.lastrowid)
+            conn.execute('INSERT INTO lot_attachments(lot_id,document_id) VALUES (?,?)',
+                         (lot_id,suggestion['source_document_id']))
             for item_data in suggestion["items"]:
                 item = LotItemCreate.model_validate(item_data)
                 conn.execute(
@@ -1229,6 +1447,7 @@ class ProcurementService:
     def reject_procurement_suggestion(
         self, suggestion_id: int, data: ProcurementSuggestionRejection
     ) -> dict[str, Any]:
+        data = data.model_copy(update={"reviewed_by": trusted_actor(data.reviewed_by)})
         suggestion = self.get_procurement_suggestion(suggestion_id)
         if suggestion["status"] != "needs_review":
             raise ConflictError("only suggestions awaiting review can be rejected")
@@ -1290,3 +1509,446 @@ class ProcurementService:
                 )["n"]
             ),
         }
+
+    # ── PR #8: batch import & price-history service ───────────────────────────
+
+    def create_import_batch(
+        self,
+        files: list[tuple[str, bytes]],
+        *,
+        created_by: str = "system",
+    ) -> dict[str, Any]:
+        """Bound extraction before writes; claim each source atomically."""
+        from .upload_io import MAX_BATCH
+        if not 1 <= len(files) <= 20 or sum(len(content) for _, content in files) > MAX_BATCH:
+            raise ValueError('batch requires 1-20 files within a 100 MB aggregate limit')
+        if any(Path(filename).suffix.lower() == ".xls" for filename, _ in files):
+            raise ValueError("legacy .xls is not supported; convert to .xlsx and review before import")
+        created_by = trusted_actor(created_by)
+        from .imports import extract_document, detect_cluster, supplier_dedup_key, price_validity_state
+
+        # Parse outside SQLite locks and cap the entire batch, not only each file.
+        # A limit violation has no database/file side effects.
+        prepared = []
+        total_items = 0
+        errors: list[str] = []
+        sha256_map: dict[str, str] = {}
+        for filename, content in files:
+            try:
+                result = extract_document(content, filename)
+            except Exception as exc:
+                errors.append(f"{filename}: extraction failed — {type(exc).__name__}")
+                continue
+            total_items += len(result.items)
+            if total_items > 10_000:
+                raise ValueError('batch exceeds the 10000 extracted item aggregate limit')
+            sha256_map[filename] = result.sha256
+            errors.extend(f"{filename}: {error}"[:2000] for error in result.errors[:100])
+            # A wholly failed extraction has no reviewable supplier/price rows.
+            if not result.items:
+                if not result.errors:
+                    errors.append(f'{filename}: no price items extracted; nothing imported')
+                continue
+            prepared.append((filename, content, result))
+
+        with self.db.connection() as conn:
+            cursor = conn.execute("""
+                INSERT INTO import_batches(status, filenames_json, total_files,
+                    processed_files, sha256_json, created_by, created_at)
+                VALUES ('processing', ?, ?, 0, ?, ?, ?)
+            """, (json.dumps([fn for fn, _ in files], ensure_ascii=False), len(files),
+                  json.dumps(sha256_map, ensure_ascii=False), created_by, utcnow()))
+            batch_id = cursor.lastrowid
+            self.db.audit('created', 'import_batch', batch_id, actor=created_by,
+                          details={'total_files': len(files)}, conn=conn)
+
+        inserted_count = 0
+        new_drafts = False
+        for filename, content, result in prepared:
+            try:
+                source = self.register_source_document(
+                    filename=filename, content=content, document_type=result.document_type,
+                    content_type='application/pdf' if Path(filename).suffix.lower()=='.pdf'
+                    else 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    _price_import=True)
+                doc_id = int(source['id'])
+
+                # One bounded transaction per source (<=10000 rows across the
+                # entire batch). The read/claim/draft/price inserts are atomic.
+                with self.db.connection() as conn:
+                    conn.execute('BEGIN IMMEDIATE')
+                    if conn.execute('SELECT 1 FROM price_history_entries WHERE source_document_id=? LIMIT 1',
+                                    (doc_id,)).fetchone():
+                        continue
+                    draft_id = None
+                    approved_supplier_id = None
+                    created_draft = False
+                    if result.supplier_name or result.supplier_tax_id:
+                        dedup_key = supplier_dedup_key(result.supplier_tax_id, result.supplier_name,
+                                                      result.supplier_email, result.supplier_phone)
+                        existing_draft = conn.execute(
+                            'SELECT id,status,approved_supplier_id FROM supplier_drafts WHERE dedup_key=?',
+                            (dedup_key,)).fetchone()
+                        superseded_id = None
+                        if existing_draft and existing_draft['status']=='rejected':
+                            # Keep the rejected decision, evidence and old price
+                            # links intact. Retire only its active identity key;
+                            # corrected evidence gets a fresh reviewable record.
+                            superseded_id = existing_draft['id']
+                            retired_key = hashlib.sha256(
+                                f'{dedup_key}:rejected:{superseded_id}'.encode()).hexdigest()
+                            conn.execute("UPDATE supplier_drafts SET dedup_key=? WHERE id=? AND status='rejected'",
+                                         (retired_key,superseded_id))
+                            existing_draft = None
+                        if existing_draft:
+                            draft_id = existing_draft['id']
+                            if existing_draft['status']=='approved':
+                                approved_supplier_id = existing_draft['approved_supplier_id']
+                                if approved_supplier_id is None:
+                                    raise ValueError('approved supplier draft has no authoritative supplier link')
+                        else:
+                            region = result.supplier_region or infer_region(result.supplier_name, result.supplier_tax_id)
+                            cluster, cluster_status = detect_cluster(region)
+                            raw = {'name':result.supplier_name, 'tax_id':result.supplier_tax_id,
+                                   'region':result.supplier_region, 'email':result.supplier_email,
+                                   'phone':result.supplier_phone, 'contact_person':result.supplier_contact,
+                                   'document_date':result.document_date}
+                            cursor = conn.execute("""
+                                INSERT INTO supplier_drafts(import_batch_id,source_document_id,
+                                    name,tax_id,region,cluster,email,phone,contact_person,
+                                    raw_json,dedup_key,status,cluster_status,created_at)
+                                VALUES (?,?,?,?,?,?,?,?,?,?,?,'needs_review',?,?)
+                            """, (batch_id,doc_id,result.supplier_name,result.supplier_tax_id,region,cluster,
+                                  result.supplier_email,result.supplier_phone,result.supplier_contact,
+                                  json.dumps(raw,ensure_ascii=False),dedup_key,cluster_status,utcnow()))
+                            draft_id = cursor.lastrowid
+                            created_draft = True
+                            if superseded_id is not None:
+                                self.db.audit('superseded','supplier_draft',superseded_id,actor=created_by,
+                                              details={'new_draft_id':draft_id,'source_document_id':doc_id,
+                                                       'old_decision_preserved':True},conn=conn)
+                    now = utcnow()
+                    validity = price_validity_state(result.valid_until)
+                    rows = [(
+                        batch_id,doc_id,draft_id,approved_supplier_id,item.item_name,item.brand,
+                        item.normalized_name,item.quantity,item.unit,item.unit_price,item.total_price,
+                        item.currency,int(item.vat_included),result.document_date,result.valid_until,validity,
+                        item.source_page,item.source_sheet,item.source_row,item.source_cell,item.source_text,'draft',now
+                    ) for item in result.items]
+                    conn.executemany("""
+                        INSERT INTO price_history_entries(import_batch_id,source_document_id,supplier_draft_id,supplier_id,
+                            item_name,brand,normalized_name,quantity,unit,unit_price,total_price,currency,vat_included,
+                            document_date,valid_until,validity_state,source_page,source_sheet,source_row,source_cell,
+                            source_text,status,created_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """, rows)
+                # Count only committed rows/claims, not rolled-back attempts.
+                inserted_count += len(rows)
+                new_drafts = new_drafts or created_draft
+            except Exception as exc:
+                errors.append(f"{filename}: import failed — {type(exc).__name__}")
+
+        final_status = 'needs_review' if inserted_count or new_drafts else 'failed' if errors else 'done'
+        with self.db.connection() as conn:
+            conn.execute("""
+                UPDATE import_batches SET status=?,processed_files=?,sha256_json=?,errors_json=? WHERE id=?
+            """, (final_status,len(files),json.dumps(sha256_map,ensure_ascii=False),
+                  json.dumps(errors,ensure_ascii=False),batch_id))
+        return self.get_import_batch(batch_id)
+
+    def get_import_batch(self, batch_id: int) -> dict[str, Any]:
+        row = self.db.one("SELECT * FROM import_batches WHERE id = ?", (batch_id,))
+        if not row:
+            raise NotFoundError("import batch not found")
+        row["filenames"] = json.loads(row.pop("filenames_json"))
+        row["sha256"] = json.loads(row.pop("sha256_json"))
+        row["errors"] = json.loads(row.pop("errors_json"))
+        row["supplier_drafts"] = self.db.all(
+            "SELECT * FROM supplier_drafts WHERE import_batch_id = ? ORDER BY id",
+            (batch_id,),
+        )
+        row["price_history_entries"] = self.db.all(
+            """SELECT e.*, d.filename AS source_filename, d.document_type AS source_document_type
+               FROM price_history_entries e LEFT JOIN source_documents d ON d.id=e.source_document_id
+               WHERE e.import_batch_id = ? ORDER BY e.id""",
+            (batch_id,),
+        )
+        return row
+
+    def list_import_batches(self) -> list[dict[str, Any]]:
+        rows = self.db.all("""
+            SELECT b.*,
+              (SELECT COUNT(*) FROM supplier_drafts s WHERE s.import_batch_id=b.id) AS supplier_draft_count,
+              (SELECT COUNT(*) FROM price_history_entries e WHERE e.import_batch_id=b.id) AS price_entry_count,
+              (SELECT COUNT(*) FROM price_history_entries e WHERE e.import_batch_id=b.id AND e.status='draft') AS draft_entry_count,
+              (SELECT COUNT(*) FROM price_history_entries e WHERE e.import_batch_id=b.id AND e.status='confirmed') AS confirmed_entry_count
+            FROM import_batches b ORDER BY b.id DESC
+        """)
+        for row in rows:
+            row["filenames"] = json.loads(row.pop("filenames_json"))
+            row["sha256"] = json.loads(row.pop("sha256_json"))
+            row["errors"] = json.loads(row.pop("errors_json"))
+        return rows
+
+    def confirm_batch_entries(
+        self,
+        batch_id: int,
+        entry_ids: list[int],
+        confirmed_by: str,
+    ) -> dict[str, Any]:
+        return self._review_batch_entries(batch_id, entry_ids, confirmed_by, 'confirmed')
+
+    def reject_batch_entries(self, batch_id: int, entry_ids: list[int], rejected_by: str) -> dict[str, Any]:
+        return self._review_batch_entries(batch_id, entry_ids, rejected_by, 'rejected')
+
+    def _review_batch_entries(self, batch_id, entry_ids, confirmed_by, target):
+        confirmed_by = trusted_actor(confirmed_by)
+        self.get_import_batch(batch_id)
+        if not entry_ids or len(entry_ids) > 500 or any(type(eid) is not int or eid <= 0 for eid in entry_ids):
+            raise ValueError("select between 1 and 500 positive entry IDs for review")
+        entry_ids = list(dict.fromkeys(entry_ids))
+        now = utcnow()
+        with self.db.connection() as conn:
+            # Validate the entire selection under one lock before changing any row.
+            conn.execute("BEGIN IMMEDIATE")
+            selected = []
+            for eid in entry_ids:
+                row = conn.execute(
+                    "SELECT id,status FROM price_history_entries WHERE id=? AND import_batch_id=?", (eid, batch_id)
+                ).fetchone()
+                if not row:
+                    raise NotFoundError(f"price_history_entry {eid} not in batch {batch_id}")
+                if row["status"] not in {"draft", target}:
+                    raise ConflictError("only draft or already " + target + " entries may be reviewed")
+                if row["status"] == "draft":
+                    selected.append(eid)
+            for eid in selected:
+                conn.execute(
+                    "UPDATE price_history_entries SET status=?, confirmed_by=?, confirmed_at=? WHERE id=? AND status='draft'",
+                    (target, confirmed_by, now, eid),
+                )
+            confirmed = len(selected)
+            if confirmed:
+                self.db.audit("entries_" + target, "import_batch", batch_id, actor=confirmed_by,
+                              details={"entry_ids": selected, target: confirmed, "paid_purchase": False}, conn=conn)
+                remaining = conn.execute(
+                    "SELECT COUNT(*) AS n FROM price_history_entries WHERE import_batch_id=? AND status='draft'", (batch_id,)
+                ).fetchone()
+                if remaining["n"] == 0:
+                    conn.execute("UPDATE import_batches SET status='done', reviewed_at=? WHERE id=?", (now, batch_id))
+                    self.db.audit("completed", "import_batch", batch_id, actor=confirmed_by,
+                                  details={target: confirmed}, conn=conn)
+        return {target: confirmed}
+
+    def list_supplier_drafts(
+        self, status: str = "", batch_id: int | None = None
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if batch_id is not None:
+            clauses.append("import_batch_id = ?")
+            params.append(batch_id)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        drafts = self.db.all(
+            f"SELECT * FROM supplier_drafts {where} ORDER BY id DESC",
+            tuple(params),
+        )
+        suppliers = self.db.all(
+            "SELECT id, name, tax_id, region, cluster, email "
+            "FROM suppliers WHERE active = 1"
+        )
+        for draft in drafts:
+            draft['match_error'] = ''
+            try:
+                matched = self._match_existing_supplier(draft, suppliers)
+            except ConflictError as exc:
+                matched = None
+                draft['match_error'] = str(exc)
+            draft["matched_supplier_id"] = matched["id"] if matched else None
+            draft["matched_supplier_name"] = matched["name"] if matched else ""
+            draft["suggested_region"] = draft["region"] or (
+                matched["region"]
+                if matched
+                else infer_region(draft["name"], draft["tax_id"])
+            )
+            draft["suggested_cluster"] = (
+                draft["cluster"]
+                or (matched["cluster"] if matched else "")
+                or infer_cluster(draft["suggested_region"])
+            )
+        return drafts
+
+    @staticmethod
+    def _match_existing_supplier(
+        draft: dict[str, Any], suppliers: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        """Unique evidence only; never pick an arbitrary row on ambiguity."""
+        def unique(matches):
+            if len(matches)>1:
+                raise ConflictError('ambiguous supplier match; resolve supplier identity before approval')
+            return matches[0] if matches else None
+        draft_tax_id = re.sub(r"\D", "", str(draft.get("tax_id", "")))
+        if draft_tax_id:
+            # An explicit INN must not fall back to another person's email/name.
+            return unique([s for s in suppliers if re.sub(r'\D','',str(s.get('tax_id','')))==draft_tax_id])
+
+        draft_email = str(draft.get("email", "")).strip().casefold()
+        if draft_email:
+            matches=[s for s in suppliers if str(s.get('email','')).strip().casefold()==draft_email]
+            if matches:
+                return unique(matches)
+
+        normalise_name = lambda value: " ".join(
+            re.findall(r"[0-9a-zа-я]+", str(value).casefold().replace("ё", "е"))
+        )
+        draft_name = normalise_name(draft.get("name", ""))
+        if draft_name:
+            return unique([s for s in suppliers if normalise_name(s.get('name',''))==draft_name])
+        return None
+
+    def confirm_supplier_draft(
+        self,
+        draft_id: int,
+        data: Any,
+    ) -> dict[str, Any]:
+        confirmed_by = trusted_actor(data.confirmed_by)
+        from .models import SupplierCreate
+        # Lock before the status check and keep the entire approval atomic.
+        # No nested service connections may commit a supplier before its claim.
+        with self.db.connection() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            draft_row = conn.execute("SELECT * FROM supplier_drafts WHERE id=?", (draft_id,)).fetchone()
+            if not draft_row:
+                raise NotFoundError("supplier draft not found")
+            draft = dict(draft_row)
+            if draft['status'] not in ('needs_review', 'pending'):
+                raise ConflictError(f"draft status is {draft['status']!r}, expected needs_review")
+            name = data.name or draft['name']
+            email = data.email or draft['email']
+            phone = data.phone or draft['phone']
+            region = data.region or draft['region']
+            if not region:
+                raise ValueError('supplier region is required before confirmation')
+            cluster = resolve_cluster(region, data.cluster or draft['cluster'])
+            if not cluster:
+                raise ValueError('supplier cluster is required before confirmation')
+            supplier_data = SupplierCreate(name=name, tax_id=draft['tax_id'], region=region,
+                                           email=email, phone=phone, cluster=cluster, categories=[])
+            matched = self._match_existing_supplier(
+                {'name': name, 'tax_id': draft['tax_id'], 'email': email},
+                [dict(row) for row in conn.execute(
+                    'SELECT id,name,tax_id,region,cluster,email FROM suppliers WHERE active=1').fetchall()])
+            if matched and matched['cluster'] and matched['cluster'] != cluster:
+                raise ConflictError('existing supplier belongs to another cluster')
+            if matched:
+                supplier_id = int(matched['id'])
+                conn.execute(
+                    """
+                    UPDATE suppliers
+                    SET region=CASE WHEN region='' THEN ? ELSE region END,
+                        cluster=CASE WHEN cluster='' THEN ? ELSE cluster END
+                    WHERE id=?
+                    """,
+                    (region, cluster, supplier_id),
+                )
+            else:
+                supplier_id = conn.execute('''INSERT INTO suppliers(
+                    name,tax_id,region,email,phone,cluster,categories_json,rating,verified,source,created_at)
+                    VALUES (?,?,?,?,?,?,?,3,0,'import_batch',?)''',
+                    (supplier_data.name,supplier_data.tax_id,region,email,phone,cluster,'[]',utcnow())).lastrowid
+                self.db.audit('created','supplier',supplier_id,actor=confirmed_by,
+                              details={'source':'import_batch'},conn=conn)
+            now = utcnow()
+            conn.execute(
+                """
+                UPDATE supplier_drafts
+                SET status='approved', confirmed_by=?, confirmed_at=?,
+                    review_notes=?, name=?, region=?, cluster=?,
+                    cluster_status='confirmed', approved_supplier_id=?
+                WHERE id=?
+                """,
+                (
+                    confirmed_by,
+                    now,
+                    data.review_notes,
+                    name,
+                    region,
+                    cluster,
+                    supplier_id,
+                    draft_id,
+                ),
+            )
+            # Supplier identity review is NOT financial or paid-invoice review.
+            # Only attach the supplier; a separate explicit entry review is required.
+            conn.execute(
+                "UPDATE price_history_entries SET supplier_id=? WHERE supplier_draft_id=? AND supplier_id IS NULL",
+                (supplier_id, draft_id),
+            )
+            self.db.audit(
+                "approved",
+                "supplier_draft",
+                draft_id,
+                actor=confirmed_by,
+                details={
+                    "supplier_id": supplier_id,
+                    "reused_existing_supplier": bool(matched),
+                    "cluster": cluster,
+                },
+                conn=conn,
+            )
+        return self.get_supplier(supplier_id)
+
+    def reject_supplier_draft(self, draft_id: int, data: Any) -> dict[str, Any]:
+        rejected_by = trusted_actor(data.rejected_by)
+        with self.db.connection() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            draft = conn.execute('SELECT status FROM supplier_drafts WHERE id=?', (draft_id,)).fetchone()
+            if not draft:
+                raise NotFoundError('supplier draft not found')
+            if draft['status'] not in ('needs_review','pending'):
+                raise ConflictError('only pending supplier drafts may be rejected')
+            conn.execute(
+                "UPDATE supplier_drafts SET status='rejected', confirmed_by=?, review_notes=? WHERE id=? AND status IN ('needs_review','pending')",
+                (rejected_by, data.review_notes, draft_id),
+            )
+            self.db.audit(
+                "rejected", "supplier_draft", draft_id,
+                actor=rejected_by, details={"notes": data.review_notes}, conn=conn,
+            )
+        return self.db.one("SELECT * FROM supplier_drafts WHERE id = ?", (draft_id,)) or {}
+
+    def list_price_history_entries(
+        self,
+        search: str = "",
+        status: str = "confirmed",
+        supplier_id: int | None = None,
+        batch_id: int | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status:
+            if status not in {"draft", "confirmed", "rejected"}:
+                raise ValueError("unsupported imported price status")
+            clauses.append("e.status = ?")
+            params.append(status)
+        if supplier_id is not None:
+            clauses.append("e.supplier_id = ?")
+            params.append(supplier_id)
+        if batch_id is not None:
+            clauses.append("e.import_batch_id = ?")
+            params.append(batch_id)
+        if search:
+            clauses.append("(e.item_name LIKE ? OR e.normalized_name LIKE ?)")
+            params.extend([f"%{search}%", f"%{search}%"])
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        return self.db.all(
+            f"""SELECT e.*, d.filename AS source_filename, d.document_type AS source_document_type
+                FROM price_history_entries e LEFT JOIN source_documents d ON d.id=e.source_document_id
+                {where} ORDER BY e.created_at DESC, e.id DESC LIMIT ?""",
+            tuple(params),
+        )

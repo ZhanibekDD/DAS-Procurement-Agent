@@ -54,6 +54,7 @@ class LotItemCreate(StrictModel):
     source_document_id: int | None = Field(default=None, gt=0)
     source_page: int | None = Field(default=None, ge=1, le=10000)
     source_reference: str = Field(default="", max_length=500)
+    delivery_date: date | None = None
 
 
 class RfqRequirements(StrictModel):
@@ -77,6 +78,7 @@ class LotCreate(StrictModel):
     currency: str = Field(default="RUB", pattern=r"^[A-Z]{3}$")
     rfq_requirements: RfqRequirements | None = None
     items: list[LotItemCreate] = Field(min_length=1, max_length=500)
+    attachment_document_ids: list[int] = Field(default_factory=list, max_length=30)
 
 
 class ProcurementSuggestionCreate(StrictModel):
@@ -109,6 +111,7 @@ class CampaignCreate(StrictModel):
     template_code: str = Field(default="rfq-email", min_length=2, max_length=80)
     supplier_ids: list[int] = Field(min_length=1, max_length=500)
     channel: Literal["email", "telegram", "max"] = "email"
+    idempotency_key: str = Field(default="", max_length=128, pattern=r"^[A-Za-z0-9_.:-]*$")
 
 
 class QuoteItemCreate(StrictModel):
@@ -121,8 +124,9 @@ class QuoteItemCreate(StrictModel):
 
 class QuoteCreate(StrictModel):
     supplier_id: int = Field(gt=0)
-    currency: str = Field(default="RUB", pattern=r"^[A-Z]{3}$")
-    vat_included: bool = True
+    # A quote must state its money basis; do not silently invent RUB or VAT.
+    currency: str = Field(pattern=r"^[A-Z]{3}$")
+    vat_included: bool = Field(strict=True)
     delivery_cost: Decimal = Field(default=Decimal("0"), ge=0)
     lead_days: int = Field(default=0, ge=0, le=3650)
     payment_terms: str = Field(default="", max_length=1000)
@@ -139,8 +143,8 @@ class PurchaseHistoryCreate(StrictModel):
     quantity: Decimal = Field(gt=0)
     unit: str = Field(min_length=1, max_length=30)
     unit_price: Decimal = Field(gt=0)
-    currency: str = Field(default="RUB", pattern=r"^[A-Z]{3}$")
-    vat_included: bool = True
+    currency: str = Field(pattern=r"^[A-Z]{3}$")
+    vat_included: bool = Field(strict=True)
     purchased_on: date
     invoice_number: str = Field(default="", max_length=120)
     project_name: str = Field(default="", max_length=240)
@@ -157,3 +161,27 @@ class TemplateUpsert(StrictModel):
 class ApprovalDecision(StrictModel):
     approved_by: str = Field(min_length=2, max_length=160)
     comment: str = Field(default="", max_length=1000)
+
+
+# ── PR #8: batch import & price-history models ───────────────────────────────
+
+
+class SupplierDraftConfirm(StrictModel):
+    confirmed_by: str = Field(min_length=2, max_length=160)
+    cluster: Literal["cluster_1", "cluster_2"]
+    region: str = Field(min_length=2, max_length=120)
+    name: str | None = None
+    email: str | None = None
+    phone: str | None = None
+    contact_person: str | None = None
+    review_notes: str = ''
+
+
+class SupplierDraftReject(StrictModel):
+    rejected_by: str
+    review_notes: str = ''
+
+
+class BatchImportConfirm(StrictModel):
+    confirmed_by: str
+    entry_ids: list[int]

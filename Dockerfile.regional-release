@@ -1,0 +1,9 @@
+# The build procedure must verify this local base tag's content ID before build.
+FROM procurement-supplier-canary:1d4b4d0
+ARG SOURCE_REVISION
+LABEL org.opencontainers.image.revision=$SOURCE_REVISION \
+      org.opencontainers.image.base.digest="sha256:75f8bbea38e48c140e80e0e1d030ddad809c41b791393164973c5e69adf6396c" \
+      org.opencontainers.image.version="regional-mapping-v1"
+USER root
+COPY --chown=10001:10001 procurement /app/procurement
+USER procurement

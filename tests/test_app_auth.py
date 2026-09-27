@@ -78,6 +78,18 @@ class StandaloneAuthHttpFlowTests(unittest.TestCase):
         dashboard = self.client.get("/api/dashboard")
         self.assertEqual(dashboard.status_code, 200)
 
+    def test_form_pages_preserve_origin_on_initial_and_failed_login(self):
+        for page in (self.client.get("/login"), self.client.post("/auth/login",
+                data={"username": "synthetic-invalid", "password": "synthetic-invalid"})):
+            self.assertEqual(page.headers["referrer-policy"], "strict-origin")
+            self.assertIn('<meta name="referrer" content="strict-origin">', page.text)
+            self.assertIn('<form method="post" action="/auth/login">', page.text)
+            self.assertNotIn('content="no-referrer"', page.text)
+        self.client.post("/auth/login", data={"username": ADMIN_USERNAME, "password": ADMIN_PASSWORD})
+        root = self.client.get("/")
+        self.assertEqual(root.headers["referrer-policy"], "strict-origin")
+        self.assertIn('<meta name="referrer" content="strict-origin">', root.text)
+
     def test_unauthenticated_browser_is_redirected_to_login_and_api_fails_closed(self):
         root = self.client.get("/", follow_redirects=False)
         dashboard = self.client.get("/api/dashboard")

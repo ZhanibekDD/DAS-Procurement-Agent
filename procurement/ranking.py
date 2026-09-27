@@ -5,6 +5,9 @@ from decimal import Decimal
 
 def rank_quotes(rows: list[dict]) -> list[dict]:
     """Rank compliant quotes by the approved price, delivery and VAT policy."""
+    currencies = {row.get("currency") for row in rows}
+    if len(currencies) > 1:
+        raise ValueError("quotes must use one currency; approved exchange rates are not configured")
     eligible = [row for row in rows if row["compliant"] and row["total_cost"] > 0]
     min_total = min((Decimal(str(row["total_cost"])) for row in eligible), default=None)
 

@@ -7,9 +7,19 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterator
 
+from .identity import trusted_actor
+
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS sso_module_session_revocations (
+    session_hash TEXT PRIMARY KEY,
+    expires_at INTEGER NOT NULL,
+    revoked_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_sso_module_revocations_expiry
+    ON sso_module_session_revocations(expires_at);
 
 CREATE TABLE IF NOT EXISTS projects (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,6 +122,32 @@ CREATE TABLE IF NOT EXISTS outbox_messages (
     approved_at TEXT,
     created_at TEXT NOT NULL,
     UNIQUE(campaign_id, supplier_id)
+);
+
+-- Additive ledgers for new canary workflows; no historical rows are rewritten.
+CREATE TABLE IF NOT EXISTS campaign_requests (
+    request_key TEXT PRIMARY KEY,
+    payload_sha256 TEXT NOT NULL,
+    campaign_id INTEGER NOT NULL REFERENCES campaigns(id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_campaign_request_payload ON campaign_requests(payload_sha256);
+
+CREATE TABLE IF NOT EXISTS outbox_approvals (
+    message_id INTEGER PRIMARY KEY REFERENCES outbox_messages(id),
+    payload_sha256 TEXT NOT NULL,
+    approved_by TEXT NOT NULL,
+    approved_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sandbox_deliveries (
+    message_id INTEGER PRIMARY KEY REFERENCES outbox_messages(id),
+    channel TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    simulated_by TEXT NOT NULL,
+    simulated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS quotes (
@@ -219,6 +255,78 @@ CREATE TABLE IF NOT EXISTS audit_log (
     details_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS import_batches (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    status          TEXT    NOT NULL DEFAULT 'pending',
+    filenames_json  TEXT    NOT NULL DEFAULT '[]',
+    total_files     INTEGER NOT NULL DEFAULT 0,
+    processed_files INTEGER NOT NULL DEFAULT 0,
+    sha256_json     TEXT    NOT NULL DEFAULT '{}',
+    created_by      TEXT    NOT NULL DEFAULT 'system',
+    created_at      TEXT    NOT NULL,
+    reviewed_at     TEXT
+);
+
+CREATE TABLE IF NOT EXISTS supplier_drafts (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_batch_id    INTEGER REFERENCES import_batches(id) ON DELETE SET NULL,
+    source_document_id INTEGER REFERENCES source_documents(id) ON DELETE SET NULL,
+    name               TEXT    NOT NULL,
+    tax_id             TEXT    NOT NULL DEFAULT '',
+    region             TEXT    NOT NULL DEFAULT '',
+    cluster            TEXT    NOT NULL DEFAULT '',
+    email              TEXT    NOT NULL DEFAULT '',
+    phone              TEXT    NOT NULL DEFAULT '',
+    contact_person     TEXT    NOT NULL DEFAULT '',
+    raw_json           TEXT    NOT NULL DEFAULT '{}',
+    dedup_key          TEXT    NOT NULL DEFAULT '',
+    status             TEXT    NOT NULL DEFAULT 'needs_review',
+    cluster_status     TEXT    NOT NULL DEFAULT 'pending',
+    review_notes       TEXT    NOT NULL DEFAULT '',
+    confirmed_by       TEXT    NOT NULL DEFAULT '',
+    confirmed_at       TEXT,
+    created_at         TEXT    NOT NULL,
+    UNIQUE(dedup_key)
+);
+
+CREATE TABLE IF NOT EXISTS price_history_entries (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    import_batch_id    INTEGER REFERENCES import_batches(id) ON DELETE SET NULL,
+    source_document_id INTEGER REFERENCES source_documents(id) ON DELETE SET NULL,
+    supplier_draft_id  INTEGER REFERENCES supplier_drafts(id) ON DELETE SET NULL,
+    supplier_id        INTEGER REFERENCES suppliers(id) ON DELETE SET NULL,
+    item_name          TEXT    NOT NULL,
+    brand              TEXT    NOT NULL DEFAULT '',
+    normalized_name    TEXT    NOT NULL,
+    quantity           TEXT    NOT NULL DEFAULT '',
+    unit               TEXT    NOT NULL DEFAULT '',
+    unit_price         TEXT    NOT NULL,
+    total_price        TEXT    NOT NULL DEFAULT '',
+    currency           TEXT    NOT NULL DEFAULT 'RUB',
+    vat_included       INTEGER NOT NULL DEFAULT 1,
+    document_date      TEXT,
+    valid_until        TEXT,
+    validity_state     TEXT    NOT NULL DEFAULT 'unknown',
+    source_page        INTEGER,
+    source_sheet       TEXT    NOT NULL DEFAULT '',
+    source_row         INTEGER,
+    source_cell        TEXT    NOT NULL DEFAULT '',
+    source_text        TEXT    NOT NULL DEFAULT '',
+    status             TEXT    NOT NULL DEFAULT 'draft',
+    confirmed_by       TEXT    NOT NULL DEFAULT '',
+    confirmed_at       TEXT,
+    created_at         TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_phe_lookup
+    ON price_history_entries(normalized_name, unit, currency, document_date DESC);
+
+CREATE INDEX IF NOT EXISTS ix_phe_status
+    ON price_history_entries(status, supplier_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS ix_supplier_drafts_status
+    ON supplier_drafts(status, import_batch_id);
 """
 
 
@@ -265,6 +373,8 @@ class Database:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self.connection() as conn:
             conn.executescript(SCHEMA)
+            from .launch_workflow import SCHEMA as LAUNCH_SCHEMA
+            conn.executescript(LAUNCH_SCHEMA)
             self._migrate_columns(conn)
             for code, template in DEFAULT_TEMPLATES.items():
                 conn.execute(
@@ -291,9 +401,16 @@ class Database:
                 ("rfq_requirements_json", "TEXT NOT NULL DEFAULT '{}'"),
             ),
             "lot_items": (
+                ("delivery_date", "TEXT"),
                 ("source_document_id", "INTEGER REFERENCES source_documents(id) ON DELETE SET NULL"),
                 ("source_page", "INTEGER"),
                 ("source_reference", "TEXT NOT NULL DEFAULT ''"),
+            ),
+            "supplier_drafts": (
+                ("approved_supplier_id", "INTEGER REFERENCES suppliers(id) ON DELETE SET NULL"),
+            ),
+            "import_batches": (
+                ("errors_json", "TEXT NOT NULL DEFAULT '[]'"),
             ),
         }
         for table, columns in additions.items():
@@ -303,6 +420,22 @@ class Database:
             for name, definition in columns:
                 if name not in existing:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+        # Recover only authoritative historical links, never fuzzy-match an approval.
+        conn.execute("""UPDATE supplier_drafts SET approved_supplier_id=(
+            SELECT min(supplier_id) FROM price_history_entries WHERE supplier_draft_id=supplier_drafts.id)
+            WHERE status='approved' AND approved_supplier_id IS NULL AND (
+            SELECT count(DISTINCT supplier_id) FROM price_history_entries
+            WHERE supplier_draft_id=supplier_drafts.id)=1""")
+        for draft in conn.execute("SELECT id FROM supplier_drafts WHERE status='approved' AND approved_supplier_id IS NULL").fetchall():
+            row = conn.execute("""SELECT details_json FROM audit_log WHERE action='approved'
+                AND entity_type='supplier_draft' AND entity_id=? ORDER BY id DESC LIMIT 1""", (str(draft['id']),)).fetchone()
+            if row:
+                try:
+                    supplier_id = json.loads(row['details_json']).get('supplier_id')
+                except (ValueError, TypeError):
+                    continue
+                if type(supplier_id) is int and conn.execute('SELECT 1 FROM suppliers WHERE id=?', (supplier_id,)).fetchone():
+                    conn.execute('UPDATE supplier_drafts SET approved_supplier_id=? WHERE id=?', (supplier_id, draft['id']))
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
@@ -331,6 +464,32 @@ class Database:
             rows = conn.execute(sql, params).fetchall()
         return [dict(row) for row in rows]
 
+    def sso_session_revoked(self, session_hash: str) -> bool:
+        return self.one("SELECT 1 FROM sso_module_session_revocations WHERE session_hash=?", (session_hash,)) is not None
+
+    def revoke_sso_session(self, session_hash: str, expires_at: int, subject: str, now: int) -> None:
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            inserted = conn.execute("""INSERT INTO sso_module_session_revocations(session_hash,expires_at,revoked_at)
+                VALUES (?,?,?) ON CONFLICT(session_hash) DO NOTHING""", (session_hash, expires_at, now)).rowcount
+            if inserted:
+                self.audit("sso_logout", "session", subject, actor=subject,
+                           details={"scope": "procurement_module", "revoked": True}, conn=conn)
+
+    def cleanup_sso_revocations(self, *, now: int, limit: int = 1000, dry_run: bool = True) -> dict[str, int | bool]:
+        """Explicit bounded maintenance only; never invoked by login/request/startup."""
+        if type(now) is not int or type(limit) is not int or not 1 <= limit <= 1000 or type(dry_run) is not bool:
+            raise ValueError("cleanup requires an integer clock and a limit between 1 and 1000")
+        with self.connection() as conn:
+            if not dry_run:
+                conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute("""SELECT session_hash FROM sso_module_session_revocations
+                WHERE expires_at<=? ORDER BY expires_at,session_hash LIMIT ?""", (now, limit)).fetchall()
+            if not dry_run:
+                conn.executemany("DELETE FROM sso_module_session_revocations WHERE session_hash=? AND expires_at<=?",
+                                 [(row["session_hash"], now) for row in rows])
+        return {"dry_run": dry_run, "eligible": len(rows), "deleted": 0 if dry_run else len(rows)}
+
     def audit(
         self,
         action: str,
@@ -342,7 +501,7 @@ class Database:
         conn: sqlite3.Connection | None = None,
     ) -> None:
         values = (
-            actor,
+            trusted_actor(actor),
             action,
             entity_type,
             str(entity_id),
