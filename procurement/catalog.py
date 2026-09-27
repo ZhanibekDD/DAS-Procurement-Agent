@@ -174,9 +174,13 @@ class Catalog:
         return report
 
     def prices(self,query='',specification=''):
-        rows=self.db.all('''SELECT p.*,s.name AS supplier_name,s.rating AS reliability,s.active
-            FROM supplier_catalog_prices p JOIN suppliers s ON s.id=p.supplier_id ORDER BY p.price_date DESC,p.id DESC LIMIT 5000''')
-        rows=[r for r in rows if normalize(query) in normalize(r['item_name']+' '+r['category']) and normalize(specification) in normalize(r['specification'])]
+        with self.db.connection() as conn:
+            conn.create_function('catalog_normalize',1,normalize,deterministic=True)
+            rows=[dict(r) for r in conn.execute('''SELECT p.*,s.name AS supplier_name,s.rating AS reliability,s.active
+                FROM supplier_catalog_prices p JOIN suppliers s ON s.id=p.supplier_id
+                WHERE instr(catalog_normalize(p.item_name||' '||p.category),?)>0
+                AND instr(catalog_normalize(p.specification),?)>0
+                ORDER BY p.price_date DESC,p.id DESC LIMIT 5000''',(normalize(query),normalize(specification)))]
         # One current offer per supplier; older prices remain visible as history.
         current={};seen=set()
         for r in rows:
