@@ -19,18 +19,23 @@ def normalized(value):
     return ' '.join(value.split())
 
 
+_DESIGNATION_PATTERN = (r'(?<!\w)(фбс|пб|фл)\s*[-–—]?\s*(\d+)\s*[.хx×-]\s*(\d+)\s*[.хx×-]\s*(\d+)'
+                        r'(?:\s*[-–—]\s*([а-яa-z]{1,3}))?(?!\w)')
+
+
 def material_key(value):
     value = normalized(value)
     # Only known material designations receive punctuation/spacing aliases.
     # Family is part of the key: an FBS mark can never match a PB mark.
-    match = re.search(r'(?<!\w)(фбс|пб|фл)\s*[-–—]?\s*(\d+)\s*[.хx×-]\s*(\d+)\s*[.хx×-]\s*(\d+)(?!\d)', value)
+    match = re.search(_DESIGNATION_PATTERN, value)
     primary = re.search(r'(?<!\w)(фбс|пб|фл)(?!\w)', value)
     if not match or (primary and primary[1] != match[1]):
         return value
     before = value[:match.start()].strip()
     if before in {'блок', 'блоки', 'блок фундаментный', 'блоки фундаментные', 'плита', 'плиты'}:
         before = ''
-    mark = match[1] + ' ' + '.'.join(str(int(match[i])) for i in (2, 3, 4))
+    mark = (match[1] + ' ' + '.'.join(str(int(match[i])) for i in (2, 3, 4))
+            + ('-' + match[5] if match[5] else ''))
     return ' '.join(filter(None, (before, mark, value[match.end():].strip())))
 
 
@@ -39,10 +44,8 @@ INVALID_DESIGNATION = '<conflicting designation>'
 
 def designation_key(name, specification=''):
     """Require one complete mark across both fields; variants and family matter."""
-    pattern = (r'(?<!\w)(фбс|пб|фл)\s*[-–—]?\s*(\d+)\s*[.хx×-]\s*(\d+)\s*[.хx×-]\s*(\d+)'
-               r'(?:\s*[-–—]\s*([а-яa-z]{1,3}))?(?!\w)')
     fields = (normalized(name), normalized(specification))
-    found = [match for field in fields for match in re.finditer(pattern, field)]
+    found = [match for field in fields for match in re.finditer(_DESIGNATION_PATTERN, field)]
     families = ({match[1] for match in found}
                 | {match[1] for field in fields for match in re.finditer(r'(?<!\w)(фбс|пб|фл)(?!\w)', field)})
     marks = {match[1] + ' ' + '.'.join(str(int(match[i])) for i in (2, 3, 4))
