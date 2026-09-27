@@ -196,6 +196,8 @@ def contacts(values: dict) -> dict:
     if email and not re.fullmatch(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z]{2,63}", email):
         raise ValueError('Некорректная почта')
     phone = str(v.get('phone', '')).strip()
+    # Business-card typography is formatting, not another phone number.
+    phone = phone.translate(str.maketrans({'\u00a0':' ', '\u202f':' ', '\u2010':'-', '\u2011':'-', '\u2012':'-', '\u2013':'-', '\u2014':'-'}))
     if phone:
         if not re.fullmatch(r'\+?[0-9 ()-]+', phone):
             raise ValueError('Некорректный телефон')

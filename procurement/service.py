@@ -1093,8 +1093,14 @@ class ProcurementService:
             raise ValueError("fence schedule extraction requires a project section document")
         if document["project_id"] is None:
             raise ValueError("project section document must be linked to a project")
-        content = read_stored_pdf(document["storage_path"])
-        text = extract_pdf_page(content, page_number)
+        from .launch_workflow import LaunchWorkflow
+        from .document_analysis import extract_pdf_page_review
+        launch = LaunchWorkflow(self)
+        content = launch.document_file(document)
+        extracted = extract_pdf_page_review(content, page_number)
+        if extracted['mode'] == 'ocr':
+            return launch.pdf_review(document, page_number, extracted)
+        text = extracted['text']
         suggestion_data = extract_bulat_fence_schedule(
             text,
             page_number=page_number,

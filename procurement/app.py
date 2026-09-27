@@ -546,6 +546,9 @@ def add_section(project_id: int, data: SectionCreate):
 @app.post("/api/suppliers", dependencies=[Depends(require_access)], status_code=201)
 def create_supplier(data: SupplierCreate):
     try:
+        from .table_ingest import contacts
+        checked = contacts({'email': data.email, 'phone': data.phone})
+        data = data.model_copy(update={k: checked[k] for k in ('email','phone')})
         return service.create_supplier(data)
     except Exception as exc:
         raise handle_domain_error(exc) from exc

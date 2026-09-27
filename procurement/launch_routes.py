@@ -35,6 +35,10 @@ class SheetConfirm(Confirm):
     lot: LotCreate
 
 
+class PdfConfirm(SheetConfirm):
+    reviewed_line_ids: list[StrictInt] = Field(min_length=1, max_length=1200)
+
+
 class PriceRejection(StrictModel):
     entry_ids: list[StrictInt] = Field(min_length=1, max_length=500)
     rejected_by: str = Field(min_length=1, max_length=128)
@@ -137,6 +141,11 @@ def install(app, settings, service, launch, require_access, session_claims, doma
             document = await run_in_threadpool(call,lambda: service.register_source_document(filename=file.filename or '',content=content,
                              document_type='project_section',project_id=project_id))
             return await run_in_threadpool(call,launch.sheet_preview,parsed,chosen,document)
+
+    @app.post('/api/launch/pdf-review/{pid}/create', dependencies=[Depends(write_access)], status_code=201)
+    def create_pdf(pid: str, data: PdfConfirm):
+        return call(lambda: launch.create_sheet_lot(pid, data.lot.model_dump(mode='json'), data.confirmed,
+                    kind='pdf_ocr', reviewed_line_ids=data.reviewed_line_ids))
 
     @app.post('/api/launch/lot-sheet/{pid}/create', dependencies=[Depends(write_access)],status_code=201)
     def create(pid: str,data: SheetConfirm):

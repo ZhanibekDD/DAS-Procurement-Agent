@@ -72,7 +72,6 @@ class LaunchWorkflow:
         return {**row, 'revision': payload_sha256(raw)}
 
     def edit_supplier(self, supplier_id, data, revision):
-        values = supplier_values(SupplierCreate(**contacts(data)))
         with self.db.connection() as conn:
             conn.execute('BEGIN IMMEDIATE')
             before = conn.execute('SELECT * FROM suppliers WHERE id=?', (supplier_id,)).fetchone()
@@ -80,6 +79,17 @@ class LaunchWorkflow:
                 raise NotFoundError('Поставщик не найден')
             if not before['active'] or payload_sha256(dict(before)) != revision:
                 raise ConflictError('Карточка изменилась или удалена; обновите страницу')
+            # Legacy cards may contain a foreign/invalid INN or contact. An unrelated
+            # edit must not silently rewrite it or require fixing it first. All new
+            # contact values still pass the same strict import validation.
+            changed = {k:data[k] for k in ('tax_id','email','phone') if data[k] != before[k]}
+            validated = contacts(changed)
+            prepared = {**data, **{k:validated[k] for k in changed}}
+            keep_cluster = data['region'] == before['region'] and data['cluster'] == before['cluster']
+            # Do not force a historic regional migration during contact/name editing.
+            # Cluster changes remain explicit and subject to the used-supplier guard.
+            values = supplier_values(SupplierCreate(**{**prepared, 'cluster': ''} if keep_cluster else prepared))
+            if keep_cluster: values['cluster'] = before['cluster']
             if before['cluster'] != values['cluster'] and self._supplier_used(conn,supplier_id):
                 raise ConflictError('Поставщик уже используется; смена кластера запрещена')
             self._update(conn, supplier_id, values)
@@ -262,13 +272,45 @@ class LaunchWorkflow:
               'source_document_id':source_document['id'] if source_document else None,
               'project_id':source_document['project_id'] if source_document else None})
 
-    def create_sheet_lot(self, pid, data, confirmed):
+    def pdf_review(self, document, page, extracted):
+        from .pdf_ocr import candidate_rows
+        rows = candidate_rows(extracted['lines'])
+        preview = self.save_preview('pdf_ocr', {
+            'source_document_id': document['id'], 'source_sha256': document['sha256'],
+            'project_id': document['project_id'], 'sheet': str(page), 'rows': rows,
+            'lines': extracted['lines'], 'source_page': page,
+        })
+        project = self.service.get_project(document['project_id'])
+        return {'decision': 'human_review_required', 'review_kind': 'pdf_ocr', 'preview': preview,
+                'source_page': page, 'suggestion': {
+                    'id': preview['preview_id'], 'review_kind': 'pdf_ocr',
+                    'source_filename': document['filename'], 'source_document_id': document['id'],
+                    'project_id': document['project_id'], 'delivery_address': project['delivery_address'],
+                    'lot_title': 'Заявка из ' + document['filename'], 'items': rows,
+                    'confidence': min(x['confidence'] for x in extracted['lines']),
+                    'lines': extracted['lines'], 'source_page': page,
+                }}
+
+    def create_sheet_lot(self, pid, data, confirmed, *, kind='lot_sheet', reviewed_line_ids=None):
         if confirmed is not True:
             raise ValueError('Подтвердите исправленные позиции')
         lot = LotCreate(**data)
         with self.db.connection() as conn:
             conn.execute('BEGIN IMMEDIATE')
-            preview, preview_data = self.preview(conn, pid, 'lot_sheet')
+            preview, preview_data = self.preview(conn, pid, kind)
+            if kind == 'pdf_ocr':
+                expected = {r['line'] for r in preview_data['lines']}
+                if (not reviewed_line_ids or len(set(reviewed_line_ids)) != len(reviewed_line_ids)
+                        or set(reviewed_line_ids) != expected):
+                    raise ValueError('Проверьте все строки OCR, включая нераспознанные позиции')
+                source = conn.execute('SELECT sha256 FROM source_documents WHERE id=?',
+                                      (preview_data['source_document_id'],)).fetchone()
+                if not source or source['sha256'] != preview_data['source_sha256']:
+                    raise ConflictError('Исходный PDF изменился после распознавания')
+                for item in lot.items:
+                    item.source_document_id = preview_data['source_document_id']
+                    item.source_page = preview_data['source_page']
+                    item.source_reference = 'Ручная проверка OCR, лист ' + preview_data['sheet']
             requested_hash = payload_sha256(lot.model_dump(mode='json'))
             if preview['status'] == 'applied':
                 result = json.loads(preview['result_json'])
@@ -304,7 +346,8 @@ class LaunchWorkflow:
                      item.source_page,item.source_reference,str(item.delivery_date) if item.delivery_date else None))
             conn.executemany('INSERT INTO lot_attachments VALUES (?,?)',[(sid,d) for d in set(lot.attachment_document_ids)])
             conn.execute("UPDATE launch_previews SET status='applied',result_json=? WHERE id=?",(encode({'lot_id':sid,'payload_sha256':requested_hash}),pid))
-            self.db.audit('lot_created_from_sheet','lot',sid,details={'preview_id':pid,'items':len(lot.items)},conn=conn)
+            self.db.audit('lot_created_from_pdf_ocr' if kind == 'pdf_ocr' else 'lot_created_from_sheet','lot',sid,
+                          details={'preview_id':pid,'items':len(lot.items), 'reviewed_line_ids': reviewed_line_ids},conn=conn)
         return self.service.get_lot(sid)
 
     def _documents(self, conn, project_id, ids):

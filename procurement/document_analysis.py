@@ -36,44 +36,73 @@ def _extract_pdf_page(content, page_number: int) -> str:
     return text
 
 
-def _page_worker(content, page_number, pipe):
+def _page_worker(content, page_number, pipe, ocr=False, workspace=None):
     try:
+        import os
+        if hasattr(os, 'setsid'): os.setsid()
         import resource
         resource.setrlimit(resource.RLIMIT_AS,(512*1024*1024,512*1024*1024))
-        resource.setrlimit(resource.RLIMIT_CPU,(15,15))
+        resource.setrlimit(resource.RLIMIT_CPU,(45 if ocr else 15,)*2)
     except ImportError:
         pass
-    try:pipe.send((True,_extract_pdf_page(content,page_number)))
+    try:
+        try:
+            text = _extract_pdf_page(content,page_number)
+            result = {'text': text, 'mode': 'text', 'lines': []} if ocr else text
+        except ValueError as exc:
+            if not ocr or str(exc) != 'PDF page has no extractable text; OCR is required': raise
+            from .pdf_ocr import recognize_page
+            result = recognize_page(content.path, page_number, workspace)
+        pipe.send((True,result))
     except Exception as exc:pipe.send((False,str(exc)[:1000]))
     finally:pipe.close()
 
 
-def extract_pdf_page(content, page_number: int) -> str:
+def _bounded_page(content, page_number: int, *, ocr=False):
     if not isinstance(content,FilePayload):return _extract_pdf_page(content,page_number)
     from .imports import _PDF_SLOTS
     import multiprocessing
     context=multiprocessing.get_context('spawn')
     receiver,sender=context.Pipe(duplex=False)
-    process=context.Process(target=_page_worker,args=(content,page_number,sender))
+    import tempfile
+    workspace = tempfile.TemporaryDirectory(prefix='procurement-page-')
+    process=context.Process(target=_page_worker,args=(content,page_number,sender,ocr,workspace.name))
     if not _PDF_SLOTS.acquire(blocking=False):
-        receiver.close();sender.close()
+        receiver.close();sender.close();workspace.cleanup()
         raise ValueError('PDF parser capacity is busy; retry later')
     result=None
     try:
         process.start();sender.close()
-        if receiver.poll(20):
+        if receiver.poll(55 if ocr else 20):
             try:result=receiver.recv()
             except EOFError:pass
     finally:
         receiver.close();sender.close()
         if process.pid is not None:
             process.join(timeout=1)
-            if process.is_alive():process.kill();process.join(timeout=2)
+            if process.is_alive():
+                import os, signal
+                try:
+                    if os.getpgid(process.pid) == process.pid: os.killpg(process.pid, signal.SIGKILL)
+                    else: process.kill()
+                except (AttributeError, ProcessLookupError): process.kill()
+                process.join(timeout=2)
             process.close()
+        workspace.cleanup()
         _PDF_SLOTS.release()
-    if not result:raise ValueError('PDF extraction exceeded resource limits or failed')
+    if not result:raise ValueError('Распознавание PDF превысило лимит ресурсов; выберите другой лист' if ocr else 'PDF extraction exceeded resource limits or failed')
     if not result[0]:raise ValueError(result[1])
     return result[1]
+
+
+def extract_pdf_page(content, page_number: int) -> str:
+    return _bounded_page(content, page_number)
+
+
+def extract_pdf_page_review(content: FilePayload, page_number: int) -> dict:
+    # Only disk-backed originals reach native programs; caller has verified SHA/ACL.
+    if not isinstance(content, FilePayload): raise ValueError('Нужен сохранённый PDF')
+    return _bounded_page(content, page_number, ocr=True)
 
 
 def extract_bulat_fence_schedule(

@@ -35,7 +35,7 @@ async function editLaunchSupplier(id){
     $('#modalTitle').textContent='Редактирование поставщика';
     for(const [field,input] of Object.entries({name:'sName',tax_id:'sTax',region:'sRegion',email:'sEmail',phone:'sPhone',telegram:'sTelegram',max_contact:'sMax',rating:'sRating',verified:'sVerified'}))$('#'+input).value=String(field==='verified'?!!s[field]:s[field]);
     $('#sCategories').value=s.categories.join(', ');
-    $('#modalBody').insertAdjacentHTML('beforeend',`<label>Кластер<select id="sCluster"><option value="cluster_1" ${s.cluster==='cluster_1'?'selected':''}>Кластер 1</option><option value="cluster_2" ${s.cluster==='cluster_2'?'selected':''}>Кластер 2</option></select></label>`);
+    $('#modalBody').insertAdjacentHTML('beforeend',`<label>Кластер<select id="sCluster"><option value="" ${!s.cluster?'selected':''}>По региону / не указан</option><option value="cluster_1" ${s.cluster==='cluster_1'?'selected':''}>Кластер 1</option><option value="cluster_2" ${s.cluster==='cluster_2'?'selected':''}>Кластер 2</option></select></label>`);
     $('#modalSubmit').onclick=()=>modalAction(()=>launchJson(`/api/launch/suppliers/${id}`,'PUT',{
       revision:s.revision,name:$('#sName').value,tax_id:$('#sTax').value,region:$('#sRegion').value,
       email:$('#sEmail').value,phone:$('#sPhone').value,telegram:$('#sTelegram').value,max_contact:$('#sMax').value,
@@ -151,4 +151,56 @@ async function sendLaunchMessage(id){
 const baseTender=renderTender;
 renderTender=function(){baseTender();const lot=state.tenderLot;if(!lot)return;$('#tender').insertAdjacentHTML('beforeend',`<section class="panel"><h3>Вложения заявки</h3><div id="tenderAttachmentChoices">${attachmentChoices(lot.project_id,(lot.attachments||[]).map(a=>a.document_id))}</div><button class="btn secondary" onclick="saveLaunchAttachments(${lot.id})">Сохранить вложения до подготовки КП</button></section>`)};
 async function saveLaunchAttachments(id){try{await launchJson(`/api/launch/lots/${id}/attachments`,'PUT',{document_ids:chosenAttachments($('#tenderAttachmentChoices'))});await openLot(id);toast('Вложения заявки сохранены')}catch(e){toast(e.message,true)}}
+
+const baseDocumentFlow=renderDocumentFlow;
+renderDocumentFlow=function(){
+  let markup=baseDocumentFlow();
+  markup=markup.replace('Для пилота ограждений используется профиль «Булат». Выберите объект, загрузите PDF и укажите лист со спецификацией.',
+    'Выберите объект и лист спецификации. Сканированный PDF распознаётся на русском языке; позиции и количества нужно проверить перед созданием заявки.')
+    .replace('id="flowPage" type="number" min="1" max="10000" value="13"','id="flowPage" type="number" min="1" max="10000" value="1"');
+  const s=state.documentFlow.suggestion;
+  if(documentFlowStage()!==2||s?.review_kind!=='pdf_ocr')return markup;
+  const start=markup.indexOf('<div class="trace-list">'),end=markup.indexOf('</div><div class="doc-flow-box" style="margin-top:14px">',start);
+  if(start<0||end<0)return markup;
+  const rows=s.items.map((r,i)=>`<tr data-ocr-row="${i}"><td><input aria-label="Наименование ${i+1}" data-ocr-field="name" value="${esc(r.name||'')}" oninput="captureOcrRows()"></td><td><input aria-label="Количество ${i+1}" data-ocr-field="quantity" value="${esc(r.quantity||'')}" oninput="captureOcrRows()"></td><td><input aria-label="Единица ${i+1}" data-ocr-field="unit" value="${esc(r.unit||'')}" oninput="captureOcrRows()"></td><td><textarea aria-label="Характеристики ${i+1}" data-ocr-field="specification" oninput="captureOcrRows()">${esc(r.specification||'')}</textarea></td><td><button type="button" class="btn secondary small" onclick="removeOcrRow(${i})">Убрать</button></td></tr>`).join('');
+  const review=`<div class="ocr-review"><p><b>OCR требует ручной проверки.</b> Количество и единица не подставляются из размеров чертежа или массы. Нераспознанные строки показаны ниже; добавьте пропущенные позиции вручную.</p>
+    <label>Название заявки<input id="ocrLotTitle" value="${esc(s.lot_title)}" oninput="state.documentFlow.suggestion.lot_title=this.value"></label>
+    <div class="table-wrap"><table><thead><tr><th>Наименование</th><th>Количество</th><th>Единица</th><th>Характеристики</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>
+    <button type="button" class="btn secondary" onclick="addOcrRow()">Добавить нераспознанную позицию</button>
+    <h4>Все строки OCR (${s.lines.length}), включая нераспознанные</h4><p>Сверьте с оригиналом: <a target="_blank" rel="noopener" href="/api/launch/documents/${s.source_document_id}/download">Открыть исходный PDF</a>. Исходный файл будет приложен к КП без изменения.</p>
+    <textarea readonly aria-label="Все строки OCR" rows="12" style="width:100%">${esc(s.lines.map(l=>`${l.line}. ${l.text} [${Math.round(l.confidence*100)}%]`).join('\n'))}</textarea>
+    <label><input id="ocrLinesReviewed" type="checkbox"> Я проверил все строки OCR по оригиналу, добавил пропущенные позиции и явно исключил остальные строки как не относящиеся к заявке.</label></div>`;
+  return markup.slice(0,start)+review+markup.slice(end);
+};
+function captureOcrRows(){
+  const s=state.documentFlow.suggestion;if(s?.review_kind!=='pdf_ocr')return;
+  s.items=[...document.querySelectorAll('[data-ocr-row]')].map(row=>{
+    const data={};row.querySelectorAll('[data-ocr-field]').forEach(x=>data[x.dataset.ocrField]=x.value);return data;
+  });
+  if($('#ocrLinesReviewed'))$('#ocrLinesReviewed').checked=false;
+  if($('#flowHumanApproval'))$('#flowHumanApproval').checked=false;
+}
+function addOcrRow(){captureOcrRows();state.documentFlow.suggestion.items.push({name:'',quantity:'',unit:'',specification:''});captureDocumentRequirements();renderDocuments()}
+function removeOcrRow(i){captureOcrRows();state.documentFlow.suggestion.items.splice(i,1);captureDocumentRequirements();renderDocuments()}
+const baseApproveDocumentFlow=approveDocumentFlow;
+approveDocumentFlow=async function(){
+  const f=state.documentFlow,s=f.suggestion;
+  if(s?.review_kind!=='pdf_ocr')return baseApproveDocumentFlow();
+  if(!$('#ocrLinesReviewed')?.checked||!$('#flowHumanApproval')?.checked)return toast('Подтвердите проверку всех строк OCR и позиций по оригиналу',true);
+  const req=captureDocumentRequirements();
+  if(!s.items.length||s.items.some(r=>!r.name?.trim()||!/^\d+(?:[.,]\d+)?$/.test(r.quantity||'')||Number((r.quantity||'').replace(',','.'))<=0||!r.unit?.trim()))return toast('Исправьте наименования, положительные количества и единицы всех позиций',true);
+  if(!req.response_deadline||!req.delivery_address_confirmation)return toast('Заполните адрес доставки и срок ответа',true);
+  const project=state.projects.find(p=>Number(p.id)===Number(s.project_id)),button=$('#flowApproveBtn');button.disabled=true;
+  try{
+    const lot=await launchJson(`/api/launch/pdf-review/${s.id}/create`,'POST',{
+      confirmed:true,reviewed_line_ids:s.lines.map(l=>l.line),lot:{project_id:s.project_id,title:s.lot_title,
+        region:project.region,delivery_address:req.delivery_address_confirmation,response_deadline:req.response_deadline,
+        desired_delivery_date:req.desired_delivery_date||null,currency:'RUB',
+        items:s.items.map(r=>({...r,quantity:r.quantity.replace(',','.')}))}});
+    f.lot=lot;
+    try{f.matches=await api(`/api/lots/${lot.id}/supplier-matches`)}catch{f.matches=[]}
+    const refreshed=await loadAll();showView('documents');
+    toast(refreshed?'Заявка создана после проверки OCR. Исходный PDF приложен.':'Заявка сохранена; обновление списка не удалось. Обновите страницу, не создавайте повторно.',!refreshed);
+  }catch(e){toast(e.message,true)}finally{button.disabled=false}
+};
 render();
