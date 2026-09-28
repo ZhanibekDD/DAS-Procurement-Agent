@@ -161,8 +161,17 @@ def test_missing_admin_entitlement_fails_closed_and_malformed_claim_is_rejected(
         return result
 
     monkeypatch.setattr(sso, '_post', no_admin_claim)
-    assert client.get('/api/ui-context').json() == {'role': 'staff'}
-    assert client.get('/api/audit').status_code == 403
+    assert client.get('/api/ui-context').status_code == 503
+    assert client.get('/api/audit').status_code == 503
+    # A fresh callback also fails; no partially privileged session is issued.
+    client.cookies.clear()
+    response = client.get('/auth/sso', follow_redirects=False)
+    query = parse_qs(urlsplit(response.headers['location']).query)
+    code = authority.authorize(query, ALICE)
+    response = client.post('/auth/sso/callback', data={'code':code,'state':query['state'][0]},
+                           headers={'Origin':DAS}, follow_redirects=False)
+    assert response.status_code == 503
+    assert sso.cookie_names(settings)[0] not in client.cookies
 
     def invalid_admin_claim(cfg, endpoint, payload):
         result = original(cfg, endpoint, payload)

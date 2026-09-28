@@ -145,9 +145,11 @@ def introspect(settings, token: str) -> dict:
                 or not isinstance(result["username"], str) or not 1 <= len(result["username"]) <= 150
                 or not isinstance(result["email"], str) or len(result["email"]) > 320):
             raise ValueError
-        # Only a backchannel entitlement from DAS may elevate a session.  Older
-        # DAS authorities omit this field, in which case admin access stays off.
-        access_admin = result.get("access_admin", False)
+        # Role is part of the mandatory server-to-server contract. An older
+        # authority without it is incompatible, not proof of a staff role.
+        # Keep SSO disabled and use the isolated local login until the provider
+        # explicitly supplies both positive and negative entitlements.
+        access_admin = result["access_admin"]
         if type(access_admin) is not bool:
             raise ValueError
     except (ValueError, KeyError, TypeError, AttributeError):

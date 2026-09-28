@@ -189,11 +189,11 @@ def install(app,settings,service,launch,require_access,write_access,session_clai
                     draft['preview_id'],data,False,auto_draft=True))
                 return {'status':'draft','lot':lot,'document':visible_document(document)}
             from .document_analysis import count_pdf_pages, extract_pdf_page_review
-            from .pdf_ocr import candidate_rows
+            from .pdf_ocr import candidate_rows, MAX_LINES, MAX_PAGES, MAX_REVIEW_LINES
             from .upload_io import FilePayload
             original=FilePayload(Path(document['storage_path']))
             page_count=await run_in_threadpool(call,count_pdf_pages,original)
-            if not 1 <= page_count <= 12:
+            if not 1 <= page_count <= MAX_PAGES:
                 raise HTTPException(422,'Быстрая закупка поддерживает PDF от 1 до 12 страниц; файл сохранён, письмо не отправлено')
             lines=[]
             for page in range(1,page_count+1):
@@ -201,11 +201,14 @@ def install(app,settings,service,launch,require_access,write_access,session_clai
                 page_lines=extracted['lines'] if extracted['mode']=='ocr' else [
                     {'text':text,'confidence':1.0}
                     for text in extracted['text'].splitlines() if text.strip()]
+                if len(page_lines)>MAX_LINES:
+                    raise HTTPException(422,'Слишком много строк на одном листе PDF; файл сохранён, письмо не отправлено')
                 for line in page_lines:
                     lines.append({'line':len(lines)+1,'page':page,'text':line['text'],
-                                  'confidence':line['confidence']})
-                if len(lines)>1200:
-                    raise HTTPException(422,'В PDF более 1200 строк; файл сохранён, письмо не отправлено')
+                                  'confidence':line['confidence'],
+                                  **({'bbox':line['bbox']} if line.get('bbox') else {})})
+                if len(lines)>MAX_REVIEW_LINES:
+                    raise HTTPException(422,'Слишком много строк в PDF; файл сохранён, письмо не отправлено')
             rows=candidate_rows(lines)
             if len(rows)>=500:
                 raise HTTPException(422,'В PDF слишком много возможных позиций; файл сохранён, письмо не отправлено')

@@ -255,8 +255,9 @@ function renderQuickReview() {
   const result=quickPurchase.intake,draft=result?.draft;if(!draft)return;
   const rows=draft.rows||[];
   const source=`/api/launch/documents/${Number(result.document.id)}/download`;
+  const sourceView=`/api/procurement/documents/${Number(result.document.id)}/view`;
   $('#quickReview').innerHTML=`<h3>Проверьте сомнительные позиции</h3><p>${esc(result.reason)}</p>
-    <p><a href="${source}" target="_blank" rel="noopener">Открыть исходный файл</a>. Он приложится к запросу без изменений.</p>
+    <p><a href="${sourceView}" target="_blank" rel="noopener">Открыть исходный файл</a> · <a href="${source}">Скачать оригинал</a>. Он приложится к запросу без изменений.</p>
     ${draft.needs_mapping?`<p role="alert">Колонки не распознаны. Укажите их один раз:</p><div class="toolbar">${[
       ['name','Позиция'],['quantity','Количество'],['unit','Единица'],['specification','Характеристики'],['delivery_date','Срок']
     ].map(([key,label])=>`<label>${label}<select data-quick-map="${key}"><option value="">Не использовать</option>${(draft.headers||[]).map((name,index)=>`<option value="${index}" ${draft.mapping?.[key]===index?'selected':''}>${esc(name)}</option>`).join('')}</select></label>`).join('')}</div><button class="btn secondary" type="button" onclick="remapQuickDraft()">Распознать по колонкам</button>`:''}
@@ -266,7 +267,7 @@ function renderQuickReview() {
     <td><input data-quick-field="unit" value="${esc(r.unit||'')}"></td><td><input data-quick-field="specification" value="${esc(r.specification||'')}"></td>
     <td><input data-quick-field="delivery_date" type="date" value="${esc(r.delivery_date||'')}"></td>
     <td><button class="btn secondary small" type="button" onclick="this.closest('tr').remove()">Исключить</button></td></tr>`).join('')}</tbody></table></div>
-    ${result.kind==='pdf'?`<details open><summary>Все распознанные строки PDF (${draft.lines?.length||0}) — проверьте пропуски</summary><pre>${esc((draft.lines||[]).map(l=>`стр. ${l.page||1}, строка ${l.line}. ${l.text}`).join('\n'))}</pre></details>`:''}
+    ${result.kind==='pdf'?`<details><summary>Исходный распознанный текст (${draft.lines?.length||0} строк), включая подписи чертежа</summary><pre>${esc((draft.lines||[]).map(l=>`стр. ${l.page||1}, строка ${l.line}. ${l.text}`).join('\n'))}</pre></details>`:''}
     <button class="btn secondary" type="button" onclick="addQuickRow()">Добавить пропущенную позицию</button>
     <button class="btn" type="button" id="quickReviewDone" onclick="finishQuickReview()" ${draft.needs_mapping?'disabled':''}>${result.kind==='pdf'?'Проверил исходный PDF и позиции — показать запрос':'Проверил позиции — показать запрос'}</button>
     <p>Ни одно письмо не отправлено. После проверки позиций вы увидите получателей и текст запроса.</p>`;

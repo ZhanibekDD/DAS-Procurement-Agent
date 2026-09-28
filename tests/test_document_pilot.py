@@ -142,6 +142,7 @@ class FenceDocumentPilotTests(unittest.TestCase):
                     );
                     """
                 )
+            conn.close()  # sqlite3's context manager commits but does not close (Windows).
             database = Database(path)
             database.initialize()
             with database.connection() as conn:

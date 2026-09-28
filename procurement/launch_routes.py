@@ -13,6 +13,7 @@ from pydantic import Field, StrictInt
 from .models import StrictModel, SupplierCreate, LotCreate
 from .table_ingest import read_table, MAX_FILE
 from .upload_io import staged_upload
+from .pdf_ocr import MAX_REVIEW_LINES
 
 
 class Confirm(StrictModel):
@@ -36,7 +37,7 @@ class SheetConfirm(Confirm):
 
 
 class PdfConfirm(SheetConfirm):
-    reviewed_line_ids: list[StrictInt] = Field(min_length=1, max_length=1200)
+    reviewed_line_ids: list[StrictInt] = Field(min_length=1, max_length=MAX_REVIEW_LINES)
 
 
 class PriceRejection(StrictModel):

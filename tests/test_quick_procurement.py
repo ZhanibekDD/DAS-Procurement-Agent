@@ -16,6 +16,52 @@ from test_sso_adapter import ALICE, BOB, login, headers
 FIXTURES=Path(__file__).parent/'fixtures'
 
 
+def test_multisheet_scanned_drawing_keeps_per_page_limits_and_all_review_lines(http_boundary,monkeypatch):
+    client,authority,settings,db=http_boundary
+    identity=login(client,authority);h=headers(identity)
+    project=client.post('/api/projects',headers=h,json={'name':'Многостраничный чертёж',
+        'region':'Воронежская область','delivery_address':'Тестовая 1'}).json()
+    monkeypatch.setattr('procurement.document_analysis.count_pdf_pages',lambda content:3)
+    def extract(content,page):
+        lines=[{'line':index+1,'text':'Размер чертежа '+str(index),'confidence':.8} for index in range(700)]
+        if page==2:lines.append({'line':701,'text':'ФБС 24.4.6 218 шт','confidence':.96})
+        return {'mode':'ocr','text':'','lines':lines}
+    monkeypatch.setattr('procurement.document_analysis.extract_pdf_page_review',extract)
+    raw=(FIXTURES/'russian_scan.pdf').read_bytes()
+    result=client.post('/api/procurement/quick-intake',headers=h,data={'project_id':project['id']},
+        files={'file':('drawing.pdf',raw)})
+    assert result.status_code==200,result.text
+    draft=result.json()['draft'];assert len(draft['lines'])==2101
+    assert [(r['name'],r['quantity'],r['source_page']) for r in draft['rows']]==[('ФБС 24.4.6','218',2)]
+    assert client.get('/api/procurement/quick-draft').json()['draft']['preview_id']==draft['preview_id']
+    source=result.json()['document']
+    assert client.get(f"/api/launch/documents/{source['id']}/download").content==raw
+    payload={'confirmed':True,'reviewed_line_ids':[line['line'] for line in draft['lines']],
+        'lot':{'project_id':project['id'],'title':'Проверенные ФБС','region':'Воронежская область',
+            'delivery_address':'Тестовая 1','response_deadline':'2099-01-01','currency':'RUB',
+            'attachment_document_ids':[source['id']],
+            'items':[{'name':'ФБС 24.4.6','quantity':218,'unit':'шт','source_page':2}]}}
+    created=client.post(f"/api/launch/pdf-review/{draft['preview_id']}/create",headers=h,json=payload)
+    assert created.status_code==201,created.text
+    assert created.json()['items'][0]['source_page']==2
+    assert db.one('SELECT count(*) AS n FROM mail_deliveries')['n']==0
+
+
+def test_one_overloaded_pdf_page_still_fails_closed(http_boundary,monkeypatch):
+    client,authority,settings,db=http_boundary
+    identity=login(client,authority);h=headers(identity)
+    project=client.post('/api/projects',headers=h,json={'name':'Предел листа','region':'Воронежская область',
+        'delivery_address':'Тестовая 1'}).json()
+    monkeypatch.setattr('procurement.document_analysis.count_pdf_pages',lambda content:1)
+    monkeypatch.setattr('procurement.document_analysis.extract_pdf_page_review',lambda *args:
+        {'mode':'ocr','text':'','lines':[{'text':'ФБС 24.4.6 218 шт','confidence':.96}]*1201})
+    response=client.post('/api/procurement/quick-intake',headers=h,data={'project_id':project['id']},
+        files={'file':('drawing.pdf',(FIXTURES/'russian_scan.pdf').read_bytes())})
+    assert response.status_code==422
+    assert db.one('SELECT count(*) AS n FROM lots')['n']==0
+    assert db.one('SELECT count(*) AS n FROM mail_deliveries')['n']==0
+
+
 def test_xlsx_upload_creates_one_draft_with_original_and_no_mail(http_boundary):
     client,authority,settings,db=http_boundary
     user=login(client,authority);h=headers(user)

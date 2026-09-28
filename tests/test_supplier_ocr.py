@@ -78,6 +78,52 @@ def test_tsv_preserves_all_lines_and_marks_uncertainty(tmp_path):
     assert [r['confidence'] for r in result]==[.4,.3]
 
 
+def test_tesseract_literal_quote_cannot_consume_following_records(tmp_path):
+    path=tmp_path/'literal-quotes.tsv'
+    path.write_text('level\tblock_num\tpar_num\tline_num\tleft\ttop\twidth\theight\tconf\ttext\n'
+        '5\t1\t1\t1\t10\t10\t20\t20\t90\t"\n'
+        '5\t2\t1\t1\t10\t50\t30\t20\t95\tФБС\n'
+        '5\t2\t1\t1\t50\t50\t80\t20\t95\t24.4.6\n',encoding='utf8')
+    result=parse_tsv(path)
+    assert [row['text'] for row in result]==['"','ФБС 24.4.6']
+    assert result[1]['bbox']=={'left':10,'top':50,'width':120,'height':20}
+    assert all('\t' not in row['text'] and '\n' not in row['text'] for row in result)
+
+
+def table_line(number,text,x,y,width=80,confidence=.96,page=1):
+    return {'line':number,'text':text,'confidence':confidence,'page':page,
+            'bbox':{'left':x,'top':y,'width':width,'height':20}}
+
+
+def test_specification_table_uses_quantity_not_mass_or_drawing_dimensions():
+    lines=[table_line(1,'Наименование',100,40,180),table_line(2,'Кол.',420,40,40),
+           table_line(3,'ФБС 24.4.6',110,100,170),table_line(4,'218',425,100,30),
+           table_line(5,'179995',510,100,70),table_line(6,'ФБС 12.4.6',110,150,170),
+           table_line(7,'95',425,150,30),table_line(8,'ФБС 9.4.6',110,200,170),
+           table_line(9,'128',425,200,30)]
+    rows=candidate_rows(lines)
+    assert [(r['name'],r['quantity'],r['unit']) for r in rows]==[
+        ('ФБС 24.4.6','218','шт'),('ФБС 12.4.6','95','шт'),('ФБС 9.4.6','128','шт')]
+    assert all(not row.get('error') for row in rows)
+    # Same coordinates on a different page cannot supply a missing quantity.
+    lines[3]['page']=2
+    assert candidate_rows(lines)[0]['quantity']==''
+    assert candidate_rows(lines)[0]['error']
+
+
+def test_uncertain_table_cells_are_not_repaired_or_silently_trusted():
+    lines=[table_line(1,'Наименование',100,40,180),table_line(2,'Кол.',420,40,40),
+           table_line(3,'ФБС 12.4.6',110,100,170),table_line(4,'9я',425,100,30,.4),
+           table_line(5,'ФБС 94.6',110,150,170),table_line(6,'128',425,150,30),
+           table_line(7,'ФБС 24.4.6',110,200,170,.85),table_line(8,'218',425,200,30)]
+    rows=candidate_rows(lines)
+    assert rows[0]['quantity']=='' and rows[0]['error']
+    assert rows[1]['name']=='ФБС 94.6' and rows[1]['unit']=='' and rows[1]['error']
+    assert rows[2]['quantity']=='218' and rows[2]['error']
+    no_header=candidate_rows([line for line in lines if line['line']!=2])
+    assert all(not row['quantity'] for row in no_header)
+
+
 def test_native_russian_image_only_pdf_opens_and_source_unchanged(tmp_path):
     if not shutil.which('tesseract') or not shutil.which('pdftoppm'):
         pytest.skip('native OCR binaries required; container/CI test is mandatory')
