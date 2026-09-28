@@ -314,8 +314,6 @@ class LaunchWorkflow:
                 if encode(source_items)!=encode(submitted):
                     raise ConflictError('Авточерновик должен совпадать с распознанным листом')
             if kind == 'pdf_ocr':
-                if preview_data.get('quick_intake') and preview_data.get('page_count', 1) != 1:
-                    raise ValueError('PDF содержит несколько страниц. Быстрая закупка не может подтвердить позиции со всех листов; выберите одностраничную спецификацию')
                 expected = {r['line'] for r in preview_data['lines']}
                 if (not reviewed_line_ids or len(set(reviewed_line_ids)) != len(reviewed_line_ids)
                         or set(reviewed_line_ids) != expected):
@@ -326,8 +324,12 @@ class LaunchWorkflow:
                     raise ConflictError('Исходный PDF изменился после распознавания')
                 for item in lot.items:
                     item.source_document_id = preview_data['source_document_id']
-                    item.source_page = preview_data['source_page']
-                    item.source_reference = 'Ручная проверка OCR, лист ' + preview_data['sheet']
+                    if preview_data.get('quick_intake'):
+                        if item.source_page is None or not 1 <= item.source_page <= preview_data['page_count']:
+                            raise ValueError('Укажите страницу исходного PDF для каждой позиции')
+                    else:
+                        item.source_page = preview_data['source_page']
+                    item.source_reference = 'Ручная проверка OCR, страница ' + str(item.source_page)
             requested_hash = payload_sha256(lot.model_dump(mode='json'))
             if preview['status'] == 'applied':
                 result = json.loads(preview['result_json'])

@@ -157,21 +157,31 @@ def install(app,settings,service,launch,require_access,write_access,session_clai
             from pypdf import PdfReader
             original=FilePayload(Path(document['storage_path']))
             page_count=await run_in_threadpool(call,lambda:len(PdfReader(str(original.path)).pages))
-            extracted=await run_in_threadpool(call,extract_pdf_page_review,original,1)
-            lines=extracted['lines'] if extracted['mode']=='ocr' else [
-                {'line':n,'text':text,'confidence':1.0}
-                for n,text in enumerate(extracted['text'].splitlines(),1) if text.strip()]
-            if len(lines)>1200:raise HTTPException(422,'Слишком много строк на первой странице PDF')
+            if not 1 <= page_count <= 12:
+                raise HTTPException(422,'Быстрая закупка поддерживает PDF от 1 до 12 страниц; файл сохранён, письмо не отправлено')
+            lines=[]
+            for page in range(1,page_count+1):
+                extracted=await run_in_threadpool(call,extract_pdf_page_review,original,page)
+                page_lines=extracted['lines'] if extracted['mode']=='ocr' else [
+                    {'text':text,'confidence':1.0}
+                    for text in extracted['text'].splitlines() if text.strip()]
+                for line in page_lines:
+                    lines.append({'line':len(lines)+1,'page':page,'text':line['text'],
+                                  'confidence':line['confidence']})
+                if len(lines)>1200:
+                    raise HTTPException(422,'В PDF более 1200 строк; файл сохранён, письмо не отправлено')
             rows=candidate_rows(lines)
+            if len(rows)>=500:
+                raise HTTPException(422,'В PDF слишком много возможных позиций; файл сохранён, письмо не отправлено')
+            pages={line['line']:line['page'] for line in lines}
+            for row in rows:row['source_page']=pages[row['row']]
             draft=await run_in_threadpool(call,launch.save_preview,'pdf_ocr',{
                 'source_document_id':document['id'],'source_sha256':document['sha256'],
-                'project_id':project_id,'sheet':'1','rows':rows,'lines':lines,'source_page':1,
+                'project_id':project_id,'sheet':'1-'+str(page_count),'rows':rows,'lines':lines,
                 'page_count':page_count,
                 'quick_intake':True})
             return {'status':'needs_review','kind':'pdf','document':visible_document(document),'draft':draft,
-                    'reason':('PDF содержит '+str(page_count)+' страниц; сейчас показан только первый лист. '
-                              if page_count>1 else '')+
-                    'Проверьте строки PDF: количество и единицы нельзя угадывать. Письмо не отправлено'}
+                    'reason':'Распознано страниц: '+str(page_count)+'. Проверьте сомнительные строки PDF: количество и единицы нельзя угадывать. Письмо не отправлено'}
 
     @app.get('/api/procurement/campaigns/{cid}/snapshot',dependencies=[Depends(require_access)])
     def campaign_snapshot(cid:int):

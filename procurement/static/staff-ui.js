@@ -218,14 +218,14 @@ function renderQuickReview() {
       ['name','Позиция'],['quantity','Количество'],['unit','Единица'],['specification','Характеристики'],['delivery_date','Срок']
     ].map(([key,label])=>`<label>${label}<select data-quick-map="${key}"><option value="">Не использовать</option>${(draft.headers||[]).map((name,index)=>`<option value="${index}" ${draft.mapping?.[key]===index?'selected':''}>${esc(name)}</option>`).join('')}</select></label>`).join('')}</div><button class="btn secondary" type="button" onclick="remapQuickDraft()">Распознать по колонкам</button>`:''}
     <div class="table-wrap"><table><thead><tr><th>Строка</th><th>Позиция</th><th>Количество</th><th>Ед.</th><th>Характеристики</th><th>Срок</th><th></th></tr></thead><tbody id="quickRows">
-    ${rows.map((r,i)=>`<tr data-quick-row="${i}" class="${r.error?'needs-review':''}"><td>${esc(r.row)}${r.error?`<small role="alert">${esc(r.error)}</small>`:''}</td>
+    ${rows.map((r,i)=>`<tr data-quick-row="${i}" class="${r.error?'needs-review':''}"><td>${esc(r.row)}${result.kind==='pdf'?`<label>Стр. <input data-quick-field="source_page" type="number" min="1" max="${Number(draft.page_count)||1}" value="${Number(r.source_page)||1}"></label>`:''}${r.error?`<small role="alert">${esc(r.error)}</small>`:''}</td>
     <td><input data-quick-field="name" value="${esc(r.name||'')}"></td><td><input data-quick-field="quantity" value="${esc(r.quantity||'')}"></td>
     <td><input data-quick-field="unit" value="${esc(r.unit||'')}"></td><td><input data-quick-field="specification" value="${esc(r.specification||'')}"></td>
     <td><input data-quick-field="delivery_date" type="date" value="${esc(r.delivery_date||'')}"></td>
     <td><button class="btn secondary small" type="button" onclick="this.closest('tr').remove()">Исключить</button></td></tr>`).join('')}</tbody></table></div>
-    ${result.kind==='pdf'?`<details open><summary>Все распознанные строки PDF (${draft.lines?.length||0}) — проверьте пропуски</summary><pre>${esc((draft.lines||[]).map(l=>`${l.line}. ${l.text}`).join('\n'))}</pre></details>`:''}
+    ${result.kind==='pdf'?`<details open><summary>Все распознанные строки PDF (${draft.lines?.length||0}) — проверьте пропуски</summary><pre>${esc((draft.lines||[]).map(l=>`стр. ${l.page||1}, строка ${l.line}. ${l.text}`).join('\n'))}</pre></details>`:''}
     <button class="btn secondary" type="button" onclick="addQuickRow()">Добавить пропущенную позицию</button>
-    <button class="btn" type="button" id="quickReviewDone" onclick="finishQuickReview()" ${draft.needs_mapping||(result.kind==='pdf'&&draft.page_count>1)?'disabled':''}>${result.kind==='pdf'?'Проверил исходный PDF и позиции — показать запрос':'Проверил позиции — показать запрос'}</button>
+    <button class="btn" type="button" id="quickReviewDone" onclick="finishQuickReview()" ${draft.needs_mapping?'disabled':''}>${result.kind==='pdf'?'Проверил исходный PDF и позиции — показать запрос':'Проверил позиции — показать запрос'}</button>
     <p>Ни одно письмо не отправлено. После проверки позиций вы увидите получателей и текст запроса.</p>`;
 }
 async function remapQuickDraft(){
@@ -250,6 +250,14 @@ loadAll=async function(){
 };
 function addQuickRow(){
   const tbody=$('#quickRows'),row=tbody.querySelector('tr')?.cloneNode(true);
+  if(quickPurchase.intake?.kind==='pdf'){
+    const pages=Number(quickPurchase.intake.draft?.page_count)||1;
+    tbody.insertAdjacentHTML('beforeend',`<tr class="needs-review"><td>Добавлено вручную<label>Стр. <input data-quick-field="source_page" type="number" min="1" max="${pages}" value="1"></label></td>
+    <td><input data-quick-field="name"></td><td><input data-quick-field="quantity"></td>
+    <td><input data-quick-field="unit"></td><td><input data-quick-field="specification"></td>
+    <td><input data-quick-field="delivery_date" type="date"></td>
+    <td><button class="btn secondary small" type="button" onclick="this.closest('tr').remove()">Исключить</button></td></tr>`);return
+  }
   if(!row){tbody.insertAdjacentHTML('beforeend',`<tr class="needs-review"><td>Добавлено вручную</td>
     <td><input data-quick-field="name"></td><td><input data-quick-field="quantity"></td>
     <td><input data-quick-field="unit"></td><td><input data-quick-field="specification"></td>
@@ -261,13 +269,14 @@ function addQuickRow(){
 async function finishQuickReview(){
   const result=quickPurchase.intake,draft=result?.draft;
   if(!draft||draft.needs_mapping)return toast('Сначала сопоставьте колонки',true);
-  if(result.kind==='pdf'&&draft.page_count>1)return toast('Для быстрой закупки выберите одностраничную спецификацию: остальные листы этого PDF не распознаны',true);
   const items=[...document.querySelectorAll('#quickRows tr')].map(row=>{
     const data={};row.querySelectorAll('[data-quick-field]').forEach(input=>data[input.dataset.quickField]=input.value.trim());
-    data.delivery_date ||= null;return data;
+    data.delivery_date ||= null;if(result.kind==='pdf')data.source_page=Number(data.source_page);return data;
   });
   if(!items.length||items.some(i=>!i.name||!i.unit||!/^\d+(?:[.,]\d+)?$/.test(i.quantity)||Number(i.quantity.replace(',','.'))<=0))
     return toast('Исправьте наименование, количество и единицу каждой оставленной позиции',true);
+  if(result.kind==='pdf'&&items.some(i=>!Number.isInteger(i.source_page)||i.source_page<1||i.source_page>draft.page_count))
+    return toast('Укажите правильную страницу PDF для каждой позиции',true);
   const project=state.projects.find(p=>Number(p.id)===Number(result.document.project_id));
   if(!project)return toast('Объект не найден; обновите страницу',true);
   const payload={confirmed:true,lot:{project_id:project.id,title:result.document.filename.replace(/\.[^.]+$/,'').slice(0,240),

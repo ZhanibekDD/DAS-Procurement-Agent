@@ -81,7 +81,7 @@ def test_pdf_upload_saves_review_only_and_never_guesses_quantity(http_boundary,m
     assert db.one('SELECT count(*) AS n FROM outbox_messages')['n']==0
 
 
-def test_multipage_pdf_cannot_silently_create_lot_from_first_page(http_boundary,monkeypatch):
+def test_multipage_pdf_reviews_all_pages_and_preserves_source_page(http_boundary,monkeypatch):
     from pypdf import PdfReader, PdfWriter
     from procurement import document_analysis
     client,authority,settings,db=http_boundary
@@ -91,23 +91,64 @@ def test_multipage_pdf_cannot_silently_create_lot_from_first_page(http_boundary,
     reader=PdfReader(str(FIXTURES/'russian_scan.pdf'))
     writer=PdfWriter();writer.add_page(reader.pages[0]);writer.add_page(reader.pages[0])
     stream=BytesIO();writer.write(stream)
-    monkeypatch.setattr(document_analysis,'extract_pdf_page_review',lambda *_:{
-        'mode':'ocr','text':'ФБС 24.4.6 218 шт','lines':[
-            {'line':1,'text':'ФБС 24.4.6 218 шт','confidence':0.84}]})
+    def page_review(_original,page):
+        text='ФБС 24.4.6 218 шт' if page==1 else 'ФБС 12.4.6 95 шт'
+        return {'mode':'ocr','text':text,'lines':[
+            {'line':1,'text':text,'confidence':0.84}]}
+    monkeypatch.setattr(document_analysis,'extract_pdf_page_review',page_review)
     response=client.post('/api/procurement/quick-intake',headers=h,data={'project_id':project['id']},
         files={'file':('two-pages.pdf',stream.getvalue())})
     assert response.status_code==200,response.text
     result=response.json()
     assert result['draft']['page_count']==2
-    assert 'только первый лист' in result['reason']
-    payload={'confirmed':True,'reviewed_line_ids':[1],
+    assert [line['page'] for line in result['draft']['lines']]==[1,2]
+    assert [row['source_page'] for row in result['draft']['rows']]==[1,2]
+    payload={'confirmed':True,'reviewed_line_ids':[1,2],
         'lot':{'project_id':project['id'],'title':'ФБС','region':'Воронежская область',
                'delivery_address':'Воронеж, Тестовая 1','response_deadline':'2026-10-10',
                'currency':'RUB','attachment_document_ids':[result['document']['id']],
-               'items':[{'name':'ФБС 24.4.6','quantity':'218','unit':'шт'}]}}
+               'items':[{'name':'ФБС 24.4.6','quantity':'218','unit':'шт','source_page':1},
+                        {'name':'ФБС 12.4.6','quantity':'95','unit':'шт','source_page':2}]}}
+    missing_page={**payload,'reviewed_line_ids':[1]}
+    assert client.post(f"/api/launch/pdf-review/{result['draft']['preview_id']}/create",
+        headers=h,json=missing_page).status_code==422
+    wrong_page={**payload,'lot':{**payload['lot'],'items':[
+        payload['lot']['items'][0],{**payload['lot']['items'][1],'source_page':3}]}}
+    assert client.post(f"/api/launch/pdf-review/{result['draft']['preview_id']}/create",
+        headers=h,json=wrong_page).status_code==422
     create=client.post(f"/api/launch/pdf-review/{result['draft']['preview_id']}/create",headers=h,json=payload)
-    assert create.status_code==422 and 'несколько страниц' in create.text
+    assert create.status_code==201,create.text
+    lot=create.json()
+    assert [(item['name'],item['source_page']) for item in lot['items']]==[
+        ('ФБС 24.4.6',1),('ФБС 12.4.6',2)]
+    assert [(item['name'],item['source_page']) for item in db.all(
+        'SELECT name,source_page FROM lot_items WHERE lot_id=? ORDER BY id',(lot['id'],))]==[
+        ('ФБС 24.4.6',1),('ФБС 12.4.6',2)]
+    assert client.get(f"/api/launch/documents/{result['document']['id']}/download").content==stream.getvalue()
+    assert db.one('SELECT count(*) AS n FROM outbox_messages')['n']==0
+
+
+def test_multipage_pdf_read_failure_never_creates_partial_preview(http_boundary,monkeypatch):
+    from pypdf import PdfReader, PdfWriter
+    from procurement import document_analysis
+    client,authority,settings,db=http_boundary
+    user=login(client,authority);h=headers(user)
+    project=client.post('/api/projects',headers=h,json={
+        'name':'Тестовый объект','region':'Воронежская область','delivery_address':'Воронеж, Тестовая 1'}).json()
+    reader=PdfReader(str(FIXTURES/'russian_scan.pdf'))
+    writer=PdfWriter();writer.add_page(reader.pages[0]);writer.add_page(reader.pages[0])
+    stream=BytesIO();writer.write(stream)
+    def page_review(_original,page):
+        if page==2:raise ValueError('Не удалось распознать вторую страницу')
+        return {'mode':'ocr','text':'ФБС 24.4.6','lines':[
+            {'line':1,'text':'ФБС 24.4.6','confidence':0.8}]}
+    monkeypatch.setattr(document_analysis,'extract_pdf_page_review',page_review)
+    response=client.post('/api/procurement/quick-intake',headers=h,data={'project_id':project['id']},
+        files={'file':('two-pages.pdf',stream.getvalue())})
+    assert response.status_code==422
+    assert db.one('SELECT count(*) AS n FROM launch_previews')['n']==0
     assert db.one('SELECT count(*) AS n FROM lots')['n']==0
+    assert db.one('SELECT count(*) AS n FROM outbox_messages')['n']==0
 
 
 def test_quick_intake_requires_write_access_and_safe_suffix(http_boundary):
