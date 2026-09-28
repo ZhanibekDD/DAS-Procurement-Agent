@@ -149,6 +149,42 @@ def test_stale_queued_worker_is_fenced_before_smtp(workflow,monkeypatch):
         assert len(smtp.messages)==1 and journal(db,m['id'])['attempt']==2
 
 
+def test_stale_failure_cannot_overwrite_recovered_smtp_acceptance(workflow,monkeypatch):
+    import procurement.mail_delivery as delivery
+    db,s,w=workflow;m,_=prepare(workflow)
+    original_spool=delivery.spool_message
+    first=[True]
+
+    def fail_first_spool(*args):
+        if first[0]:
+            first[0]=False
+            raise OSError('first worker failed before SMTP')
+        return original_spool(*args)
+
+    def recover_between_attempt_check_and_failure_write(exc,user,credential):
+        # Reproduce the exact interleaving: worker A already checked attempt 1,
+        # then worker B takes its expired lease and accepts attempt 2.
+        with db.connection() as conn:
+            conn.execute('UPDATE mail_receipts SET started_at=? WHERE message_id=?',
+                         ((datetime.now(UTC)-timedelta(seconds=QUEUE_LEASE_SECONDS+1)).isoformat(),m['id']))
+        recovered=w.send(m['id'],True)
+        assert recovered['status']=='sent' and recovered['delivery']['attempt']==2
+        return None,None
+
+    with CaptureSMTP() as smtp:
+        smtp_env(monkeypatch,smtp)
+        monkeypatch.setattr(delivery,'spool_message',fail_first_spool)
+        monkeypatch.setattr(delivery,'smtp_failure_receipt',recover_between_attempt_check_and_failure_write)
+        with pytest.raises(ConflictError,match='другой работник'):
+            w.send(m['id'],True)
+        info=journal(db,m['id'])
+        assert info['status']=='sent' and info['attempt']==2 and len(smtp.messages)==1
+        assert db.one('SELECT status FROM mail_deliveries WHERE message_id=?',(m['id'],))['status']=='sent'
+        assert db.one('SELECT status FROM outbox_messages WHERE id=?',(m['id'],))['status']=='sent'
+        assert not any(row['event']=='mail_send_failed' for row in info['events'])
+        assert w.send(m['id'],True)['duplicate'] and len(smtp.messages)==1
+
+
 def test_abandoned_sending_is_never_retried_automatically(workflow,monkeypatch):
     db,s,w=workflow;m,_=prepare(workflow)
     import procurement.mail_delivery as delivery

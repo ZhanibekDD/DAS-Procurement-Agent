@@ -254,10 +254,21 @@ def send(workflow, mid, confirmed):
             reason = 'SMTP недоступен или время соединения истекло; письмо не отправлено. Доступен безопасный повтор.'
         code, reply = smtp_failure_receipt(exc,user,credential)
         with db.connection() as conn:
-            conn.execute('UPDATE mail_deliveries SET status=?,updated_at=? WHERE message_id=?',(status,utcnow(),mid))
-            conn.execute('UPDATE mail_receipts SET status=?,error=?,smtp_code=?,smtp_reply=? WHERE message_id=?',
-                         (status,reason,code,reply,mid))
-            conn.execute("UPDATE outbox_messages SET status='failed' WHERE id=?",(mid,))
+            conn.execute('BEGIN IMMEDIATE')
+            # The earlier attempt read is only a fast check. A recovering worker
+            # may take over before this transaction starts, so fence every state
+            # change on the receipt's current attempt and pre-SMTP/sending state.
+            updated = conn.execute('''UPDATE mail_receipts SET status=?,error=?,smtp_code=?,smtp_reply=?
+                WHERE message_id=? AND attempt=? AND status IN ('queued','sending')''',
+                (status,reason,code,reply,mid,attempt)).rowcount
+            if not updated:
+                raise ConflictError('Эту очередь уже обрабатывает другой работник; повтор SMTP не выполнялся') from None
+            if conn.execute("UPDATE mail_deliveries SET status=?,updated_at=? WHERE message_id=? AND status IN ('queued','sending')",
+                            (status,utcnow(),mid)).rowcount != 1:
+                raise ConflictError('Состояние отправки изменилось; повтор SMTP не выполнялся')
+            if conn.execute("UPDATE outbox_messages SET status='failed' WHERE id=? AND status IN ('queued','sending')",
+                            (mid,)).rowcount != 1:
+                raise ConflictError('Состояние отправки изменилось; повтор SMTP не выполнялся')
             event(db,conn,mid,'mail_send_unconfirmed' if uncertain else 'mail_send_failed',
                   error=reason,error_type=type(exc).__name__,smtp_code=code,smtp_reply=reply,retry=not uncertain)
         raise ConflictError(reason) from None
