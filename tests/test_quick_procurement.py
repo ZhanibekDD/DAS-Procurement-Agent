@@ -1,4 +1,5 @@
 """One-screen file intake must persist a safe draft, never mail during upload."""
+import json
 from pathlib import Path
 from io import BytesIO
 
@@ -9,7 +10,7 @@ from test_launch_mail import smtp_env
 from smtp_capture import CaptureSMTP
 
 from test_launch_http import http_boundary
-from test_sso_adapter import BOB, login, headers
+from test_sso_adapter import ALICE, BOB, login, headers
 
 FIXTURES=Path(__file__).parent/'fixtures'
 
@@ -73,6 +74,70 @@ def test_invalid_sheet_is_persisted_for_correction_without_lot(http_boundary):
     assert client.post(f"/api/procurement/quick-draft/{result['draft']['preview_id']}/remap",
         headers=headers(other),json={'mapping':mapping}).status_code==404
     assert db.one('SELECT count(*) AS n FROM lots')['n']==0
+
+
+def test_multiple_pending_uploads_are_recoverable_and_private(http_boundary):
+    client,authority,settings,db=http_boundary
+    alice=login(client,authority);h=headers(alice)
+    project=client.post('/api/projects',headers=h,json={
+        'name':'Тестовый объект','region':'Воронежская область','delivery_address':'Воронеж, Тестовая 1'}).json()
+    first=client.post('/api/procurement/quick-intake',headers=h,data={'project_id':project['id']},
+        files={'file':('first.xlsx',(FIXTURES/'items.xlsx').read_bytes())})
+    assert first.status_code==200 and first.json()['status']=='needs_review',first.text
+    workbook=Workbook();sheet=workbook.active
+    sheet.append(['Наименование','Количество'])
+    sheet.append(['ФБС 24.4.6',218])
+    stream=BytesIO();workbook.save(stream)
+    second=client.post('/api/procurement/quick-intake',headers=h,data={'project_id':project['id']},
+        files={'file':('second.xlsx',stream.getvalue())})
+    assert second.status_code==200 and second.json()['status']=='needs_review',second.text
+    old_id=first.json()['draft']['preview_id'];new_id=second.json()['draft']['preview_id']
+    recovered=client.get('/api/procurement/quick-draft').json()
+    assert recovered['draft']['preview_id']==new_id
+    assert [draft['preview_id'] for draft in recovered['pending_drafts']]==[new_id,old_id]
+    assert client.get(f'/api/procurement/quick-draft/{old_id}').json()['draft']['preview_id']==old_id
+    assert client.get(f'/api/procurement/quick-draft/{new_id}').json()['draft']['preview_id']==new_id
+    assert db.one("SELECT count(*) AS n FROM launch_previews WHERE status='preview'")['n']==2
+    assert db.one('SELECT count(*) AS n FROM outbox_messages')['n']==0
+    login(client,authority,BOB)
+    assert client.get('/api/procurement/quick-draft').json() is None
+    assert client.get(f'/api/procurement/quick-draft/{old_id}').status_code==404
+    login(client,authority,ALICE)
+    assert client.get(f'/api/procurement/quick-draft/{old_id}').status_code==200
+
+
+def test_pending_draft_pages_have_stable_cursor_and_no_orphans(http_boundary):
+    client,authority,settings,db=http_boundary
+    alice=login(client,authority);h=headers(alice)
+    project=client.post('/api/projects',headers=h,json={
+        'name':'Тестовый объект','region':'Воронежская область','delivery_address':'Воронеж, Тестовая 1'}).json()
+    uploaded=client.post('/api/procurement/quick-intake',headers=h,data={'project_id':project['id']},
+        files={'file':('first.xlsx',(FIXTURES/'items.xlsx').read_bytes())})
+    assert uploaded.status_code==200,uploaded.text
+    source=uploaded.json()['document']['id']
+    payload=json.dumps({'quick_intake':True,'source_document_id':source,'project_id':project['id']})
+    with db.connection() as conn:
+        for index in range(52):
+            conn.execute('''INSERT INTO launch_previews(id,kind,actor,data_json,created_at)
+                VALUES (?,?,?,?,?)''',(f'pending-{index:02d}','lot_sheet',ALICE,payload,
+                                    '2026-09-28T00:00:00Z'))
+    first=client.get('/api/procurement/quick-draft').json()
+    assert len(first['pending_drafts'])==50
+    assert first['pending_drafts'][0]['preview_id']=='pending-51'
+    assert first['draft']['preview_id']=='pending-51'
+    assert first['next_before'] is not None
+    second=client.get('/api/procurement/quick-draft',params={'before':first['next_before']}).json()
+    assert len(second['pending_drafts'])==3
+    assert second['next_before'] is None
+    all_ids=[row['preview_id'] for row in first['pending_drafts']+second['pending_drafts']]
+    assert len(all_ids)==len(set(all_ids))==53
+    assert uploaded.json()['draft']['preview_id'] in all_ids
+    assert client.get('/api/procurement/quick-draft/pending-00').status_code==200
+    assert client.get('/api/procurement/quick-draft',params={'before':0}).status_code==422
+    login(client,authority,BOB)
+    assert client.get('/api/procurement/quick-draft',params={'before':first['next_before']}).json()=={
+        'pending_drafts':[],'next_before':None}
+    assert client.get('/api/procurement/quick-draft/pending-00').status_code==404
 
 
 def test_multisheet_xlsx_never_silently_omits_other_worksheets(http_boundary):

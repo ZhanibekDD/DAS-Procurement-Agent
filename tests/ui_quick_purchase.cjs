@@ -17,6 +17,39 @@ assert(flow.includes("host.replaceChildren(...rfq.childNodes)"));
 assert(flow.includes("confirmedMailNotice(r)"));
 assert(!flow.includes('procurementConfirmed'));
 assert(staff.includes('quickPurchase.recovered'));
+assert(staff.includes('<div id="quickPending"></div>'));
+const pendingFunctions=['refreshQuickDrafts','openPendingQuickDraft','loadMoreQuickDrafts']
+  .map(name=>staff.match(new RegExp(`async function ${name}\\([^]*?\\n\\}`))?.[0]);
+assert(pendingFunctions.every(Boolean),'recoverable pending-draft functions');
+async function pendingRecovery(){
+  const older={preview_id:'older',filename:'first.xlsx',available:true};
+  const latest={preview_id:'latest',filename:'second.xlsx',available:true};
+  const draft={status:'needs_review',draft:{preview_id:'latest'}};
+  const pending={intake:null,pending:[],nextBefore:null};
+  const calls=[];
+  const context={quickPurchase:pending,state:{view:'other'},renderLots:()=>{},
+    renderPendingQuickDrafts:()=>{},toast:()=>{},Number,Set,encodeURIComponent,
+    $:()=>({scrollIntoView:()=>{}}),
+    api:async url=>{
+      calls.push(url);
+      if(url==='/api/procurement/quick-draft')return {...draft,pending_drafts:[latest],next_before:10};
+      if(url==='/api/procurement/quick-draft?before=10')
+        return {pending_drafts:[older],next_before:null};
+      if(url==='/api/procurement/quick-draft/older')
+        return {status:'needs_review',draft:{preview_id:'older'}};
+      throw new Error(`unexpected URL ${url}`);
+    }};
+  const source=pendingFunctions.join('\n');
+  const refresh=vm.runInNewContext(`${source};refreshQuickDrafts`,context);
+  const more=vm.runInNewContext(`${source};loadMoreQuickDrafts`,context);
+  const open=vm.runInNewContext(`${source};openPendingQuickDraft`,context);
+  await refresh();assert.equal(pending.intake.draft.preview_id,'latest');
+  await more();assert.deepEqual(pending.pending.map(item=>item.preview_id),['latest','older']);
+  await open('older');assert.equal(pending.intake.draft.preview_id,'older');
+  assert.deepEqual(calls,[
+    '/api/procurement/quick-draft','/api/procurement/quick-draft?before=10',
+    '/api/procurement/quick-draft/older']);
+}
 const outcomeSource=flow.match(/function procurementMailOutcome[\s\S]*?\n\}/)?.[0];
 assert(outcomeSource,'mail outcome classifier');
 const classify=(messages,campaign)=>vm.runInNewContext(`${outcomeSource};procurementMailOutcome(messages,campaign)`,{messages,campaign});
@@ -49,6 +82,7 @@ async function sendFailure(attempted){
   return {purchasing,status,outboxReads,sendCalls,button};
 }
 (async()=>{
+  await pendingRecovery();
   const before=await sendFailure(false);
   assert.equal(before.purchasing.lastSendOutcome.kind,'failed');
   assert.equal(before.outboxReads,0);

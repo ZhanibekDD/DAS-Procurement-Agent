@@ -88,20 +88,51 @@ def install(app,settings,service,launch,require_access,write_access,session_clai
     @app.post('/api/procurement/lots/{lid}/preview',dependencies=[Depends(write_access)])
     def preview(lid:int,data:CampaignCreate):return call(flow.preview,lid,data)
 
+    def quick_draft_detail(row):
+        data=json.loads(row['data_json'])
+        if not data.get('quick_intake') or row['status']!='preview':
+            raise HTTPException(404,'Незавершённый черновик не найден')
+        document=service.db.one('SELECT * FROM source_documents WHERE id=?',
+            (data['source_document_id'],))
+        if not document:raise HTTPException(409,'Исходный файл черновика недоступен')
+        return {'status':'needs_review','kind':'pdf' if row['kind']=='pdf_ocr' else 'sheet',
+                'document':visible_document(document),'draft':{'preview_id':row['id'],**data},
+                'reason':'Черновик сохранён. Проверьте отмеченные строки; письмо не отправлено'}
+
     @app.get('/api/procurement/quick-draft',dependencies=[Depends(require_access)])
-    def latest_quick_draft():
-        for row in service.db.all('''SELECT id,kind,data_json FROM launch_previews
+    def latest_quick_draft(before:int|None=None):
+        if before is not None and before<1:raise HTTPException(422,'Некорректная страница черновиков')
+        rows=service.db.all('''SELECT rowid AS sequence,id,kind,data_json,status FROM launch_previews
             WHERE actor=? AND status='preview' AND kind IN ('lot_sheet','pdf_ocr')
-            ORDER BY created_at DESC LIMIT 50''',(trusted_actor(),)):
+              AND json_extract(data_json,'$.quick_intake')=1
+              AND (? IS NULL OR rowid<?)
+            ORDER BY rowid DESC LIMIT 51''',(trusted_actor(),before,before))
+        page=rows[:50]
+        pending=[]
+        for row in page:
             data=json.loads(row['data_json'])
-            if not data.get('quick_intake'):continue
-            document=service.db.one('SELECT * FROM source_documents WHERE id=?',
+            document=service.db.one('SELECT filename FROM source_documents WHERE id=?',
                 (data['source_document_id'],))
-            if document:
-                return {'status':'needs_review','kind':'pdf' if row['kind']=='pdf_ocr' else 'sheet',
-                    'document':visible_document(document),'draft':{'preview_id':row['id'],**data},
-                    'reason':'Черновик сохранён. Проверьте отмеченные строки; письмо не отправлено'}
-        return None
+            pending.append({'preview_id':row['id'],
+                'kind':'pdf' if row['kind']=='pdf_ocr' else 'sheet',
+                'filename':document['filename'] if document else 'Исходный файл недоступен',
+                'available':bool(document)})
+        next_before=page[-1]['sequence'] if len(rows)>50 else None
+        if before is not None:return {'pending_drafts':pending,'next_before':next_before}
+        if not page:return None
+        first_available=next((row for row,item in zip(page,pending) if item['available']),None)
+        if not first_available:
+            return {'status':'unavailable','pending_drafts':pending,'next_before':next_before,
+                    'reason':'Исходные файлы незавершённых проверок недоступны; письма не отправлены'}
+        return {**quick_draft_detail(first_available),'pending_drafts':pending,
+                'next_before':next_before}
+
+    @app.get('/api/procurement/quick-draft/{pid}',dependencies=[Depends(require_access)])
+    def open_quick_draft(pid:str):
+        row=service.db.one('''SELECT id,kind,data_json,status FROM launch_previews
+            WHERE id=? AND actor=? AND kind IN ('lot_sheet','pdf_ocr')''',(pid,trusted_actor()))
+        if not row:raise HTTPException(404,'Незавершённый черновик не найден')
+        return quick_draft_detail(row)
 
     @app.post('/api/procurement/quick-draft/{pid}/remap',dependencies=[Depends(write_access)])
     def remap_quick_draft(pid:str,data:QuickMapping):

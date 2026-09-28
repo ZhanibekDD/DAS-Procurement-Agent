@@ -109,14 +109,51 @@ renderOverview = function() {
 };
 
 const fullRenderLots = renderLots;
-const quickPurchase = {intake:null, busy:false, recovered:false};
+const quickPurchase = {intake:null, busy:false, recovered:false, pending:[], nextBefore:null};
 function quickPurchaseMarkup() {
   const projectOptions=state.projects.map(p=>`<option value="${Number(p.id)}">${esc(p.name)}</option>`).join('');
   return `<section class="panel quick-purchase"><div class="panel-title"><div><h2>Новая закупка из файла</h2><p>Загрузите PDF или Excel. Черновик, поставщики, письмо и вложение появятся здесь.</p></div></div>
     <div class="toolbar"><label>Объект<select id="quickProject"><option value="">Выберите объект</option>${projectOptions}</select></label>
     <label>Спецификация PDF / XLSX / CSV<input id="quickFile" type="file" accept=".pdf,.xlsx,.csv" ${quickPurchase.busy?'disabled':''}></label></div>
     <div id="quickProgress" role="status">${quickPurchase.busy?'Распознаём файл и сохраняем черновик…':''}</div>
+    <div id="quickPending"></div>
     <div id="quickReview"></div></section>`;
+}
+function renderPendingQuickDrafts(){
+  const current=quickPurchase.intake?.draft?.preview_id;
+  const other=quickPurchase.pending.filter(d=>d.preview_id!==current);
+  const root=$('#quickPending');if(!root)return;
+  if(!other.length&&!quickPurchase.nextBefore){root.replaceChildren();return}
+  root.innerHTML=`<h3>Незавершённые проверки</h3><p>Другие загруженные файлы сохранены. Выберите файл, который хотите проверить.</p>
+    ${other.map(d=>`<button class="btn secondary small" type="button" data-quick-draft="${esc(d.preview_id)}" ${d.available?'':'disabled'}>${esc(d.filename)}${d.available?'':' — исходный файл недоступен'}</button>`).join(' ')}
+    ${quickPurchase.nextBefore?'<button class="btn secondary small" type="button" id="quickMore">Показать ещё</button>':''}`;
+  root.querySelectorAll('[data-quick-draft]').forEach(button=>button.onclick=()=>openPendingQuickDraft(button.dataset.quickDraft));
+  if($('#quickMore'))$('#quickMore').onclick=loadMoreQuickDrafts;
+}
+async function refreshQuickDrafts(){
+  const saved=await api('/api/procurement/quick-draft');
+  quickPurchase.pending=saved?.pending_drafts||[];
+  quickPurchase.nextBefore=saved?.next_before||null;
+  const current=quickPurchase.intake;
+  if(!current||(current.status==='needs_review'&&
+      !quickPurchase.pending.some(d=>d.preview_id===current.draft?.preview_id)))
+    quickPurchase.intake=saved?.status==='needs_review'?saved:null;
+  if(state.view==='lots')renderLots();
+}
+async function openPendingQuickDraft(pid){
+  try{
+    quickPurchase.intake=await api(`/api/procurement/quick-draft/${encodeURIComponent(pid)}`);
+    renderLots();$('#quickReview')?.scrollIntoView({block:'nearest'});
+  }catch(error){toast(error.message,true)}
+}
+async function loadMoreQuickDrafts(){
+  const before=quickPurchase.nextBefore;if(!before)return;
+  try{
+    const page=await api(`/api/procurement/quick-draft?before=${Number(before)}`);
+    const known=new Set(quickPurchase.pending.map(d=>d.preview_id));
+    quickPurchase.pending.push(...page.pending_drafts.filter(d=>!known.has(d.preview_id)));
+    quickPurchase.nextBefore=page.next_before||null;renderPendingQuickDrafts();
+  }catch(error){toast(error.message,true)}
 }
 renderLots = function() {
   fullRenderLots();
@@ -125,6 +162,7 @@ renderLots = function() {
   $('#quickProject').value=quickPurchase.intake?.document?.project_id || (state.projects.length===1?state.projects[0].id:'');
   $('#quickFile').onchange=startQuickPurchase;
   if(quickPurchase.intake?.status==='needs_review')renderQuickReview();
+  renderPendingQuickDrafts();
   const summary = root.querySelector('.lot-summary');
   if (summary) {
     const stages = staffLotCounts(state.lots);
@@ -196,6 +234,7 @@ async function startQuickPurchase() {
     const result=await api('/api/procurement/quick-intake',{method:'POST',body:form});
     quickPurchase.intake=result;
     await loadAll();
+    await refreshQuickDrafts();
     if(result.status==='draft'){
       toast('Черновик сохранён. Проверьте получателей, письмо и вложение.');
       await openLot(result.lot.id);
@@ -233,7 +272,7 @@ async function remapQuickDraft(){
   document.querySelectorAll('[data-quick-map]').forEach(select=>{if(select.value!=='')mapping[select.dataset.quickMap]=Number(select.value)});
   try{
     const updated=await launchJson(`/api/procurement/quick-draft/${intake.draft.preview_id}/remap`,'POST',{mapping});
-    quickPurchase.intake=updated;renderLots();toast('Колонки сопоставлены. Проверьте отмеченные строки.');
+    quickPurchase.intake=updated;await refreshQuickDrafts();toast('Колонки сопоставлены. Проверьте отмеченные строки.');
   }catch(error){toast(error.message,true)}
 }
 const quickBaseLoadAll=loadAll;
@@ -243,7 +282,10 @@ loadAll=async function(){
     quickPurchase.recovered=true;
     try{
       const saved=await api('/api/procurement/quick-draft');
-      if(saved&&!quickPurchase.intake){quickPurchase.intake=saved;if(state.view==='lots')renderLots()}
+      quickPurchase.pending=saved?.pending_drafts||[];
+      quickPurchase.nextBefore=saved?.next_before||null;
+      if(saved?.status==='needs_review'&&!quickPurchase.intake)quickPurchase.intake=saved;
+      if(state.view==='lots')renderLots();
     }catch{/* The main dashboard remains usable; no unconfirmed draft is sent. */}
   }
   return loaded;
@@ -288,7 +330,7 @@ async function finishQuickReview(){
     const endpoint=result.kind==='pdf'?`/api/launch/pdf-review/${draft.preview_id}/create`:`/api/launch/lot-sheet/${draft.preview_id}/create`;
     const lot=await launchJson(endpoint,'POST',payload);
     quickPurchase.intake={status:'draft',lot,document:result.document};
-    await loadAll();toast('Черновик сохранён. Проверьте письмо и отправьте запрос.');await openLot(lot.id);
+    await loadAll();await refreshQuickDrafts();toast('Черновик сохранён. Проверьте письмо и отправьте запрос.');await openLot(lot.id);
   }catch(error){toast(error.message,true)}finally{if(button.isConnected)button.disabled=false}
 }
 
