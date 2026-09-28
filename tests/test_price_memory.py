@@ -7,7 +7,7 @@ import pytest
 
 from procurement.catalog import ALIASES, Catalog
 from procurement.models import QuoteCreate
-from procurement.price_memory import PriceMemory, material_key, unit_key, designation_key, INVALID_DESIGNATION
+from procurement.price_memory import PriceMemory, material_key, specification_key, unit_key, designation_key, INVALID_DESIGNATION
 from procurement.table_ingest import read_table
 from test_launch_workflow import workflow
 from test_procurement_redesign import fbs
@@ -124,6 +124,20 @@ def test_specification_variant_separator_aliases_share_one_price_history(workflo
         assert PriceMemory(s).search(specification=query,today=TODAY)['total']==3
     assert PriceMemory(s).search('ФБС 9.4.6-П',today=TODAY)['total']==1
     assert PriceMemory(s).search('ПБ 9.4.6-Т',today=TODAY)['total']==1
+
+
+def test_generic_specification_words_remain_searchable_while_marks_canonicalize(workflow):
+    _,s,_=workflow
+    for spec,supplier in [('Блок фундаментный ФБС 9.4.6-Т','A'),
+                          ('Блок фундаментный ФБС 9.4.6 - Т','B'),
+                          ('Блок фундаментный ФБС 9.4.6—Т','C')]:
+        price(workflow,'ФБС 9.4.6-Т','100',supplier,specification=spec)
+    assert specification_key('Блок фундаментный ФБС 9.4.6 - Т')=='блок фундаментный фбс 9.4.6-т'
+    for spec_query in ('Блок фундаментный','ФБС 9.4.6-Т','ФБС 9.4.6 — Т'):
+        result=PriceMemory(s).search(specification=spec_query,today=TODAY)
+        assert result['total']==3
+        assert len(result['groups'])==1
+        assert result['groups'][0]['current_stats']['count']==3
 
 
 @pytest.mark.parametrize('name,spec,expected',[

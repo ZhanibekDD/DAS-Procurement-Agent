@@ -23,6 +23,16 @@ _DESIGNATION_PATTERN = (r'(?<!\w)(фбс|пб|фл)\s*[-–—]?\s*(\d+)\s*[.хx
                         r'(?:\s*[-–—]\s*([а-яa-z]{1,3}))?(?!\w)')
 
 
+def _canonical_mark(match):
+    return (match[1] + ' ' + '.'.join(str(int(match[i])) for i in (2, 3, 4))
+            + ('-' + match[5] if match[5] else ''))
+
+
+def specification_key(value):
+    """Normalize marks without removing any literal characteristic words."""
+    return re.sub(_DESIGNATION_PATTERN, _canonical_mark, normalized(value))
+
+
 def material_key(value):
     value = normalized(value)
     # Only known material designations receive punctuation/spacing aliases.
@@ -34,8 +44,7 @@ def material_key(value):
     before = value[:match.start()].strip()
     if before in {'блок', 'блоки', 'блок фундаментный', 'блоки фундаментные', 'плита', 'плиты'}:
         before = ''
-    mark = (match[1] + ' ' + '.'.join(str(int(match[i])) for i in (2, 3, 4))
-            + ('-' + match[5] if match[5] else ''))
+    mark = _canonical_mark(match)
     return ' '.join(filter(None, (before, mark, value[match.end():].strip())))
 
 
@@ -92,7 +101,7 @@ def stats(values):
 
 
 def basis(row):
-    return (material_key(row['item_name']), material_key(row['specification']), unit_key(row['unit']),
+    return (material_key(row['item_name']), specification_key(row['specification']), unit_key(row['unit']),
             row['currency'], vat_key(row['vat']), normalized(row['region']),
             delivery_key(row['delivery']), format(decimal(row['minimum_batch']).normalize(),'f') if decimal(row['minimum_batch']) is not None else '')
 
@@ -177,7 +186,7 @@ class PriceMemory:
             if family_query:
                 primary = re.search(r'(?<!\w)(фбс|пб|фл)(?!\w)', combined)
                 if not primary or primary[1] != family_query[1]:return False
-            return (not query_key or query_key == key or re.search(r'(?<!\w)'+re.escape(query_key)+r'(?!\w)',combined) is not None) and material_key(specification) in material_key(spec) and (not region or normalized(region)==normalized(reg))
+            return (not query_key or query_key == key or re.search(r'(?<!\w)'+re.escape(query_key)+r'(?!\w)',combined) is not None) and specification_key(specification) in specification_key(spec) and (not region or normalized(region)==normalized(reg))
         records=[]; groups=defaultdict(list); total=0; unread=[]
         with self.db.connection() as conn:
             conn.create_function('memory_matches',3,lambda n,s,r:int(matches(n,s,r)),deterministic=True)
