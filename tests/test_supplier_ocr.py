@@ -54,6 +54,19 @@ def test_no_quantity_guessed_from_drawing_dimensions():
     assert rows[0]['specification']=='ФБС 24.4.6 179 995'
 
 
+def test_explicit_high_confidence_quantities_prefill_without_losing_codes():
+    rows=candidate_rows([
+        {'line':1,'text':'ФБС 24.4.6 218 шт','confidence':.96},
+        {'line':2,'text':'Кабель 001230040500 10 м','confidence':.918},
+        {'line':3,'text':'ФБС 12.4.6 95 шт','confidence':.84},
+    ])
+    assert [(row['name'],row['quantity'],row['unit']) for row in rows]==[
+        ('ФБС 24.4.6','218','шт'),('Кабель 001230040500','10','м'),
+        ('ФБС 12.4.6 95 шт','','')]
+    assert rows[0]['specification']=='ФБС 24.4.6 218 шт'
+    assert rows[2]['error'] and not rows[0].get('error')
+
+
 def test_tsv_preserves_all_lines_and_marks_uncertainty(tmp_path):
     path=tmp_path/'scan.tsv'
     path.write_text('level\tblock_num\tpar_num\tline_num\tleft\ttop\theight\tconf\ttext\n'

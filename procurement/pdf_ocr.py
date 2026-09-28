@@ -72,11 +72,19 @@ def recognize_page(path, page_number, workspace=None):
 
 
 def candidate_rows(lines):
-    """Drafts only: never infer a quantity from drawing dimensions or a mass column."""
+    """Prefill only explicit trailing quantity+unit; leave ambiguous drawings for review."""
     rows = []
     for line in lines:
         if re.search(r'\b(?:ФБС|Панель|Кабель|Арматура|Блок|Труба|Калитка|Ворота)\b', line['text'], re.I):
-            rows.append({'row': line['line'], 'name': line['text'][:240], 'quantity': '',
-                         'unit': '', 'specification': line['text'], 'confidence': line['confidence'],
-                         'error': 'Уточните наименование, количество и единицу по исходному PDF'})
+            match = re.fullmatch(
+                r'(?P<name>.+?)\s+(?P<quantity>\d+(?:[,.]\d+)?)\s*'
+                r'(?P<unit>шт\.?|штук|кг|тонн?|м|м2|м²|м3|м³|пог\.?\s*м|комплект(?:ов|а)?)\s*',
+                line['text'].strip(), re.I)
+            trusted = match is not None and line['confidence'] >= .9 and len(match['name'].strip()) >= 3
+            rows.append({'row': line['line'],
+                         'name': match['name'].strip()[:240] if trusted else line['text'][:240],
+                         'quantity': match['quantity'] if trusted else '',
+                         'unit': match['unit'] if trusted else '',
+                         'specification': line['text'], 'confidence': line['confidence'],
+                         **({} if trusted else {'error': 'Уточните наименование, количество и единицу по исходному PDF'})})
     return rows[:500]

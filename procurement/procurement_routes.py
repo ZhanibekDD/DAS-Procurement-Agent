@@ -153,12 +153,11 @@ def install(app,settings,service,launch,require_access,write_access,session_clai
                 lot=await run_in_threadpool(call,lambda:launch.create_sheet_lot(
                     draft['preview_id'],data,False,auto_draft=True))
                 return {'status':'draft','lot':lot,'document':visible_document(document)}
-            from .document_analysis import extract_pdf_page_review
+            from .document_analysis import count_pdf_pages, extract_pdf_page_review
             from .pdf_ocr import candidate_rows
             from .upload_io import FilePayload
-            from pypdf import PdfReader
             original=FilePayload(Path(document['storage_path']))
-            page_count=await run_in_threadpool(call,lambda:len(PdfReader(str(original.path)).pages))
+            page_count=await run_in_threadpool(call,count_pdf_pages,original)
             if not 1 <= page_count <= 12:
                 raise HTTPException(422,'Быстрая закупка поддерживает PDF от 1 до 12 страниц; файл сохранён, письмо не отправлено')
             lines=[]
@@ -183,7 +182,7 @@ def install(app,settings,service,launch,require_access,write_access,session_clai
                 'page_count':page_count,
                 'quick_intake':True})
             return {'status':'needs_review','kind':'pdf','document':visible_document(document),'draft':draft,
-                    'reason':'Распознано страниц: '+str(page_count)+'. Проверьте сомнительные строки PDF: количество и единицы нельзя угадывать. Письмо не отправлено'}
+                    'reason':'Распознано страниц: '+str(page_count)+'. Явные количества подставлены; проверьте исходник и исправьте только сомнительные строки. Письмо не отправлено'}
 
     @app.get('/api/procurement/campaigns/{cid}/snapshot',dependencies=[Depends(require_access)])
     def campaign_snapshot(cid:int):

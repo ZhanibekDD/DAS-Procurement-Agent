@@ -64,13 +64,13 @@ async function sendProcurement(){
  if(!p||p.lot_id!==lid||JSON.stringify(request)!==JSON.stringify(selectedRfqRequest()))return toast('Обновите предпросмотр выбранного лота',true);
  const button=$('#procurementSend');button.disabled=true;
  const status=$('#procurementSendStatus');if(status)status.textContent='Отправляется…';
- let sentCount=0,campaign=null;
+ let sentCount=0,campaign=null,attemptedSend=false;
  try{campaign=await launchJson(`/api/lots/${lid}/campaigns`,'POST',{...request,snapshot_sha256:p.snapshot_sha256,preview_sha256:p.preview_sha256});
  if(campaign.lot_id!==lid)throw new Error('ID запроса не совпал с закупкой');
  if(p.approval_required){toast('Черновики созданы. Требуется согласование по правилу.');}
- else{let warnings=[];for(const m of campaign.messages){const r=await launchJson(`/api/procurement/outbox/${m.id}/send`,'POST',{lot_id:lid,snapshot_sha256:p.snapshot_sha256,confirmed:true});confirmedMailNotice(r);if(r.warning)warnings.push(r.warning);sentCount++;}purchasing.lastSendError=null;purchasing.lastSendOutcome=null;purchasing.lastSentCount=0;if(status)status.textContent='Отправлено: почтовый сервер принял '+sentCount+' письмо(а).';toast(warnings.length?`SMTP принял запросы: ${sentCount}. ${warnings[0]}`:`SMTP принял запросы: ${sentCount}; копии сохранены в «Отправленных». Доставка пока не подтверждена.`,!!warnings.length)}
+ else{let warnings=[];for(const m of campaign.messages){attemptedSend=true;const r=await launchJson(`/api/procurement/outbox/${m.id}/send`,'POST',{lot_id:lid,snapshot_sha256:p.snapshot_sha256,confirmed:true});confirmedMailNotice(r);if(r.warning)warnings.push(r.warning);sentCount++;}purchasing.lastSendError=null;purchasing.lastSendOutcome=null;purchasing.lastSentCount=0;if(status)status.textContent='Отправлено: почтовый сервер принял '+sentCount+' письмо(а).';toast(warnings.length?`SMTP принял запросы: ${sentCount}. ${warnings[0]}`:`SMTP принял запросы: ${sentCount}; копии сохранены в «Отправленных». Доставка пока не подтверждена.`,!!warnings.length)}
  invalidateProcurement();await loadAll();await openLot(lid);
- }catch(e){let outcome={kind:'unknown',sent:sentCount};try{outcome=procurementMailOutcome(await api(`/api/outbox?lot_id=${lid}`),campaign)}catch{}
+ }catch(e){let outcome={kind:'failed',sent:0};if(attemptedSend){outcome={kind:'unknown',sent:sentCount};try{outcome=procurementMailOutcome(await api(`/api/outbox?lot_id=${lid}`),campaign)}catch{}}
  purchasing.lastSendError=e.message;purchasing.lastSendOutcome=outcome;purchasing.lastSentCount=outcome.sent;
  if(status)status.textContent=outcome.kind==='unknown'?'Результат отправки не подтверждён. Повтор заблокирован; проверьте журнал.':
    outcome.kind==='sent'?'Отправлено: почтовый сервер принял письмо, но ответ интерфейсу не дошёл.':

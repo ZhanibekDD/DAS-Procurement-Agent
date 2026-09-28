@@ -252,14 +252,14 @@ class LaunchWorkflow:
             self.db.audit('supplier_import_rolled_back','supplier_import',pid,details={'changed':len(changes)},conn=conn)
         return {'status':'rolled_back','changed':len(changes)}
 
-    def sheet_preview(self, table, mapping=None, source_document=None, quick_intake=False):
+    def sheet_preview(self, table, mapping=None, source_document=None, quick_intake=False, persist=True):
         mapping = suggested_mapping(table['headers'], ITEM_ALIASES) if mapping is None else mapping
         if not {'name','quantity','unit'} <= set(mapping):
             incomplete={**table,'rows':table['rows'][:20],'mapping':mapping,'needs_mapping':True,
                 'quick_intake':quick_intake,
                 'source_document_id':source_document['id'] if source_document else None,
                 'project_id':source_document['project_id'] if source_document else None}
-            return self.save_preview('lot_sheet',incomplete) if quick_intake else incomplete
+            return self.save_preview('lot_sheet',incomplete) if quick_intake and persist else incomplete
         rows, errors = [], []
         for source in table['rows']:
             values = {}
@@ -272,15 +272,15 @@ class LaunchWorkflow:
             except ValueError as exc:
                 errors.append({'row':source['row'],'reason':str(exc)})
                 rows.append({'row':source['row'],**values,'error':str(exc)})
-        return self.save_preview('lot_sheet', {'headers':table['headers'],'sheets':table['sheets'],
+        data = {'headers':table['headers'],'sheets':table['sheets'],
               'sheet':table['sheet'],'mapping':mapping,'rows':rows,'errors':errors,
               'quick_intake':quick_intake,
               'source_document_id':source_document['id'] if source_document else None,
-              'project_id':source_document['project_id'] if source_document else None})
+              'project_id':source_document['project_id'] if source_document else None}
+        return self.save_preview('lot_sheet', data) if persist else data
 
     def remap_quick_sheet_preview(self, pid, table, mapping, document):
-        data = self.sheet_preview(table, mapping, document, quick_intake=False)
-        data['quick_intake'] = True
+        data = self.sheet_preview(table, mapping, document, quick_intake=True, persist=False)
         replacement = uuid.uuid4().hex
         with self.db.connection() as conn:
             conn.execute('BEGIN IMMEDIATE')

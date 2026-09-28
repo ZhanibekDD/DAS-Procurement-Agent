@@ -53,6 +53,12 @@ def test_invalid_sheet_is_persisted_for_correction_without_lot(http_boundary):
         headers=h,json={'mapping':mapping})
     assert remap.status_code==200,remap.text
     assert remap.json()['draft']['errors']
+    assert remap.json()['draft']['preview_id']!=result['draft']['preview_id']
+    assert db.one("SELECT count(*) AS n FROM launch_previews WHERE kind='lot_sheet'")['n']==2
+    assert db.one("SELECT status FROM launch_previews WHERE id=?",
+                  (result['draft']['preview_id'],))['status']=='superseded'
+    assert db.one("SELECT status FROM launch_previews WHERE id=?",
+                  (remap.json()['draft']['preview_id'],))['status']=='preview'
     assert client.get('/api/procurement/quick-draft').json()['draft']['preview_id']==remap.json()['draft']['preview_id']
     assert client.post(f"/api/procurement/quick-draft/{result['draft']['preview_id']}/remap",
         headers=h,json={'mapping':mapping}).status_code==409
@@ -155,6 +161,17 @@ def test_multipage_pdf_reviews_all_pages_and_preserves_source_page(http_boundary
         ('ФБС 24.4.6',1),('ФБС 12.4.6',2)]
     assert client.get(f"/api/launch/documents/{result['document']['id']}/download").content==stream.getvalue()
     assert db.one('SELECT count(*) AS n FROM outbox_messages')['n']==0
+
+
+def test_page_count_uses_bounded_parser_and_rejects_invalid_pdf(monkeypatch):
+    from procurement import document_analysis
+    from procurement.upload_io import FilePayload
+    pdf=FilePayload(FIXTURES/'russian_scan.pdf')
+    assert document_analysis.count_pdf_pages(pdf)==1
+    calls=[]
+    monkeypatch.setattr(document_analysis,'_bounded_page',lambda content,page: calls.append((content,page)) or 2)
+    assert document_analysis.count_pdf_pages(pdf)==2
+    assert calls==[(pdf,0)]
 
 
 def test_multipage_pdf_read_failure_never_creates_partial_preview(http_boundary,monkeypatch):
