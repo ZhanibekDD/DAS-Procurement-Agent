@@ -4,6 +4,8 @@ import os
 import re
 import subprocess
 import tempfile
+from bisect import bisect_left, bisect_right
+from collections import defaultdict
 from pathlib import Path
 
 MAX_LINES = 1200
@@ -83,27 +85,56 @@ def recognize_page(path, page_number, workspace=None):
     return {'text': '\n'.join(x['text'] for x in lines), 'mode': 'ocr', 'lines': lines}
 
 
-def _table_quantity(line, lines):
+def _table_index(lines):
+    """One bounded indexing pass, independent of the number of candidates."""
+    pages = defaultdict(lambda: {'cells': [], 'quantity': [], 'name': []})
+    for line in lines:
+        if not line.get('bbox'):
+            continue
+        page = pages[line.get('page', 1)]
+        page['cells'].append(line)
+        if re.fullmatch(r'Кол\.?|Кол-во|Количество', line['text'], re.I):
+            page['quantity'].append(line)
+        elif re.fullmatch('Наименование', line['text'], re.I):
+            page['name'].append(line)
+    for page in pages.values():
+        page['cells'].sort(key=_center_y)
+        for kind in ('quantity', 'name'):
+            page[kind].sort(key=lambda item: item['bbox']['top'])
+    return pages
+
+
+def _center_y(line):
+    return line['bbox']['top'] + line['bbox']['height'] / 2
+
+
+def _range(items, low, high, *, centers=False):
+    key = _center_y if centers else lambda item: item['bbox']['top']
+    return items[bisect_left(items, low, key=key):bisect_right(items, high, key=key)]
+
+
+def _table_quantity(line, index):
     """Read only the aligned quantity column, never drawing dimensions/mass."""
     box = line.get('bbox')
     if not box:
         return None
-    same_page = [item for item in lines if item.get('page',1)==line.get('page',1) and item.get('bbox')]
-    headers = [item for item in same_page if re.fullmatch(r'Кол\.?|Кол-во|Количество',item['text'],re.I)
-               and item['bbox']['top'] < box['top']
+    page = index[line.get('page', 1)]
+    headers = [item for item in _range(page['quantity'], box['top']-70*max(box['height'],1), box['top'])
+               if item['bbox']['top'] < box['top']
                and 0 < item['bbox']['left']-box['left'] < 50*max(box['height'],1)
                and box['top']-item['bbox']['top'] < 70*max(box['height'],1)]
     for header in sorted(headers,key=lambda item:(-item['bbox']['top'],item['bbox']['left']-box['left'])):
         hb = header['bbox']; baseline = box['top']+box['height']/2
-        name_headers = [item for item in same_page if re.fullmatch('Наименование',item['text'],re.I)
-                        and abs(item['bbox']['top']-hb['top']) <= 2*hb['height']
+        name_headers = [item for item in _range(page['name'],hb['top']-2*hb['height'],hb['top']+2*hb['height'])
+                        if abs(item['bbox']['top']-hb['top']) <= 2*hb['height']
                         and item['bbox']['left'] < box['left']+box['width'] < hb['left']]
         if not name_headers:
             continue
         # The nearest explicit quantity heading is required; neighboring mass
         # columns are excluded even if their numbers have higher confidence.
         center = hb['left']+hb['width']/2
-        cells = [item for item in same_page if item is not line
+        tolerance = max(box['height'],hb['height'])*.6
+        cells = [item for item in _range(page['cells'],baseline-tolerance,baseline+tolerance,centers=True) if item is not line
                  and abs(item['bbox']['top']+item['bbox']['height']/2-baseline) <= max(box['height'],hb['height'])*.6
                  and abs(item['bbox']['left']+item['bbox']['width']/2-center) <= max(hb['width']*.9,hb['height'])]
         cells.sort(key=lambda item:item['bbox']['left'])
@@ -118,7 +149,10 @@ def _table_quantity(line, lines):
 def candidate_rows(lines):
     """Prefill aligned table cells or explicit units; keep uncertainty visible."""
     rows = []
+    index = _table_index(lines)
     for line in lines:
+        if len(rows) >= 500:
+            break  # Full OCR transcript remains available for explicit review.
         # Section headings are not material positions. They remain in the
         # complete OCR transcript, alongside all unrecognized drawing text.
         if re.match(r'^Спецификация\b',line['text'],re.I):
@@ -126,7 +160,7 @@ def candidate_rows(lines):
         if re.fullmatch(r'Блоки\s+ФБС\.?',line['text'].strip(),re.I):
             continue
         if re.search(r'\b(?:ФБС|Панель|Кабель|Арматура|Блок|Труба|Калитка|Ворота)\b', line['text'], re.I):
-            table_quantity = _table_quantity(line,lines)
+            table_quantity = _table_quantity(line,index)
             if table_quantity is not None:
                 quantity, confidence = table_quantity
                 # A product family establishes pieces, but malformed marks

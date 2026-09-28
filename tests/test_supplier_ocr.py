@@ -124,6 +124,35 @@ def test_uncertain_table_cells_are_not_repaired_or_silently_trusted():
     assert all(not row['quantity'] for row in no_header)
 
 
+def test_full_budget_ocr_is_indexed_once_and_matching_is_bounded(monkeypatch):
+    import procurement.pdf_ocr as ocr
+    class CountingLines(list):
+        iterations = 0
+        def __iter__(self):
+            self.iterations += 1
+            return super().__iter__()
+    lines = CountingLines()
+    for page in range(1,13):
+        lines.extend([table_line(len(lines)+1,'Наименование',100,0,180,page=page),
+                      table_line(len(lines)+2,'Кол.',420,0,40,page=page)])
+        for row in range(599):
+            lines.extend([table_line(len(lines)+1,'ФБС 24.4.6',110,40+row*24,170,page=page),
+                          table_line(len(lines)+2,'218',425,40+row*24,30,page=page)])
+    assert len(lines)==ocr.MAX_REVIEW_LINES
+    calls = []
+    original = ocr._table_quantity
+    def counted(line,index):
+        calls.append(id(index))
+        return original(line,index)
+    monkeypatch.setattr(ocr,'_table_quantity',counted)
+    rows=ocr.candidate_rows(lines)
+    assert len(rows)==500
+    assert rows[0]['quantity']=='218'
+    assert lines.iterations==2  # Index build + bounded candidate traversal only.
+    assert len(calls)==500 and len(set(calls))==1
+    assert len(lines)==ocr.MAX_REVIEW_LINES  # No raw line silently removed.
+
+
 def test_native_russian_image_only_pdf_opens_and_source_unchanged(tmp_path):
     if not shutil.which('tesseract') or not shutil.which('pdftoppm'):
         pytest.skip('native OCR binaries required; container/CI test is mandatory')
