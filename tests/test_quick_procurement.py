@@ -81,6 +81,35 @@ def test_pdf_upload_saves_review_only_and_never_guesses_quantity(http_boundary,m
     assert db.one('SELECT count(*) AS n FROM outbox_messages')['n']==0
 
 
+def test_multipage_pdf_cannot_silently_create_lot_from_first_page(http_boundary,monkeypatch):
+    from pypdf import PdfReader, PdfWriter
+    from procurement import document_analysis
+    client,authority,settings,db=http_boundary
+    user=login(client,authority);h=headers(user)
+    project=client.post('/api/projects',headers=h,json={
+        'name':'Тестовый объект','region':'Воронежская область','delivery_address':'Воронеж, Тестовая 1'}).json()
+    reader=PdfReader(str(FIXTURES/'russian_scan.pdf'))
+    writer=PdfWriter();writer.add_page(reader.pages[0]);writer.add_page(reader.pages[0])
+    stream=BytesIO();writer.write(stream)
+    monkeypatch.setattr(document_analysis,'extract_pdf_page_review',lambda *_:{
+        'mode':'ocr','text':'ФБС 24.4.6 218 шт','lines':[
+            {'line':1,'text':'ФБС 24.4.6 218 шт','confidence':0.84}]})
+    response=client.post('/api/procurement/quick-intake',headers=h,data={'project_id':project['id']},
+        files={'file':('two-pages.pdf',stream.getvalue())})
+    assert response.status_code==200,response.text
+    result=response.json()
+    assert result['draft']['page_count']==2
+    assert 'только первый лист' in result['reason']
+    payload={'confirmed':True,'reviewed_line_ids':[1],
+        'lot':{'project_id':project['id'],'title':'ФБС','region':'Воронежская область',
+               'delivery_address':'Воронеж, Тестовая 1','response_deadline':'2026-10-10',
+               'currency':'RUB','attachment_document_ids':[result['document']['id']],
+               'items':[{'name':'ФБС 24.4.6','quantity':'218','unit':'шт'}]}}
+    create=client.post(f"/api/launch/pdf-review/{result['draft']['preview_id']}/create",headers=h,json=payload)
+    assert create.status_code==422 and 'несколько страниц' in create.text
+    assert db.one('SELECT count(*) AS n FROM lots')['n']==0
+
+
 def test_quick_intake_requires_write_access_and_safe_suffix(http_boundary):
     client,authority,settings,db=http_boundary
     user=login(client,authority);h=headers(user)

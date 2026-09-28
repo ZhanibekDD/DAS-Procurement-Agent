@@ -314,6 +314,8 @@ class LaunchWorkflow:
                 if encode(source_items)!=encode(submitted):
                     raise ConflictError('Авточерновик должен совпадать с распознанным листом')
             if kind == 'pdf_ocr':
+                if preview_data.get('quick_intake') and preview_data.get('page_count', 1) != 1:
+                    raise ValueError('PDF содержит несколько страниц. Быстрая закупка не может подтвердить позиции со всех листов; выберите одностраничную спецификацию')
                 expected = {r['line'] for r in preview_data['lines']}
                 if (not reviewed_line_ids or len(set(reviewed_line_ids)) != len(reviewed_line_ids)
                         or set(reviewed_line_ids) != expected):

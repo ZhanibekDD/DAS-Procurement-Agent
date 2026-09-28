@@ -225,7 +225,7 @@ function renderQuickReview() {
     <td><button class="btn secondary small" type="button" onclick="this.closest('tr').remove()">Исключить</button></td></tr>`).join('')}</tbody></table></div>
     ${result.kind==='pdf'?`<details open><summary>Все распознанные строки PDF (${draft.lines?.length||0}) — проверьте пропуски</summary><pre>${esc((draft.lines||[]).map(l=>`${l.line}. ${l.text}`).join('\n'))}</pre></details>`:''}
     <button class="btn secondary" type="button" onclick="addQuickRow()">Добавить пропущенную позицию</button>
-    <button class="btn" type="button" id="quickReviewDone" onclick="finishQuickReview()" ${draft.needs_mapping?'disabled':''}>${result.kind==='pdf'?'Проверил исходный PDF и позиции — показать запрос':'Проверил позиции — показать запрос'}</button>
+    <button class="btn" type="button" id="quickReviewDone" onclick="finishQuickReview()" ${draft.needs_mapping||(result.kind==='pdf'&&draft.page_count>1)?'disabled':''}>${result.kind==='pdf'?'Проверил исходный PDF и позиции — показать запрос':'Проверил позиции — показать запрос'}</button>
     <p>Ни одно письмо не отправлено. После проверки позиций вы увидите получателей и текст запроса.</p>`;
 }
 async function remapQuickDraft(){
@@ -261,6 +261,7 @@ function addQuickRow(){
 async function finishQuickReview(){
   const result=quickPurchase.intake,draft=result?.draft;
   if(!draft||draft.needs_mapping)return toast('Сначала сопоставьте колонки',true);
+  if(result.kind==='pdf'&&draft.page_count>1)return toast('Для быстрой закупки выберите одностраничную спецификацию: остальные листы этого PDF не распознаны',true);
   const items=[...document.querySelectorAll('#quickRows tr')].map(row=>{
     const data={};row.querySelectorAll('[data-quick-field]').forEach(input=>data[input.dataset.quickField]=input.value.trim());
     data.delivery_date ||= null;return data;
