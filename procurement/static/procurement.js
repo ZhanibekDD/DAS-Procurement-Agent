@@ -8,7 +8,7 @@ pages.pricebook=['Прайсы поставщиков','История пред�
 const procurementShowView=showView;
 showView=function(name){procurementShowView(name);if(['rfq','tender'].includes(name))document.querySelector('#nav [data-view="lots"]')?.classList.add('active')};
 function procurementStage(l){return ({rfq_sent:1,quotes_received:2,comparison:3,awarded:4,ordered:5})[l.status]||0}
-function invalidateProcurement(){purchasing.epoch++;purchasing.preview=null;purchasing.request=null;$('#procurementPreview')&&( $('#procurementPreview').innerHTML='<p>Выбор изменён. Обновите предпросмотр.</p>')}
+function invalidateProcurement(){purchasing.epoch++;purchasing.preview=null;purchasing.request=null;$('#procurementPreview')&&( $('#procurementPreview').innerHTML='<p>Выбор изменён. Обновите предпросмотр.</p>');$('#procurementPreviewBtn')?.classList.remove('secondary')}
 function selectedRfqRequest(){return {supplier_ids:[...document.querySelectorAll('[name="procurementSupplier"]:checked')].map(n=>Number(n.value)),
  item_ids:[...document.querySelectorAll('[name="procurementItem"]:checked')].map(n=>Number(n.value)),channel:'email',template_code:'rfq-email'};}
 function filteredProcurementMessages(lotId){return state.outbox.filter(m=>Number(m.lot_id)===Number(lotId))}
@@ -34,6 +34,7 @@ async function previewProcurement(){
  if(p.lot_id!==lid||p.items.some(i=>i.lot_id!==lid))throw new Error('Предпросмотр не соответствует выбранному лоту; отправка заблокирована');
  purchasing.preview=p;purchasing.request=request;
  $('#procurementPreview').innerHTML=`<h3>Проверьте запрос перед отправкой</h3>${p.messages.map(messagePreview).join('<hr>')}${p.approval_required?'<p>По правилу компании требуется согласование.</p>':''}<label><input id="procurementConfirmed" type="checkbox"> Проверены позиции, количества, поставщики и вложения</label><button class="btn" id="procurementSend" onclick="sendProcurement()">${p.approval_required?'Подготовить для согласования':'Отправить запрос'}</button>`;
+ button.classList.add('secondary');
  }catch(e){toast(e.message,true)}finally{if(button.isConnected)button.disabled=false}
 }
 async function sendProcurement(){

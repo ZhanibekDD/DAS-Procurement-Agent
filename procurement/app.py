@@ -885,7 +885,13 @@ _ACTIVITY_LABELS = {
 def recent_activity(limit: int = Query(default=8, ge=1, le=30)):
     """A deliberately small, human-readable projection; raw audit remains admin-only."""
     result = []
-    for event in service.list_audit(min(200, limit * 10)):
+    filter_sql = " OR ".join("(action = ? AND entity_type = ?)" for _ in _ACTIVITY_LABELS)
+    filter_args = tuple(part for pair in _ACTIVITY_LABELS for part in pair)
+    events = service.db.all(
+        f"SELECT action, entity_type, entity_id, created_at FROM audit_log WHERE {filter_sql} ORDER BY id DESC LIMIT ?",
+        (*filter_args, min(200, limit * 10)),
+    )
+    for event in events:
         label = _ACTIVITY_LABELS.get((event["action"], event["entity_type"]))
         if not label:
             continue

@@ -7,7 +7,7 @@ Object.assign(mailStatus, {
 });
 const statusNames = {
   draft:'Черновик', rfq_draft:'Черновик', rfq_sent:'Запрос отправлен',
-  queued:'Готов к отправке', approved:'Готов к отправке', sending:'Отправляется',
+  queued:'Готов к отправке', approved:'Подтверждён', sending:'Отправляется',
   sent:'Отправлен', failed:'Ошибка отправки', unknown:'Результат отправки не подтверждён',
   quotes_received:'Получены цены', comparison:'Сравнение', awarded:'Поставщик выбран',
   ordered:'Заказ', cancelled:'Отменён', active:'Активен', rejected:'Отклонён',
@@ -29,6 +29,14 @@ function staffMailStatus(message) {
   return mailStatus[delivery?.status || message.status] || 'Результат отправки не подтверждён';
 }
 
+function staffMailError(value) {
+  const text = String(value || '');
+  if (/timeout|timed out|время ожидания/i.test(text)) return 'Почтовый сервер не ответил вовремя.';
+  if (/recipient|адрес получателя|mailbox/i.test(text)) return 'Почтовый сервер отклонил адрес получателя.';
+  if (/connect|network|connection|соединен/i.test(text)) return 'Нет связи с почтовым сервером.';
+  return 'Письмо не отправлено. Проверьте данные и попробуйте снова.';
+}
+
 const technicalMailJournal = mailJournal;
 mailJournal = function(message) {
   if (state.role === 'admin') return technicalMailJournal(message);
@@ -39,7 +47,7 @@ mailJournal = function(message) {
     <p>Получатель: ${esc(message.recipient)}<br>Время: ${esc(delivery.accepted_at || delivery.updated_at || 'ещё не отправлено')}<br>
     Копия в «Отправленных»: ${delivery.sent_copy_status === 'saved' ? 'сохранена' : 'не подтверждена'}<br>
     Вложения: ${files.length ? files.map(file => esc(file.filename)).join(', ') : 'нет'}</p>
-    ${delivery.error ? `<p role="alert">${esc(delivery.error)}</p>` : ''}
+    ${delivery.error ? `<p role="alert">${esc(staffMailError(delivery.error))}</p>` : ''}
     ${delivery.warning ? `<p role="alert">${esc(delivery.warning)}</p>` : ''}
     ${delivery.copy_retry_allowed ? `<button class="btn secondary small" onclick="retrySentCopy(${Number(message.id)})">Проверить копию без повторной отправки</button>` : ''}
   </details>`;
@@ -90,7 +98,7 @@ renderLots = function() {
   root.querySelectorAll('#lotsTable tbody td:first-child small.muted').forEach(node => node.remove());
   const excel = root.querySelector(':scope > button[onclick*="openLaunchImport"]');
   if (excel) {
-    excel.classList.replace('btn', 'btn');
+    excel.classList.add('secondary');
     excel.textContent = 'Создать из Excel или CSV';
     const title = root.querySelector('.panel-title');
     title?.append(moreMenu([excel]));
