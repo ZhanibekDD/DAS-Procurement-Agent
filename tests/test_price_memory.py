@@ -118,6 +118,20 @@ def test_long_dash_dimension_search_merges_only_matching_family_and_suffix(workf
     assert PriceMemory(store).search('ФБС 9—4—6-П',today=TODAY)['total']==1
 
 
+def test_generic_item_words_remain_searchable_without_merging_designations(workflow):
+    _,store,_=workflow
+    price(workflow,'Блок фундаментный ФБС 9.4.6-Т','100','A')
+    price(workflow,'ФБС 9—4—6-Т','110','B')
+    price(workflow,'Плита ПБ 9.4.6-Т','1','C')
+    generic=PriceMemory(store).search('Блок фундаментный',today=TODAY)
+    assert generic['total']==1
+    assert generic['records'][0]['supplier_name']=='ТЕСТ A'
+    marked=PriceMemory(store).search('ФБС 9-4-6-Т',today=TODAY)
+    assert marked['total']==2
+    assert marked['groups'][0]['current_stats']==dict(count=2,min='100',median='105',max='110')
+    assert PriceMemory(store).search('ПБ 9.4.6-Т',today=TODAY)['total']==1
+
+
 def test_global_variant_separator_aliases_share_one_price_history(workflow):
     _,s,_=workflow
     for name,amount,supplier in [('ФБС 9.4.6-Т','100','A'),('ФБС 9.4.6 - Т','110','B'),

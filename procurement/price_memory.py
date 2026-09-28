@@ -173,10 +173,14 @@ class PriceMemory:
                                  for i in data['materials']
                                  if designation_key(i['name'],i.get('specification','')) != INVALID_DESIGNATION}
         query_key = material_key(query)
+        # Preserve literal characteristic words for containment searches; the
+        # grouping key intentionally removes generic item prefixes.
+        query_literal = specification_key(query)
         family_query = re.search(r'(?<!\w)(фбс|пб|фл)(?!\w)', query_key)
         def matches(name, spec, reg):
             key = material_key(name)
             combined = material_key(str(name)+' '+str(spec))
+            combined_literal = specification_key(str(name)+' '+str(spec))
             if project_materials is not None:
                 designation = designation_key(name,spec)
                 if designation == INVALID_DESIGNATION or not any(
@@ -186,7 +190,9 @@ class PriceMemory:
             if family_query:
                 primary = re.search(r'(?<!\w)(фбс|пб|фл)(?!\w)', combined)
                 if not primary or primary[1] != family_query[1]:return False
-            return (not query_key or query_key == key or re.search(r'(?<!\w)'+re.escape(query_key)+r'(?!\w)',combined) is not None) and specification_key(specification) in specification_key(spec) and (not region or normalized(region)==normalized(reg))
+            return (not query_key or query_key == key or
+                    re.search(r'(?<!\w)'+re.escape(query_key)+r'(?!\w)',combined) is not None or
+                    re.search(r'(?<!\w)'+re.escape(query_literal)+r'(?!\w)',combined_literal) is not None) and specification_key(specification) in specification_key(spec) and (not region or normalized(region)==normalized(reg))
         records=[]; groups=defaultdict(list); total=0; unread=[]
         with self.db.connection() as conn:
             conn.create_function('memory_matches',3,lambda n,s,r:int(matches(n,s,r)),deterministic=True)
