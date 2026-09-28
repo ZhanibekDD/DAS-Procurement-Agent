@@ -1088,7 +1088,8 @@ class ProcurementService:
             from PIL import Image
             from .upload_io import open_payload
             with open_payload(content) as image_stream, Image.open(image_stream) as image:
-                if image.format not in {'PNG','JPEG'} or image.width*image.height>40_000_000:
+                expected_format = 'PNG' if suffix == '.png' else 'JPEG'
+                if image.format != expected_format or image.width*image.height>40_000_000:
                     raise ValueError('Недопустимое или слишком большое изображение')
                 image.verify()
         if project_id is not None:

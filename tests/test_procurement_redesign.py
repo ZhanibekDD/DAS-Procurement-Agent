@@ -470,6 +470,36 @@ def test_native_pdf_view_not_plugin_sandboxed_office_is_sandboxed(http_boundary)
         else:assert '<table>' in r.text
 
 
+@pytest.mark.parametrize('filename,payload_format,accepted,mime',[
+    ('scan.png','PNG',True,'image/png'),
+    ('scan.jpg','JPEG',True,'image/jpeg'),
+    ('scan.jpeg','JPEG',True,'image/jpeg'),
+    ('scan.png','JPEG',False,None),
+    ('scan.jpg','PNG',False,None),
+    ('scan.jpeg','PNG',False,None),
+])
+def test_image_upload_requires_format_matching_extension_and_inline_mime(
+    http_boundary,filename,payload_format,accepted,mime
+):
+    from PIL import Image
+    client,a,settings,db=http_boundary;u=login(client,a);h=headers(u)
+    output=io.BytesIO();Image.new('RGB',(3,2),(10,20,30)).save(output,format=payload_format)
+    data=output.getvalue()
+    response=client.post('/api/documents',headers=h,params={'document_type':'project_section'},
+                         files={'file':(filename,data)})
+    if not accepted:
+        assert response.status_code==422
+        assert 'Недопустимое' in response.json()['detail']
+        assert not db.one('SELECT id FROM source_documents WHERE sha256=?',(hashlib.sha256(data).hexdigest(),))
+        return
+    assert response.status_code==201,response.text
+    view=f"/api/procurement/documents/{response.json()['id']}/view"
+    opened=client.get(view)
+    assert opened.status_code==200 and opened.content==data
+    assert opened.headers['content-type']==mime
+    assert opened.headers['x-content-type-options']=='nosniff'
+
+
 @pytest.mark.parametrize('path',['/api/procurement/catalog/preview','/api/procurement/catalog/incoming-mail','/api/procurement/projects/2/workbook'])
 def test_new_uploads_share_streaming_body_limit(path):
     assert upload_request({'type':'http','method':'POST','path':path})
