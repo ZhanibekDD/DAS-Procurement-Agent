@@ -10,6 +10,7 @@ from pypdf import PdfReader
 
 from .models import LotItemCreate, ProcurementSuggestionCreate
 from .upload_io import FilePayload, MAX_FILE, open_payload, UploadTooLarge, TOO_LARGE
+from .pdf_ocr import OCR_PAGE_TIMEOUT, OCR_CPU_LIMIT
 
 
 def _number(value: str) -> Decimal:
@@ -52,7 +53,7 @@ def _page_worker(content, page_number, pipe, ocr=False, workspace=None):
         if hasattr(os, 'setsid'): os.setsid()
         import resource
         resource.setrlimit(resource.RLIMIT_AS,(512*1024*1024,512*1024*1024))
-        resource.setrlimit(resource.RLIMIT_CPU,(45 if ocr else 15,)*2)
+        resource.setrlimit(resource.RLIMIT_CPU,(OCR_CPU_LIMIT if ocr else 15,)*2)
     except ImportError:
         pass
     try:
@@ -86,7 +87,7 @@ def _bounded_page(content, page_number: int, *, ocr=False):
     result=None
     try:
         process.start();sender.close()
-        if receiver.poll(55 if ocr else 20):
+        if receiver.poll(OCR_PAGE_TIMEOUT if ocr else 20):
             try:result=receiver.recv()
             except EOFError:pass
     finally:

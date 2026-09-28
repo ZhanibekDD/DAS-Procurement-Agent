@@ -208,3 +208,31 @@ def test_missing_ocr_and_native_timeout_are_honest(monkeypatch,tmp_path):
     def timeout(*a,**kw):raise subprocess.TimeoutExpired('tesseract',1)
     monkeypatch.setattr(subprocess,'run',timeout)
     with pytest.raises(ValueError,match='слишком долго'):_run(['tesseract'],1)
+
+
+def test_dense_scan_has_bounded_native_budget_inside_worker_deadline(monkeypatch,tmp_path):
+    from procurement import pdf_ocr as ocr
+    from procurement import document_analysis as analysis
+    calls=[]
+    def run(command,timeout):
+        calls.append((command[0],timeout))
+        if command[0]=='pdftoppm':(tmp_path/'page.png').write_bytes(b'fixture')
+    monkeypatch.setattr(ocr,'_run',run)
+    monkeypatch.setattr(ocr,'parse_tsv',lambda _: [{'line':1,'text':'ФБС 24.4.6 218 шт','confidence':.96}])
+    assert ocr.recognize_page(tmp_path/'scan.pdf',2,tmp_path)['mode']=='ocr'
+    assert calls==[('pdftoppm',18),('tesseract',45)]
+    assert 0 < ocr.RASTER_TIMEOUT + ocr.OCR_TIMEOUT < analysis.OCR_PAGE_TIMEOUT <= 75
+    assert ocr.OCR_TIMEOUT < analysis.OCR_CPU_LIMIT <= 60
+
+
+def test_native_timeout_does_not_retry_and_keeps_thread_limit(monkeypatch):
+    import subprocess
+    from procurement.pdf_ocr import _run,OCR_TIMEOUT
+    calls=[]
+    def run(command,**kwargs):
+        calls.append(kwargs)
+        raise subprocess.TimeoutExpired(command,kwargs['timeout'])
+    monkeypatch.setattr(subprocess,'run',run)
+    with pytest.raises(ValueError,match='слишком долго'):_run(['tesseract'],OCR_TIMEOUT)
+    assert len(calls)==1 and calls[0]['timeout']==45
+    assert calls[0]['env']['OMP_THREAD_LIMIT']==calls[0]['env']['OMP_NUM_THREADS']=='1'

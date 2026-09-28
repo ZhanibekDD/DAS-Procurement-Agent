@@ -13,6 +13,12 @@ MAX_TEXT = 100000
 MAX_OUTPUT = 8 * 1024 * 1024
 MAX_PAGES = 12
 MAX_REVIEW_LINES = MAX_LINES * MAX_PAGES
+RASTER_TIMEOUT = 18
+OCR_TIMEOUT = 45
+# The real multi-column A3 scan takes ~27 seconds in a two-CPU canary.
+# Keep bounded headroom under load, with one coherent enclosing deadline.
+OCR_PAGE_TIMEOUT = RASTER_TIMEOUT + OCR_TIMEOUT + 12
+OCR_CPU_LIMIT = 60
 
 
 def _run(command, timeout):
@@ -74,11 +80,11 @@ def recognize_page(path, page_number, workspace=None):
         root = Path(directory)
         image, output = root / 'page', root / 'ocr'
         _run(['pdftoppm', '-f', str(page_number), '-l', str(page_number), '-singlefile',
-              '-scale-to', '6000', '-png', str(path), str(image)], 18)
+              '-scale-to', '6000', '-png', str(path), str(image)], RASTER_TIMEOUT)
         png = image.with_suffix('.png')
         if not png.is_file() or png.stat().st_size > 64 * 1024 * 1024:
             raise ValueError('Изображение листа превышает безопасный размер')
-        _run(['tesseract', str(png), str(output), '-l', 'rus+eng', '--psm', '11', 'tsv'], 30)
+        _run(['tesseract', str(png), str(output), '-l', 'rus+eng', '--psm', '11', 'tsv'], OCR_TIMEOUT)
         lines = parse_tsv(output.with_suffix('.tsv'))
     if not lines:
         raise ValueError('На скане не распознан текст. Выберите лист со спецификацией или введите позиции вручную')
