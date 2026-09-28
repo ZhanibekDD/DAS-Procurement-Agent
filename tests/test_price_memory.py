@@ -88,9 +88,34 @@ def test_future_and_same_day_numeric_sequence(workflow):
 
 @pytest.mark.parametrize('name,expected',[('Блок ФБС 24-4-6','фбс 24.4.6'),('фбс 24 × 4 × 6','фбс 24.4.6'),
     ('ФБС 9.4.6-Т','фбс 9.4.6-т'),('ФБС 9.4.6 - Т','фбс 9.4.6-т'),
-    ('ФБС 9.4.6—Т','фбс 9.4.6-т'),('ПБ 24.4.6','пб 24.4.6')])
+    ('ФБС 9.4.6—Т','фбс 9.4.6-т'),('ФБС 9–4–6-Т','фбс 9.4.6-т'),
+    ('ФБС 9—4—6-Т','фбс 9.4.6-т'),('ПБ 24.4.6','пб 24.4.6')])
 def test_material_normalization(name,expected):
     assert material_key(name)==expected
+
+
+@pytest.mark.parametrize('separator',['-', '–', '—', '.', 'х', 'x', '×'])
+def test_dimension_separator_aliases_across_all_keys(separator):
+    mark=f'ФБС 9{separator}4{separator}6-Т'
+    assert material_key(mark)=='фбс 9.4.6-т'
+    assert specification_key(f'Блок фундаментный {mark}')=='блок фундаментный фбс 9.4.6-т'
+    assert designation_key(mark)=='фбс 9.4.6-т'
+    assert designation_key(mark,'ПБ 9.4.6-Т')==INVALID_DESIGNATION
+
+
+def test_long_dash_dimension_search_merges_only_matching_family_and_suffix(workflow):
+    _,store,_=workflow
+    price(workflow,'ФБС 9-4-6-Т','100','A')
+    price(workflow,'ФБС 9—4—6-Т','110','B')
+    price(workflow,'ФБС 9–4–6-Т','120','C')
+    price(workflow,'ПБ 9—4—6-Т','1','D')
+    price(workflow,'ФБС 9—4—6-П','2','E')
+    for query in ('ФБС 9-4-6-Т','ФБС 9—4—6-Т','ФБС 9–4–6-Т'):
+        result=PriceMemory(store).search(query,today=TODAY)
+        assert result['total']==3
+        assert result['groups'][0]['current_stats']==dict(count=3,min='100',median='110',max='120')
+    assert PriceMemory(store).search('ПБ 9—4—6-Т',today=TODAY)['total']==1
+    assert PriceMemory(store).search('ФБС 9—4—6-П',today=TODAY)['total']==1
 
 
 def test_global_variant_separator_aliases_share_one_price_history(workflow):

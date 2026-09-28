@@ -19,7 +19,7 @@ def normalized(value):
     return ' '.join(value.split())
 
 
-_DESIGNATION_PATTERN = (r'(?<!\w)(фбс|пб|фл)\s*[-–—]?\s*(\d+)\s*[.хx×-]\s*(\d+)\s*[.хx×-]\s*(\d+)'
+_DESIGNATION_PATTERN = (r'(?<!\w)(фбс|пб|фл)\s*[-–—]?\s*(\d+)\s*[.хx×–—-]\s*(\d+)\s*[.хx×–—-]\s*(\d+)'
                         r'(?:\s*[-–—]\s*([а-яa-z]{1,3}))?(?!\w)')
 
 
