@@ -33,7 +33,7 @@ async function previewProcurement(){
  try{const p=await launchJson(`/api/procurement/lots/${lid}/preview`,'POST',request);if(epoch!==purchasing.epoch||lid!==state.selectedLot)return;
  if(p.lot_id!==lid||p.items.some(i=>i.lot_id!==lid))throw new Error('Предпросмотр не соответствует выбранному лоту; отправка заблокирована');
  purchasing.preview=p;purchasing.request=request;
- $('#procurementPreview').innerHTML=`<h3>Предпросмотр лота #${p.lot_id}</h3>${p.messages.map(messagePreview).join('<hr>')}<p>${p.approval_required?'Для закупки требуется отдельное согласование по настроенному правилу.':'Отдельное согласование не требуется.'}</p><label><input id="procurementConfirmed" type="checkbox"> Проверены позиции, количества, поставщики и вложения</label><button class="btn" id="procurementSend" onclick="sendProcurement()">${p.approval_required?'Создать запрос для согласования':'Отправить запрос'}</button>`;
+ $('#procurementPreview').innerHTML=`<h3>Проверьте запрос перед отправкой</h3>${p.messages.map(messagePreview).join('<hr>')}${p.approval_required?'<p>По правилу компании требуется согласование.</p>':''}<label><input id="procurementConfirmed" type="checkbox"> Проверены позиции, количества, поставщики и вложения</label><button class="btn" id="procurementSend" onclick="sendProcurement()">${p.approval_required?'Подготовить для согласования':'Отправить запрос'}</button>`;
  }catch(e){toast(e.message,true)}finally{if(button.isConnected)button.disabled=false}
 }
 async function sendProcurement(){
