@@ -25,7 +25,8 @@ DAS = "https://procurement.test:9444"
 
 class Authority:
     def __init__(self):
-        self.users = {sub: {"epoch": 1, "active": True, "read_only": False, "modules": ["procurement"]}
+        self.users = {sub: {"epoch": 1, "active": True, "read_only": False,
+                            "access_admin": False, "modules": ["procurement"]}
                       for sub in (ALICE, BOB)}
         self.tokens = {}
         self.codes = {}
@@ -67,6 +68,7 @@ class Authority:
         result = {"active": True, "sub": sub, "epoch": epoch,
             "username": "alice" if sub == ALICE else "bob", "email": "test@example.invalid",
             "modules": user["modules"], "read_only": user["read_only"],
+            "access_admin": user["access_admin"],
             "access_token": self.issue(sub), "expires_in": 120}
         if self.bad_field:
             result.pop(self.bad_field)
@@ -125,6 +127,53 @@ def test_sso_exchange_pkce_secure_namespaced_cookies_and_live_introspection(boun
     assert sso.cookie_names(other) != sso.cookie_names(settings)
     with pytest.raises(sso.SSOError):
         sso.authenticate(other, client.cookies.get(session_name))
+
+
+def test_admin_role_requires_current_authoritative_backchannel_entitlement(boundary):
+    client, authority, _, _ = boundary
+    login(client, authority)
+    assert client.get('/api/ui-context', headers={'X-OpenWebUI-User-Role': 'admin'}).json() == {'role': 'staff'}
+    assert client.get('/api/audit').status_code == 403
+
+    authority.users[ALICE]['access_admin'] = True
+    assert client.get('/api/ui-context').json() == {'role': 'admin'}
+    assert client.get('/api/audit').status_code == 200
+
+    authority.users[ALICE]['read_only'] = True
+    assert client.get('/api/ui-context').json() == {'role': 'staff'}
+    assert client.get('/api/audit').status_code == 403
+
+    authority.users[ALICE]['read_only'] = False
+    authority.users[ALICE]['access_admin'] = False
+    assert client.get('/api/ui-context').json() == {'role': 'staff'}
+    assert client.get('/api/audit').status_code == 403
+
+
+def test_missing_admin_entitlement_fails_closed_and_malformed_claim_is_rejected(boundary, monkeypatch):
+    client, authority, settings, _ = boundary
+    login(client, authority)
+    original = authority.post
+
+    def no_admin_claim(cfg, endpoint, payload):
+        result = original(cfg, endpoint, payload)
+        if endpoint == '/access/sso/introspect/':
+            result.pop('access_admin', None)
+        return result
+
+    monkeypatch.setattr(sso, '_post', no_admin_claim)
+    assert client.get('/api/ui-context').json() == {'role': 'staff'}
+    assert client.get('/api/audit').status_code == 403
+
+    def invalid_admin_claim(cfg, endpoint, payload):
+        result = original(cfg, endpoint, payload)
+        if endpoint == '/access/sso/introspect/':
+            result['access_admin'] = 'true'
+        return result
+
+    monkeypatch.setattr(sso, '_post', invalid_admin_claim)
+    with pytest.raises(sso.SSOError) as exc:
+        sso.introspect(settings, authority.issue(ALICE))
+    assert exc.value.status == 503
 
 
 @pytest.mark.parametrize("mutation", ["state", "unicode_state", "signature", "expiry", "verifier", "origin", "null_origin"])

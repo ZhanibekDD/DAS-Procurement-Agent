@@ -145,13 +145,19 @@ def introspect(settings, token: str) -> dict:
                 or not isinstance(result["username"], str) or not 1 <= len(result["username"]) <= 150
                 or not isinstance(result["email"], str) or len(result["email"]) > 320):
             raise ValueError
+        # Only a backchannel entitlement from DAS may elevate a session.  Older
+        # DAS authorities omit this field, in which case admin access stays off.
+        access_admin = result.get("access_admin", False)
+        if type(access_admin) is not bool:
+            raise ValueError
     except (ValueError, KeyError, TypeError, AttributeError):
         raise SSOError(503) from None
     if "procurement" not in modules:
         raise SSOError(403)
     token, expires = _access_token(result)
     return {"sub": subject, "username": result["username"], "email": result["email"], "modules": modules,
-        "read_only": result["read_only"], "epoch": result["epoch"], "token": token, "expires": expires}
+        "read_only": result["read_only"], "epoch": result["epoch"], "token": token, "expires": expires,
+        "role": "admin" if access_admin and not result["read_only"] else "staff"}
 
 
 def complete(settings, state_cookie: str, code: str, state: str) -> dict:
