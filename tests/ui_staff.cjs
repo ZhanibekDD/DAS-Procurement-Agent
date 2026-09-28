@@ -36,4 +36,12 @@ const activity = context.staffActivity();
 assert(activity.includes('Поставщик изменён'));
 assert(activity.includes('Тест &lt;script&gt;'));
 assert(!activity.includes('<script>'));
+assert.deepEqual(Array.from(context.staffLotCounts([
+  {status:'draft'}, {status:'rfq_draft'}, {status:'rfq_sent'},
+  {status:'rfq_sent'}, {status:'quotes_received'}, {status:'comparison'},
+  {status:'awarded'}, {status:'ordered'}
+]), row => [row.label, row.count]), [
+  ['Черновики', 2], ['Запрос отправлен', 2],
+  ['Получены цены', 2], ['Поставщик выбран', 2]
+]);
 console.log('staff UI: Russian statuses, server-confirmed send, safe activity and admin-only audit PASS');

@@ -90,6 +90,18 @@ function staffActivity() {
     : '<p>Пока нет новых действий.</p>'}</div></section>`;
 }
 
+function staffLotCounts(lots) {
+  const stages = [
+    ['Черновики', ['draft', 'rfq_draft']],
+    ['Запрос отправлен', ['rfq_sent']],
+    ['Получены цены', ['quotes_received', 'comparison']],
+    ['Поставщик выбран', ['awarded', 'ordered']]
+  ];
+  return stages.map(([label, statuses]) => ({
+    label, count: lots.filter(lot => statuses.includes(lot.status)).length
+  }));
+}
+
 renderOverview = function() {
   $('#overview').innerHTML = `<section class="panel"><div class="panel-title"><h2>Закупки в работе</h2>
     <button class="btn" data-open="lot">Новая закупка</button></div>${lotsTable(state.lots.slice(0,6))}</section>${staffActivity()}`;
@@ -100,9 +112,22 @@ const fullRenderLots = renderLots;
 renderLots = function() {
   fullRenderLots();
   const root = $('#lots');
+  const summary = root.querySelector('.lot-summary');
+  if (summary) {
+    const stages = staffLotCounts(state.lots);
+    summary.querySelectorAll('.mini-stat').forEach((card, index) => {
+      card.querySelector('span').textContent = stages[index].label;
+      card.querySelector('b').textContent = stages[index].count;
+    });
+  }
   root.querySelectorAll(':scope > section.panel').forEach(panel => {
     if (panel.querySelector('h2')?.textContent === 'Закупочный процесс') panel.remove();
   });
+  const title = root.querySelector('.panel-title');
+  if (title) {
+    title.querySelector('h2').textContent = 'Список закупок';
+    title.querySelector('p')?.remove();
+  }
   const create = root.querySelector('[data-open="lot"]');
   if (create) create.textContent = 'Новая закупка';
   root.querySelectorAll('#lotsTable tbody td:first-child small.muted').forEach(node => node.remove());
@@ -128,6 +153,7 @@ renderSuppliers = function() {
   const root = $('#suppliers');
   const hero = root.querySelector('.supplier-visual');
   const panelTitle = root.querySelector('.panel-title');
+  panelTitle?.querySelector('p')?.remove();
   const add = hero?.querySelector('[data-open="supplier"]');
   const importButton = hero?.querySelector('[data-open="supplier-import"]');
   const history = root.querySelector('#launchSupplierHistory')?.parentElement;
@@ -183,11 +209,21 @@ renderPricebook = function() {
   const root = $('#pricebook');
   root.querySelector('.price-hero')?.remove();
   const catalog = root.querySelector(':scope > section.panel');
+  catalog?.querySelector(':scope > p')?.remove();
   const upload = catalog?.querySelector('button[onclick*="openCatalogImport"]');
   const incoming = catalog?.querySelector('button[onclick*="openIncomingPrices"]');
   const historical = root.querySelector('[data-open="price-history"]');
   const more = [incoming, historical].filter(Boolean);
   if (more.length) catalog?.insertBefore(moreMenu(more), upload?.nextSibling || null);
+  const material = catalog?.querySelector('#catalogQuery')?.closest('label');
+  const specification = catalog?.querySelector('#catalogSpecification')?.closest('label');
+  const search = catalog?.querySelector('button[onclick*="searchCatalog"]');
+  if (material && specification && search) {
+    const row = document.createElement('div');
+    row.className = 'catalog-search';
+    row.append(material, specification, search);
+    catalog.insertBefore(row, catalog.querySelector('#catalogResults'));
+  }
   const memory = document.createElement('button');
   memory.className = 'btn secondary';
   memory.textContent = 'Память цен по всей базе';

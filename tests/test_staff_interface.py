@@ -77,10 +77,13 @@ class StaffInterfaceTests(unittest.TestCase):
             self.assertIn(name, nav)
         self.assertEqual(nav.count("data-view="), 5)
         self.assertNotIn("PROCUREMENT CONTROL", html)
+        self.assertIn(".app{grid-template-columns:minmax(0,1fr)}", html)
+        self.assertIn(".nav{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))", html)
         script = (Path(__file__).parents[1] / "procurement" / "static" / "staff-ui.js").read_text(encoding="utf-8")
         for status in ("Черновик", "Готов к отправке", "Отправляется", "Отправлен", "Ошибка отправки"):
             self.assertIn(status, script)
         self.assertIn("accepted_at", script)
+        self.assertIn("staffLotCounts", script)
 
 
 if __name__ == "__main__":
