@@ -3,13 +3,14 @@ import asyncio
 import hashlib
 import io
 import tracemalloc
+from dataclasses import replace
 from email.message import EmailMessage
 from pathlib import Path
 
 import pytest
 
 from procurement.upload_io import (FilePayload,MAX_FILE,MAX_BODY,CHUNK,TOO_LARGE,
-    UploadTooLarge,staged_upload,payload_sha256,UploadBodyLimit,PACK_TOO_LARGE)
+    UploadTooLarge,staged_upload,payload_sha256,UploadBodyLimit,PACK_TOO_LARGE,upload_request)
 from procurement.table_ingest import read_table
 from procurement.imports import parse_supplier_table
 from procurement.stream_mail import send_streamed
@@ -86,10 +87,11 @@ def test_legacy_supplier_csv_stream(tmp_path):
     assert parse_supplier_table(FilePayload(path),path.name).rows[0].email=='t@example.test'
 
 
+@pytest.mark.parametrize('path',['/api/documents','/api/procurement/quick-intake'])
 @pytest.mark.parametrize('chunked',[False,True])
-def test_request_envelope_101mb_and_chunked_limit(chunked):
+def test_request_envelope_101mb_and_chunked_limit(chunked,path):
     async def run():
-        scope={'type':'http','method':'POST','path':'/api/documents','headers':[]}
+        scope={'type':'http','method':'POST','path':path,'headers':[]}
         if not chunked:scope['headers']=[(b'content-length',str(MAX_BODY+1).encode())]
         emitted=[]
         async def receive():return {'type':'http.request','body':b'x'*CHUNK,'more_body':True}
@@ -104,6 +106,55 @@ def test_request_envelope_101mb_and_chunked_limit(chunked):
         await UploadBodyLimit(app)(scope,receive,send)
         assert emitted[0]['status']==413
         assert TOO_LARGE.encode() in emitted[1]['body']
+    asyncio.run(run())
+
+
+def test_quick_intake_prebody_identity_and_two_upload_slots(http_boundary):
+    from starlette.requests import Request
+    import procurement.app as application
+
+    assert upload_request({'type':'http','method':'POST','path':'/api/procurement/quick-intake'})
+    assert not upload_request({'type':'http','method':'GET','path':'/api/procurement/quick-intake'})
+
+    async def run():
+        # The identity boundary must reject an anonymous production upload before
+        # FastAPI/Starlette consumes the multipart body.
+        settings=application.settings
+        application.settings=replace(settings,sso_enabled=False,environment='production')
+        try:
+            async def unread_body():
+                raise AssertionError('multipart body was read before identity rejection')
+            request=Request({'type':'http','method':'POST','path':'/api/procurement/quick-intake',
+                'headers':[],'query_string':b''},receive=unread_body)
+            async def forbidden_next(_):
+                raise AssertionError('unauthenticated request reached FastAPI')
+            response=await application.das_identity_boundary(request,forbidden_next)
+            assert response.status_code==403
+        finally:application.settings=settings
+
+        entered=asyncio.Event()
+        release=asyncio.Event()
+        slots=0
+        async def held_app(scope,receive,send):
+            nonlocal slots
+            slots+=1
+            if slots==2:entered.set()
+            await release.wait()
+        gate=UploadBodyLimit(held_app)
+        scope={'type':'http','method':'POST','path':'/api/procurement/quick-intake','headers':[]}
+        async def receive():return {'type':'http.request','body':b'','more_body':False}
+        sent=[]
+        async def send(message):sent.append(message)
+        first=asyncio.create_task(gate(scope,receive,send))
+        second=asyncio.create_task(gate(scope,receive,send))
+        await asyncio.wait_for(entered.wait(),timeout=1)
+        try:
+            await gate(scope,receive,send)
+            assert sent[0]['status']==429
+            assert slots==2
+        finally:
+            release.set()
+            await asyncio.gather(first,second)
     asyncio.run(run())
 
 

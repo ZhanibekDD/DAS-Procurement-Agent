@@ -72,7 +72,8 @@ def upload_request(scope):
     return (scope.get('type')=='http' and scope.get('method')=='POST' and
             (scope.get('path') in {'/api/documents','/api/imports/batch','/api/suppliers/import',
                 '/api/launch/lot-sheet/preview','/api/launch/supplier-import/preview',
-                '/api/procurement/catalog/preview','/api/procurement/catalog/incoming-mail'}
+                '/api/procurement/catalog/preview','/api/procurement/catalog/incoming-mail',
+                '/api/procurement/quick-intake'}
              or bool(re.fullmatch(r'/api/procurement/projects/\d+/workbook',scope.get('path','')))))
 
 
