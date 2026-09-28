@@ -2,13 +2,13 @@
 /* Presentation only: the server remains the authority for ACL, lot contents and SMTP status. */
 Object.assign(mailStatus, {
   draft: 'Черновик', approved: 'Готов к отправке', queued: 'Готов к отправке',
-  sending: 'Отправляется', sent: 'Отправлен', failed: 'Ошибка отправки',
+  sending: 'Отправляется', sent: 'Отправлен', failed: 'Не отправлено',
   unknown: 'Результат отправки не подтверждён'
 });
 const statusNames = {
   draft:'Черновик', rfq_draft:'Черновик', rfq_sent:'Запрос отправлен',
   queued:'Готов к отправке', approved:'Подтверждён', sending:'Отправляется',
-  sent:'Отправлен', failed:'Ошибка отправки', unknown:'Результат отправки не подтверждён',
+  sent:'Отправлен', failed:'Не отправлено', unknown:'Результат отправки не подтверждён',
   quotes_received:'Получены цены', comparison:'Сравнение', awarded:'Поставщик выбран',
   ordered:'Заказ', cancelled:'Отменён', active:'Активен', rejected:'Отклонён',
   needs_review:'Требует проверки', pending_ai_extraction:'Обрабатывается',
@@ -109,9 +109,22 @@ renderOverview = function() {
 };
 
 const fullRenderLots = renderLots;
+const quickPurchase = {intake:null, busy:false, recovered:false};
+function quickPurchaseMarkup() {
+  const projectOptions=state.projects.map(p=>`<option value="${Number(p.id)}">${esc(p.name)}</option>`).join('');
+  return `<section class="panel quick-purchase"><div class="panel-title"><div><h2>Новая закупка из файла</h2><p>Загрузите PDF или Excel. Черновик, поставщики, письмо и вложение появятся здесь.</p></div></div>
+    <div class="toolbar"><label>Объект<select id="quickProject"><option value="">Выберите объект</option>${projectOptions}</select></label>
+    <label>Спецификация PDF / XLSX / CSV<input id="quickFile" type="file" accept=".pdf,.xlsx,.csv" ${quickPurchase.busy?'disabled':''}></label></div>
+    <div id="quickProgress" role="status">${quickPurchase.busy?'Распознаём файл и сохраняем черновик…':''}</div>
+    <div id="quickReview"></div></section>`;
+}
 renderLots = function() {
   fullRenderLots();
   const root = $('#lots');
+  root.insertAdjacentHTML('afterbegin',quickPurchaseMarkup());
+  $('#quickProject').value=quickPurchase.intake?.document?.project_id || (state.projects.length===1?state.projects[0].id:'');
+  $('#quickFile').onchange=startQuickPurchase;
+  if(quickPurchase.intake?.status==='needs_review')renderQuickReview();
   const summary = root.querySelector('.lot-summary');
   if (summary) {
     const stages = staffLotCounts(state.lots);
@@ -123,7 +136,7 @@ renderLots = function() {
   root.querySelectorAll(':scope > section.panel').forEach(panel => {
     if (panel.querySelector('h2')?.textContent === 'Закупочный процесс') panel.remove();
   });
-  const title = root.querySelector('.panel-title');
+  const title = root.querySelector('#lotsTable')?.closest('section.panel')?.querySelector('.panel-title');
   if (title) {
     title.querySelector('h2').textContent = 'Список закупок';
     title.querySelector('p')?.remove();
@@ -135,7 +148,7 @@ renderLots = function() {
   if (excel) {
     excel.classList.add('secondary');
     excel.textContent = 'Создать из Excel или CSV';
-    const title = root.querySelector('.panel-title');
+    const title = root.querySelector('#lotsTable')?.closest('section.panel')?.querySelector('.panel-title');
     title?.append(moreMenu([excel]));
   }
   root.insertAdjacentHTML('beforeend', staffActivity());
@@ -171,6 +184,104 @@ renderSuppliers = function() {
   bindOpeners();
 };
 
+async function startQuickPurchase() {
+  const projectId=Number($('#quickProject').value),file=$('#quickFile').files[0];
+  if(!file)return;
+  if(!projectId){$('#quickFile').value='';return toast('Сначала выберите объект',true)}
+  if(file.size>100*1024*1024){$('#quickFile').value='';return toast('Файл больше 100 МБ',true)}
+  quickPurchase.busy=true;$('#quickFile').disabled=true;
+  $('#quickProgress').textContent='Распознаём файл и сохраняем черновик…';
+  try{
+    const form=new FormData();form.append('project_id',String(projectId));form.append('file',file);
+    const result=await api('/api/procurement/quick-intake',{method:'POST',body:form});
+    quickPurchase.intake=result;
+    await loadAll();
+    if(result.status==='draft'){
+      toast('Черновик сохранён. Проверьте получателей, письмо и вложение.');
+      await openLot(result.lot.id);
+      if($('#quickProgress'))$('#quickProgress').textContent='Черновик сохранён. Ничего не отправлено.';
+    }else{
+      showView('lots');$('#quickProgress').textContent=result.reason;
+      $('#quickReview')?.scrollIntoView({block:'nearest'});
+    }
+  }catch(error){$('#quickProgress').textContent='Черновик не подтверждён: '+error.message;toast(error.message,true)}
+  finally{quickPurchase.busy=false;if($('#quickFile'))$('#quickFile').disabled=false}
+}
+
+function renderQuickReview() {
+  const result=quickPurchase.intake,draft=result?.draft;if(!draft)return;
+  const rows=draft.rows||[];
+  const source=`/api/launch/documents/${Number(result.document.id)}/download`;
+  $('#quickReview').innerHTML=`<h3>Проверьте сомнительные позиции</h3><p>${esc(result.reason)}</p>
+    <p><a href="${source}" target="_blank" rel="noopener">Открыть исходный файл</a>. Он приложится к запросу без изменений.</p>
+    ${draft.needs_mapping?`<p role="alert">Колонки не распознаны. Укажите их один раз:</p><div class="toolbar">${[
+      ['name','Позиция'],['quantity','Количество'],['unit','Единица'],['specification','Характеристики'],['delivery_date','Срок']
+    ].map(([key,label])=>`<label>${label}<select data-quick-map="${key}"><option value="">Не использовать</option>${(draft.headers||[]).map((name,index)=>`<option value="${index}" ${draft.mapping?.[key]===index?'selected':''}>${esc(name)}</option>`).join('')}</select></label>`).join('')}</div><button class="btn secondary" type="button" onclick="remapQuickDraft()">Распознать по колонкам</button>`:''}
+    <div class="table-wrap"><table><thead><tr><th>Строка</th><th>Позиция</th><th>Количество</th><th>Ед.</th><th>Характеристики</th><th>Срок</th><th></th></tr></thead><tbody id="quickRows">
+    ${rows.map((r,i)=>`<tr data-quick-row="${i}" class="${r.error?'needs-review':''}"><td>${esc(r.row)}${r.error?`<small role="alert">${esc(r.error)}</small>`:''}</td>
+    <td><input data-quick-field="name" value="${esc(r.name||'')}"></td><td><input data-quick-field="quantity" value="${esc(r.quantity||'')}"></td>
+    <td><input data-quick-field="unit" value="${esc(r.unit||'')}"></td><td><input data-quick-field="specification" value="${esc(r.specification||'')}"></td>
+    <td><input data-quick-field="delivery_date" type="date" value="${esc(r.delivery_date||'')}"></td>
+    <td><button class="btn secondary small" type="button" onclick="this.closest('tr').remove()">Исключить</button></td></tr>`).join('')}</tbody></table></div>
+    ${result.kind==='pdf'?`<details open><summary>Все распознанные строки PDF (${draft.lines?.length||0}) — проверьте пропуски</summary><pre>${esc((draft.lines||[]).map(l=>`${l.line}. ${l.text}`).join('\n'))}</pre></details>`:''}
+    <button class="btn secondary" type="button" onclick="addQuickRow()">Добавить пропущенную позицию</button>
+    <button class="btn" type="button" id="quickReviewDone" onclick="finishQuickReview()" ${draft.needs_mapping?'disabled':''}>${result.kind==='pdf'?'Проверил исходный PDF и позиции — показать запрос':'Проверил позиции — показать запрос'}</button>
+    <p>Ни одно письмо не отправлено. После проверки позиций вы увидите получателей и текст запроса.</p>`;
+}
+async function remapQuickDraft(){
+  const intake=quickPurchase.intake,mapping={};
+  document.querySelectorAll('[data-quick-map]').forEach(select=>{if(select.value!=='')mapping[select.dataset.quickMap]=Number(select.value)});
+  try{
+    const updated=await launchJson(`/api/procurement/quick-draft/${intake.draft.preview_id}/remap`,'POST',{mapping});
+    quickPurchase.intake=updated;renderLots();toast('Колонки сопоставлены. Проверьте отмеченные строки.');
+  }catch(error){toast(error.message,true)}
+}
+const quickBaseLoadAll=loadAll;
+loadAll=async function(){
+  const loaded=await quickBaseLoadAll();
+  if(loaded&&!state.demo&&!quickPurchase.recovered){
+    quickPurchase.recovered=true;
+    try{
+      const saved=await api('/api/procurement/quick-draft');
+      if(saved&&!quickPurchase.intake){quickPurchase.intake=saved;if(state.view==='lots')renderLots()}
+    }catch{/* The main dashboard remains usable; no unconfirmed draft is sent. */}
+  }
+  return loaded;
+};
+function addQuickRow(){
+  const tbody=$('#quickRows'),row=tbody.querySelector('tr')?.cloneNode(true);
+  if(!row){tbody.insertAdjacentHTML('beforeend',`<tr class="needs-review"><td>Добавлено вручную</td>
+    <td><input data-quick-field="name"></td><td><input data-quick-field="quantity"></td>
+    <td><input data-quick-field="unit"></td><td><input data-quick-field="specification"></td>
+    <td><input data-quick-field="delivery_date" type="date"></td>
+    <td><button class="btn secondary small" type="button" onclick="this.closest('tr').remove()">Исключить</button></td></tr>`);return}
+  row.querySelectorAll('input').forEach(input=>input.value='');row.querySelector('td').textContent='Добавлено вручную';
+  row.classList.add('needs-review');tbody.append(row);
+}
+async function finishQuickReview(){
+  const result=quickPurchase.intake,draft=result?.draft;
+  if(!draft||draft.needs_mapping)return toast('Сначала сопоставьте колонки',true);
+  const items=[...document.querySelectorAll('#quickRows tr')].map(row=>{
+    const data={};row.querySelectorAll('[data-quick-field]').forEach(input=>data[input.dataset.quickField]=input.value.trim());
+    data.delivery_date ||= null;return data;
+  });
+  if(!items.length||items.some(i=>!i.name||!i.unit||!/^\d+(?:[.,]\d+)?$/.test(i.quantity)||Number(i.quantity.replace(',','.'))<=0))
+    return toast('Исправьте наименование, количество и единицу каждой оставленной позиции',true);
+  const project=state.projects.find(p=>Number(p.id)===Number(result.document.project_id));
+  if(!project)return toast('Объект не найден; обновите страницу',true);
+  const payload={confirmed:true,lot:{project_id:project.id,title:result.document.filename.replace(/\.[^.]+$/,'').slice(0,240),
+    region:project.region,delivery_address:project.delivery_address,response_deadline:futureDate(7),currency:'RUB',
+    attachment_document_ids:[result.document.id],items}};
+  if(result.kind==='pdf')payload.reviewed_line_ids=(draft.lines||[]).map(line=>line.line);
+  const button=$('#quickReviewDone');button.disabled=true;
+  try{
+    const endpoint=result.kind==='pdf'?`/api/launch/pdf-review/${draft.preview_id}/create`:`/api/launch/lot-sheet/${draft.preview_id}/create`;
+    const lot=await launchJson(endpoint,'POST',payload);
+    quickPurchase.intake={status:'draft',lot,document:result.document};
+    await loadAll();toast('Черновик сохранён. Проверьте письмо и отправьте запрос.');await openLot(lot.id);
+  }catch(error){toast(error.message,true)}finally{if(button.isConnected)button.disabled=false}
+}
+
 const fullRenderRfq = renderRfq;
 renderRfq = function() {
   fullRenderRfq();
@@ -189,6 +300,11 @@ renderRfq = function() {
     const line = card.querySelector('p');
     if (message && line) line.textContent = `${message.supplier_name} · ${staffMailStatus(message)}`;
     const actions = [...card.querySelectorAll(':scope > button')];
+    if(message?.delivery?.retry_allowed && actions.length){
+      const retry=actions[0];retry.textContent='Повторить';retry.className='btn small';
+      retry.onclick=()=>sendSavedProcurementMessage(message.id);
+      return;
+    }
     if (message?.status === 'draft' && actions.length) {
       const button = actions[0];
       button.textContent = state.role === 'admin' ? 'Проверить правило согласования' : 'Отправить запрос';

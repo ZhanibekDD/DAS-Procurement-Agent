@@ -33,5 +33,5 @@ jobs:
       - name: Check independent price memory
         run: node --check procurement/static/price-memory.js && node tests/ui_price_memory.cjs
       - name: Check staff workflow and audit presentation
-        run: node --check procurement/static/staff-ui.js && node tests/ui_staff.cjs
+        run: node --check procurement/static/staff-ui.js && node tests/ui_staff.cjs && node tests/ui_quick_purchase.cjs
 

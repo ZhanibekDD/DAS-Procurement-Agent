@@ -252,16 +252,21 @@ class LaunchWorkflow:
             self.db.audit('supplier_import_rolled_back','supplier_import',pid,details={'changed':len(changes)},conn=conn)
         return {'status':'rolled_back','changed':len(changes)}
 
-    def sheet_preview(self, table, mapping=None, source_document=None):
+    def sheet_preview(self, table, mapping=None, source_document=None, quick_intake=False):
         mapping = suggested_mapping(table['headers'], ITEM_ALIASES) if mapping is None else mapping
         if not {'name','quantity','unit'} <= set(mapping):
-            return {**table, 'rows': table['rows'][:20], 'mapping': mapping, 'needs_mapping': True}
+            incomplete={**table,'rows':table['rows'][:20],'mapping':mapping,'needs_mapping':True,
+                'quick_intake':quick_intake,
+                'source_document_id':source_document['id'] if source_document else None,
+                'project_id':source_document['project_id'] if source_document else None}
+            return self.save_preview('lot_sheet',incomplete) if quick_intake else incomplete
         rows, errors = [], []
         for source in table['rows']:
             values = {}
             try:
                 values = mapped(source, mapping, table['headers'], set(ITEM_ALIASES))
                 values['quantity'] = quantity(values['quantity'])
+                values['specification'] = values.get('specification') or ''
                 values['delivery_date'] = delivery_date(values.get('delivery_date', ''))
                 rows.append({'row': source['row'], **values})
             except ValueError as exc:
@@ -269,6 +274,7 @@ class LaunchWorkflow:
                 rows.append({'row':source['row'],**values,'error':str(exc)})
         return self.save_preview('lot_sheet', {'headers':table['headers'],'sheets':table['sheets'],
               'sheet':table['sheet'],'mapping':mapping,'rows':rows,'errors':errors,
+              'quick_intake':quick_intake,
               'source_document_id':source_document['id'] if source_document else None,
               'project_id':source_document['project_id'] if source_document else None})
 
@@ -291,13 +297,22 @@ class LaunchWorkflow:
                     'lines': extracted['lines'], 'source_page': page,
                 }}
 
-    def create_sheet_lot(self, pid, data, confirmed, *, kind='lot_sheet', reviewed_line_ids=None):
-        if confirmed is not True:
+    def create_sheet_lot(self, pid, data, confirmed, *, kind='lot_sheet', reviewed_line_ids=None, auto_draft=False):
+        if confirmed is not True and not auto_draft:
             raise ValueError('Подтвердите исправленные позиции')
         lot = LotCreate(**data)
         with self.db.connection() as conn:
             conn.execute('BEGIN IMMEDIATE')
             preview, preview_data = self.preview(conn, pid, kind)
+            if auto_draft:
+                if kind!='lot_sheet' or preview_data.get('errors') or not preview_data.get('rows'):
+                    raise ValueError('Авточерновик возможен только для полностью распознанного листа')
+                source_items=[{key:row.get(key) for key in ('name','quantity','unit','specification','delivery_date')}
+                              for row in preview_data['rows']]
+                submitted=[{key:item.get(key) for key in ('name','quantity','unit','specification','delivery_date')}
+                           for item in data['items']]
+                if encode(source_items)!=encode(submitted):
+                    raise ConflictError('Авточерновик должен совпадать с распознанным листом')
             if kind == 'pdf_ocr':
                 expected = {r['line'] for r in preview_data['lines']}
                 if (not reviewed_line_ids or len(set(reviewed_line_ids)) != len(reviewed_line_ids)
@@ -351,7 +366,7 @@ class LaunchWorkflow:
                      item.source_page,item.source_reference,str(item.delivery_date) if item.delivery_date else None))
             conn.executemany('INSERT INTO lot_attachments VALUES (?,?)',[(sid,d) for d in set(lot.attachment_document_ids)])
             conn.execute("UPDATE launch_previews SET status='applied',result_json=? WHERE id=?",(encode({'lot_id':sid,'payload_sha256':requested_hash}),pid))
-            self.db.audit('lot_created_from_pdf_ocr' if kind == 'pdf_ocr' else 'lot_created_from_sheet','lot',sid,
+            self.db.audit('quick_lot_draft_created' if auto_draft else 'lot_created_from_pdf_ocr' if kind == 'pdf_ocr' else 'lot_created_from_sheet','lot',sid,
                           details={'preview_id':pid,'items':len(lot.items), 'reviewed_line_ids': reviewed_line_ids},conn=conn)
         return self.service.get_lot(sid)
 

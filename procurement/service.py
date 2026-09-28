@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 from difflib import SequenceMatcher
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from statistics import median
@@ -274,6 +275,15 @@ class ProcurementService:
         lot = self.get_lot(lot_id)
         cluster = self._lot_cluster(lot)
         search_text = " ".join([lot["title"], *(item["name"] for item in lot["items"])]).casefold()
+        from .price_memory import material_key, designation_key
+        from .catalog import normalize
+        today = date.today().isoformat()
+        known = self.db.all('''SELECT supplier_id,item_name,specification,region,valid_until FROM supplier_catalog_prices
+            UNION ALL SELECT q.supplier_id,i.name,i.specification,l.region,COALESCE(q.valid_until,'')
+            FROM quote_items qi JOIN quotes q ON q.id=qi.quote_id
+            JOIN lot_items i ON i.id=qi.lot_item_id JOIN lots l ON l.id=q.lot_id
+            UNION ALL SELECT supplier_id,item_name,'',region,'' FROM purchase_history
+            WHERE review_status='approved' AND supplier_id IS NOT NULL''')
         candidates = []
         for supplier in self.list_suppliers():
             if supplier["cluster"] != cluster:
@@ -284,6 +294,20 @@ class ProcurementService:
             category_hits = sum(
                 1 for category in supplier["categories"] if category.casefold() in search_text
             )
+            def covers(item):
+                label=material_key(item['name'])
+                designation=designation_key(item['name'],item.get('specification',''))
+                category=not item.get('specification') and any(
+                    normalize(c) and normalize(c) in normalize(item['name'])
+                    for c in supplier['categories'])
+                history=any(row['supplier_id']==supplier['id'] and
+                    (not row['valid_until'] or row['valid_until']>=today) and
+                    normalize(row['region'])==normalize(lot['region']) and
+                    material_key(row['item_name'])==label and
+                    designation_key(row['item_name'],row['specification'])==designation
+                    for row in known)
+                return category or history
+            item_coverage=sum(bool(covers(item)) for item in lot['items'])
             score = category_hits * 40 + int(region_match) * 25 + int(supplier["verified"]) * 20 + supplier[
                 "rating"
             ] * 3
@@ -295,6 +319,9 @@ class ProcurementService:
                     "category_hits": category_hits,
                     "verified": supplier["verified"],
                 }
+                supplier['item_coverage']=item_coverage
+                supplier['auto_select']=bool(supplier['email'] and supplier['active'] and supplier['verified']
+                    and region_match and lot['items'] and item_coverage==len(lot['items']))
                 candidates.append(supplier)
         return sorted(candidates, key=lambda row: (-row["match_score"], row["name"]))
 

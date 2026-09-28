@@ -1,12 +1,13 @@
 """Authenticated procurement workflow, catalog, portfolio and document views."""
 import json
 import re
+from datetime import date, timedelta
 from pathlib import Path
 from fastapi import Depends,File,Form,HTTPException,Request,UploadFile
 from fastapi.responses import HTMLResponse,FileResponse
 from pydantic import Field
 from starlette.concurrency import run_in_threadpool
-from .models import CampaignCreate,StrictModel
+from .models import CampaignCreate,LotCreate,StrictModel
 from .catalog import Catalog,workbook_rows,number,ALIASES
 from .procurement_flow import ProcurementFlow,validate_message
 from .upload_io import staged_upload
@@ -45,6 +46,9 @@ class ReviewedPriceRows(StrictModel):
 class ReadAlerts(StrictModel):
     event_ids:list[str]=Field(min_length=1,max_length=100)
 
+class QuickMapping(StrictModel):
+    mapping:dict[str,int]
+
 
 def install(app,settings,service,launch,require_access,write_access,session_claims,domain_error):
     flow=ProcurementFlow(service);catalog=Catalog(service,launch)
@@ -56,6 +60,9 @@ def install(app,settings,service,launch,require_access,write_access,session_clai
     def role(request):
         principal=getattr(request.state,'das_principal',{}) or session_claims(request.cookies.get('procurement_session','')) or {}
         return principal.get('role','staff')
+
+    def visible_document(document):
+        return {key:document[key] for key in ('id','project_id','filename','sha256','size_bytes')}
 
     @app.get('/assets/procurement.js',dependencies=[Depends(require_access)])
     def script():return FileResponse(Path(__file__).parent/'static/procurement.js',media_type='application/javascript')
@@ -80,6 +87,91 @@ def install(app,settings,service,launch,require_access,write_access,session_clai
 
     @app.post('/api/procurement/lots/{lid}/preview',dependencies=[Depends(write_access)])
     def preview(lid:int,data:CampaignCreate):return call(flow.preview,lid,data)
+
+    @app.get('/api/procurement/quick-draft',dependencies=[Depends(require_access)])
+    def latest_quick_draft():
+        for row in service.db.all('''SELECT id,kind,data_json FROM launch_previews
+            WHERE actor=? AND status='preview' AND kind IN ('lot_sheet','pdf_ocr')
+            ORDER BY created_at DESC LIMIT 50''',(trusted_actor(),)):
+            data=json.loads(row['data_json'])
+            if not data.get('quick_intake'):continue
+            document=service.db.one('SELECT * FROM source_documents WHERE id=?',
+                (data['source_document_id'],))
+            if document:
+                return {'status':'needs_review','kind':'pdf' if row['kind']=='pdf_ocr' else 'sheet',
+                    'document':visible_document(document),'draft':{'preview_id':row['id'],**data},
+                    'reason':'Черновик сохранён. Проверьте отмеченные строки; письмо не отправлено'}
+        return None
+
+    @app.post('/api/procurement/quick-draft/{pid}/remap',dependencies=[Depends(write_access)])
+    def remap_quick_draft(pid:str,data:QuickMapping):
+        allowed={'name','quantity','unit','specification','delivery_date'}
+        if set(data.mapping)-allowed or not {'name','quantity','unit'}<=set(data.mapping):
+            raise HTTPException(422,'Укажите колонки позиции, количества и единицы')
+        with service.db.connection() as conn:
+            row,stored=call(launch.preview,conn,pid,'lot_sheet')
+        if not stored.get('quick_intake') or row['status']!='preview':
+            raise HTTPException(409,'Черновик уже обработан или не принадлежит быстрой закупке')
+        document=service.db.one('SELECT * FROM source_documents WHERE id=?',
+            (stored['source_document_id'],))
+        if not document:raise HTTPException(404,'Исходный файл не найден')
+        content=call(launch.document_file,document)
+        table=call(read_table,content,document['filename'],stored.get('sheet',''),1)
+        if any(not isinstance(index,int) or isinstance(index,bool) or index<0 or index>=len(table['headers'])
+               for index in data.mapping.values()):
+            raise HTTPException(422,'Некорректный номер колонки')
+        draft=call(lambda:launch.sheet_preview(table,data.mapping,document,quick_intake=True))
+        return {'status':'needs_review','kind':'sheet','document':visible_document(document),
+                'draft':draft,'reason':'Проверьте распознанные строки перед отправкой'}
+
+    @app.post('/api/procurement/quick-intake',dependencies=[Depends(write_access)])
+    async def quick_intake(project_id:int=Form(...),file:UploadFile=File(...)):
+        """Persist the original first; a readable sheet becomes a draft, never an email."""
+        project=call(service.get_project,project_id)
+        filename=file.filename or ''
+        suffix=Path(filename).suffix.lower()
+        if suffix not in {'.xlsx','.csv','.pdf'}:
+            raise HTTPException(422,'Выберите PDF, XLSX или CSV')
+        async with staged_upload(file) as content:
+            document=await run_in_threadpool(call,lambda:service.register_source_document(
+                filename=filename,content=content,document_type='project_section',project_id=project_id))
+            if suffix in {'.xlsx','.csv'}:
+                table=await run_in_threadpool(call,read_table,content,filename,'',1)
+                draft=await run_in_threadpool(call,lambda:launch.sheet_preview(
+                    table,None,document,quick_intake=True))
+                if draft.get('needs_mapping') or draft['errors'] or not draft['rows']:
+                    return {'status':'needs_review','kind':'sheet','document':visible_document(document),'draft':draft,
+                            'reason':'Проверьте отмеченные строки или сопоставление колонок; письмо не отправлено'}
+                data={'project_id':project_id,'title':Path(filename).stem[:240] or 'Закупка из файла',
+                      'region':project['region'],'delivery_address':project['delivery_address'],
+                      'response_deadline':(date.today()+timedelta(days=7)).isoformat(),
+                      'currency':'RUB','attachment_document_ids':[document['id']],
+                      'items':[{k:r.get(k) for k in ('name','quantity','unit','specification','delivery_date')}
+                               for r in draft['rows']]}
+                lot=await run_in_threadpool(call,lambda:launch.create_sheet_lot(
+                    draft['preview_id'],data,False,auto_draft=True))
+                return {'status':'draft','lot':lot,'document':visible_document(document)}
+            from .document_analysis import extract_pdf_page_review
+            from .pdf_ocr import candidate_rows
+            from .upload_io import FilePayload
+            from pypdf import PdfReader
+            original=FilePayload(Path(document['storage_path']))
+            page_count=await run_in_threadpool(call,lambda:len(PdfReader(str(original.path)).pages))
+            extracted=await run_in_threadpool(call,extract_pdf_page_review,original,1)
+            lines=extracted['lines'] if extracted['mode']=='ocr' else [
+                {'line':n,'text':text,'confidence':1.0}
+                for n,text in enumerate(extracted['text'].splitlines(),1) if text.strip()]
+            if len(lines)>1200:raise HTTPException(422,'Слишком много строк на первой странице PDF')
+            rows=candidate_rows(lines)
+            draft=await run_in_threadpool(call,launch.save_preview,'pdf_ocr',{
+                'source_document_id':document['id'],'source_sha256':document['sha256'],
+                'project_id':project_id,'sheet':'1','rows':rows,'lines':lines,'source_page':1,
+                'page_count':page_count,
+                'quick_intake':True})
+            return {'status':'needs_review','kind':'pdf','document':visible_document(document),'draft':draft,
+                    'reason':('PDF содержит '+str(page_count)+' страниц; сейчас показан только первый лист. '
+                              if page_count>1 else '')+
+                    'Проверьте строки PDF: количество и единицы нельзя угадывать. Письмо не отправлено'}
 
     @app.get('/api/procurement/campaigns/{cid}/snapshot',dependencies=[Depends(require_access)])
     def campaign_snapshot(cid:int):
