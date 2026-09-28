@@ -17,6 +17,12 @@ assert(flow.includes("host.replaceChildren(...rfq.childNodes)"));
 assert(flow.includes("confirmedMailNotice(r)"));
 assert(!flow.includes('procurementConfirmed'));
 assert(staff.includes('quickPurchase.recovered'));
+const quickTitleSource=staff.match(/function quickLotTitle\(filename\)\{[\s\S]*?\n\}/)?.[0];
+assert(quickTitleSource&&staff.includes('title:quickLotTitle(result.document.filename)'));
+const quickTitle=vm.runInNewContext(`${quickTitleSource};quickLotTitle`);
+for(const name of ['a.xlsx','я.xlsx','😀.xlsx',' .xlsx'])
+  assert.equal(quickTitle(name),'Закупка из файла',name);
+assert.equal(quickTitle('ab.xlsx'),'ab');
 assert(staff.includes('<div id="quickPending"></div>'));
 const pendingFunctions=['refreshQuickDrafts','openPendingQuickDraft','loadMoreQuickDrafts']
   .map(name=>staff.match(new RegExp(`async function ${name}\\([^]*?\\n\\}`))?.[0]);

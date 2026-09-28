@@ -64,6 +64,10 @@ def install(app,settings,service,launch,require_access,write_access,session_clai
     def visible_document(document):
         return {key:document[key] for key in ('id','project_id','filename','sha256','size_bytes')}
 
+    def quick_lot_title(filename):
+        stem=Path(filename).stem.strip()[:240]
+        return stem if len(stem)>=2 else 'Закупка из файла'
+
     @app.get('/assets/procurement.js',dependencies=[Depends(require_access)])
     def script():return FileResponse(Path(__file__).parent/'static/procurement.js',media_type='application/javascript')
 
@@ -175,7 +179,7 @@ def install(app,settings,service,launch,require_access,write_access,session_clai
                 if draft.get('needs_mapping') or draft['errors'] or not draft['rows']:
                     return {'status':'needs_review','kind':'sheet','document':visible_document(document),'draft':draft,
                             'reason':'Проверьте отмеченные строки или сопоставление колонок; письмо не отправлено'}
-                data={'project_id':project_id,'title':Path(filename).stem[:240] or 'Закупка из файла',
+                data={'project_id':project_id,'title':quick_lot_title(filename),
                       'region':project['region'],'delivery_address':project['delivery_address'],
                       'response_deadline':(date.today()+timedelta(days=7)).isoformat(),
                       'currency':'RUB','attachment_document_ids':[document['id']],

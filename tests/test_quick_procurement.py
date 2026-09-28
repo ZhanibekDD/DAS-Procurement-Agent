@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 from io import BytesIO
 
+import pytest
 from openpyxl import Workbook
 from procurement.models import LotCreate, SupplierCreate
 from test_launch_workflow import workflow, lot_payload, project
@@ -35,6 +36,51 @@ def test_xlsx_upload_creates_one_draft_with_original_and_no_mail(http_boundary):
     assert client.get(f"/api/launch/documents/{doc['id']}/download").content==raw
     assert db.one('SELECT count(*) AS n FROM outbox_messages')['n']==0
     assert db.one('SELECT count(*) AS n FROM mail_deliveries')['n']==0
+
+
+@pytest.mark.parametrize('filename,expected_title',[
+    ('a.xlsx','Закупка из файла'),
+    ('я.xlsx','Закупка из файла'),
+    ('😀.xlsx','Закупка из файла'),
+    ('ab.xlsx','ab'),
+])
+def test_quick_upload_uses_valid_title_for_short_stems(http_boundary,filename,expected_title):
+    client,authority,settings,db=http_boundary
+    alice=login(client,authority);h=headers(alice)
+    project=client.post('/api/projects',headers=h,json={
+        'name':'Объект ФБС','region':'Воронежская область','delivery_address':'Воронеж, Тестовая 1'}).json()
+    workbook=Workbook();sheet=workbook.active
+    sheet.append(['Наименование','Количество','Ед. изм.'])
+    sheet.append(['ФБС 24.4.6',218,'шт'])
+    stream=BytesIO();workbook.save(stream)
+    response=client.post('/api/procurement/quick-intake',headers=h,data={'project_id':project['id']},
+        files={'file':(filename,stream.getvalue())})
+    assert response.status_code==200,response.text
+    assert response.json()['status']=='draft'
+    assert response.json()['lot']['title']==expected_title
+    assert db.one('SELECT count(*) AS n FROM outbox_messages')['n']==0
+
+
+def test_short_named_sheet_review_accepts_valid_fallback_title(http_boundary):
+    client,authority,settings,db=http_boundary
+    alice=login(client,authority);h=headers(alice)
+    project=client.post('/api/projects',headers=h,json={
+        'name':'Объект ФБС','region':'Воронежская область','delivery_address':'Воронеж, Тестовая 1'}).json()
+    response=client.post('/api/procurement/quick-intake',headers=h,data={'project_id':project['id']},
+        files={'file':('b.xlsx',(FIXTURES/'items.xlsx').read_bytes())})
+    assert response.status_code==200,response.text
+    draft=response.json();assert draft['status']=='needs_review'
+    payload={'confirmed':True,'lot':{'project_id':project['id'],'title':'Закупка из файла',
+        'region':'Воронежская область','delivery_address':'Воронеж, Тестовая 1',
+        'response_deadline':'2026-10-10','currency':'RUB',
+        'attachment_document_ids':[draft['document']['id']],
+        'items':[{'name':'ФБС 24.4.6','quantity':'218','unit':'шт'}]}}
+    created=client.post(f"/api/launch/lot-sheet/{draft['draft']['preview_id']}/create",
+        headers=h,json=payload)
+    assert created.status_code==201,created.text
+    assert created.json()['title']=='Закупка из файла'
+    assert created.json()['attachments'][0]['document_id']==draft['document']['id']
+    assert db.one('SELECT count(*) AS n FROM outbox_messages')['n']==0
 
 
 def test_invalid_sheet_is_persisted_for_correction_without_lot(http_boundary):

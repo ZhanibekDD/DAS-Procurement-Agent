@@ -140,6 +140,10 @@ async function refreshQuickDrafts(){
     quickPurchase.intake=saved?.status==='needs_review'?saved:null;
   if(state.view==='lots')renderLots();
 }
+function quickLotTitle(filename){
+  const stem=[...filename.replace(/\.[^.]+$/,'').trim()].slice(0,240).join('');
+  return [...stem].length>=2?stem:'Закупка из файла';
+}
 async function openPendingQuickDraft(pid){
   try{
     quickPurchase.intake=await api(`/api/procurement/quick-draft/${encodeURIComponent(pid)}`);
@@ -321,7 +325,7 @@ async function finishQuickReview(){
     return toast('Укажите правильную страницу PDF для каждой позиции',true);
   const project=state.projects.find(p=>Number(p.id)===Number(result.document.project_id));
   if(!project)return toast('Объект не найден; обновите страницу',true);
-  const payload={confirmed:true,lot:{project_id:project.id,title:result.document.filename.replace(/\.[^.]+$/,'').slice(0,240),
+  const payload={confirmed:true,lot:{project_id:project.id,title:quickLotTitle(result.document.filename),
     region:project.region,delivery_address:project.delivery_address,response_deadline:futureDate(7),currency:'RUB',
     attachment_document_ids:[result.document.id],items}};
   if(result.kind==='pdf')payload.reviewed_line_ids=(draft.lines||[]).map(line=>line.line);
