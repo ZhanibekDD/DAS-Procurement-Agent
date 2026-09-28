@@ -278,6 +278,24 @@ class LaunchWorkflow:
               'source_document_id':source_document['id'] if source_document else None,
               'project_id':source_document['project_id'] if source_document else None})
 
+    def remap_quick_sheet_preview(self, pid, table, mapping, document):
+        data = self.sheet_preview(table, mapping, document, quick_intake=False)
+        data['quick_intake'] = True
+        replacement = uuid.uuid4().hex
+        with self.db.connection() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            row, old = self.preview(conn, pid, 'lot_sheet')
+            if (row['status'] != 'preview' or not old.get('quick_intake')
+                    or old.get('source_document_id') != document['id']):
+                raise ConflictError('Черновик уже обработан или заменён')
+            conn.execute('INSERT INTO launch_previews(id,kind,actor,data_json,created_at) VALUES (?,?,?,?,?)',
+                         (replacement, 'lot_sheet', trusted_actor(), encode(data), utcnow()))
+            conn.execute("UPDATE launch_previews SET status='superseded',result_json=? WHERE id=?",
+                         (encode({'replacement_preview_id': replacement}), pid))
+            self.db.audit('quick_draft_remapped', 'lot_sheet', replacement,
+                          details={'superseded_preview_id':pid,'rows':len(data.get('rows',[]))},conn=conn)
+        return {'preview_id':replacement,**data}
+
     def pdf_review(self, document, page, extracted):
         from .pdf_ocr import candidate_rows
         rows = candidate_rows(extracted['lines'])
@@ -336,6 +354,8 @@ class LaunchWorkflow:
                 if result['payload_sha256'] != requested_hash:
                     raise ConflictError('Этот предпросмотр уже использован с другими исправленными данными')
                 return self.service.get_lot(result['lot_id'])
+            if preview['status'] != 'preview':
+                raise ConflictError('Предпросмотр уже заменён или отменён')
             source_id = preview_data.get('source_document_id')
             if source_id:
                 if preview_data.get('project_id') != lot.project_id:

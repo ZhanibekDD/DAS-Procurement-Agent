@@ -53,11 +53,40 @@ def test_invalid_sheet_is_persisted_for_correction_without_lot(http_boundary):
         headers=h,json={'mapping':mapping})
     assert remap.status_code==200,remap.text
     assert remap.json()['draft']['errors']
+    assert client.get('/api/procurement/quick-draft').json()['draft']['preview_id']==remap.json()['draft']['preview_id']
+    assert client.post(f"/api/procurement/quick-draft/{result['draft']['preview_id']}/remap",
+        headers=h,json={'mapping':mapping}).status_code==409
+    old_payload={'confirmed':True,'lot':{'project_id':project['id'],'title':'Старый предпросмотр',
+        'region':'Воронежская область','delivery_address':'Воронеж, Тестовая 1',
+        'response_deadline':'2026-10-10','currency':'RUB',
+        'items':[{'name':'ФБС 24.4.6','quantity':'218','unit':'шт'}]}}
+    assert client.post(f"/api/launch/lot-sheet/{result['draft']['preview_id']}/create",
+        headers=h,json=old_payload).status_code==409
     other=login(client,authority,BOB)
     assert client.get('/api/procurement/quick-draft').json() is None
     assert client.post(f"/api/procurement/quick-draft/{result['draft']['preview_id']}/remap",
         headers=headers(other),json={'mapping':mapping}).status_code==404
     assert db.one('SELECT count(*) AS n FROM lots')['n']==0
+
+
+def test_multisheet_xlsx_never_silently_omits_other_worksheets(http_boundary):
+    client,authority,settings,db=http_boundary
+    user=login(client,authority);h=headers(user)
+    project=client.post('/api/projects',headers=h,json={
+        'name':'Тестовый объект','region':'Воронежская область','delivery_address':'Воронеж, Тестовая 1'}).json()
+    workbook=Workbook();first=workbook.active;first.title='ФБС'
+    first.append(['Наименование','Количество','Ед. изм.'])
+    first.append(['ФБС 24.4.6',218,'шт'])
+    second=workbook.create_sheet('Вторая партия')
+    second.append(['Наименование','Количество','Ед. изм.'])
+    second.append(['ФБС 12.4.6',95,'шт'])
+    stream=BytesIO();workbook.save(stream)
+    response=client.post('/api/procurement/quick-intake',headers=h,data={'project_id':project['id']},
+        files={'file':('two-sheets.xlsx',stream.getvalue())})
+    assert response.status_code==422 and 'несколько листов' in response.text
+    assert db.one('SELECT count(*) AS n FROM source_documents')['n']==1
+    assert db.one('SELECT count(*) AS n FROM lots')['n']==0
+    assert db.one('SELECT count(*) AS n FROM outbox_messages')['n']==0
 
 
 def test_pdf_upload_saves_review_only_and_never_guesses_quantity(http_boundary,monkeypatch):

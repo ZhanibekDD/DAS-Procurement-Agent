@@ -1,5 +1,16 @@
 'use strict';
-const purchasing={lot:null,preview:null,request:null,epoch:0,catalog:null,portfolio:null,lastSendError:null,lastSentCount:0};
+const purchasing={lot:null,preview:null,request:null,epoch:0,catalog:null,portfolio:null,lastSendError:null,lastSendOutcome:null,lastSentCount:0};
+
+function procurementMailOutcome(outbox,campaign){
+ const ids=(campaign?.messages||[]).map(m=>m.id);
+ if(!ids.length)return {kind:'unknown',sent:0};
+ const messages=ids.map(id=>outbox.find(m=>m.id===id));
+ const sent=messages.filter(m=>m?.delivery?.status==='sent'||m?.status==='sent').length;
+ if(messages.some(m=>!m||['unknown','queued','sending'].includes(m.delivery?.status)||['queued','sending'].includes(m.status)
+   ||(m.status==='failed'&&!m.delivery)))return {kind:'unknown',sent};
+ if(sent===ids.length)return {kind:'sent',sent};
+ return {kind:'failed',sent};
+}
 const procurementStages=['Черновик','Запрос отправлен','Получены цены','Сравнение','Поставщик выбран','Заказ'];
 pages.lots=['Закупки','Загрузите файл или откройте закупку, проверьте запрос и отправьте его.'];
 pages.rfq=pages.lots;
@@ -41,7 +52,10 @@ async function previewProcurement(){
  try{const p=await launchJson(`/api/procurement/lots/${lid}/preview`,'POST',request);if(epoch!==purchasing.epoch||lid!==state.selectedLot)return;
  if(p.lot_id!==lid||p.items.some(i=>i.lot_id!==lid))throw new Error('Предпросмотр не соответствует выбранному лоту; отправка заблокирована');
  purchasing.preview=p;purchasing.request=request;
- $('#procurementPreview').innerHTML=`<h3>Проверьте запрос перед отправкой</h3>${p.messages.map(m=>messagePreview(m)+`<p>Вложения: ${(m.attachments||[]).map(a=>esc(a.filename)).join(', ')||'нет'}</p>`).join('<hr>')}${p.approval_required?'<p>По правилу компании требуется согласование.</p>':''}${purchasing.lastSendError?`<p role="alert">${purchasing.lastSentCount?`Отправлено: ${purchasing.lastSentCount}. Остальные не отправлены: `:'Не отправлено: '}${esc(purchasing.lastSendError)}</p>`:''}<button class="btn" id="procurementSend" onclick="sendProcurement()">${p.approval_required?'Подготовить для согласования':purchasing.lastSendError?'Повторить':'Отправить запрос КП'}</button><p id="procurementSendStatus" role="status"></p>`;
+ const outcome=purchasing.lastSendOutcome?.kind;
+ const prefix=outcome==='unknown'?'Результат отправки не подтверждён: ':outcome==='sent'?'Почтовый сервер принял письмо: ':
+   purchasing.lastSentCount?`Отправлено: ${purchasing.lastSentCount}. Остальные не отправлены: `:'Не отправлено: ';
+ $('#procurementPreview').innerHTML=`<h3>Проверьте запрос перед отправкой</h3>${p.messages.map(m=>messagePreview(m)+`<p>Вложения: ${(m.attachments||[]).map(a=>esc(a.filename)).join(', ')||'нет'}</p>`).join('<hr>')}${p.approval_required?'<p>По правилу компании требуется согласование.</p>':''}${purchasing.lastSendError?`<p role="alert">${prefix}${esc(purchasing.lastSendError)}</p>`:''}${outcome==='unknown'||outcome==='sent'?'':`<button class="btn" id="procurementSend" onclick="sendProcurement()">${p.approval_required?'Подготовить для согласования':purchasing.lastSendError?'Повторить':'Отправить запрос КП'}</button>`}<p id="procurementSendStatus" role="status"></p>`;
  button.classList.add('secondary');
  }catch(e){toast(e.message,true)}finally{if(button.isConnected)button.disabled=false}
 }
@@ -50,13 +64,18 @@ async function sendProcurement(){
  if(!p||p.lot_id!==lid||JSON.stringify(request)!==JSON.stringify(selectedRfqRequest()))return toast('Обновите предпросмотр выбранного лота',true);
  const button=$('#procurementSend');button.disabled=true;
  const status=$('#procurementSendStatus');if(status)status.textContent='Отправляется…';
- let sentCount=0;
- try{const campaign=await launchJson(`/api/lots/${lid}/campaigns`,'POST',{...request,snapshot_sha256:p.snapshot_sha256,preview_sha256:p.preview_sha256});
+ let sentCount=0,campaign=null;
+ try{campaign=await launchJson(`/api/lots/${lid}/campaigns`,'POST',{...request,snapshot_sha256:p.snapshot_sha256,preview_sha256:p.preview_sha256});
  if(campaign.lot_id!==lid)throw new Error('ID запроса не совпал с закупкой');
  if(p.approval_required){toast('Черновики созданы. Требуется согласование по правилу.');}
- else{let warnings=[];for(const m of campaign.messages){const r=await launchJson(`/api/procurement/outbox/${m.id}/send`,'POST',{lot_id:lid,snapshot_sha256:p.snapshot_sha256,confirmed:true});confirmedMailNotice(r);if(r.warning)warnings.push(r.warning);sentCount++;}purchasing.lastSendError=null;purchasing.lastSentCount=0;if(status)status.textContent='Отправлено: почтовый сервер принял '+sentCount+' письмо(а).';toast(warnings.length?`SMTP принял запросы: ${sentCount}. ${warnings[0]}`:`SMTP принял запросы: ${sentCount}; копии сохранены в «Отправленных». Доставка пока не подтверждена.`,!!warnings.length)}
+ else{let warnings=[];for(const m of campaign.messages){const r=await launchJson(`/api/procurement/outbox/${m.id}/send`,'POST',{lot_id:lid,snapshot_sha256:p.snapshot_sha256,confirmed:true});confirmedMailNotice(r);if(r.warning)warnings.push(r.warning);sentCount++;}purchasing.lastSendError=null;purchasing.lastSendOutcome=null;purchasing.lastSentCount=0;if(status)status.textContent='Отправлено: почтовый сервер принял '+sentCount+' письмо(а).';toast(warnings.length?`SMTP принял запросы: ${sentCount}. ${warnings[0]}`:`SMTP принял запросы: ${sentCount}; копии сохранены в «Отправленных». Доставка пока не подтверждена.`,!!warnings.length)}
  invalidateProcurement();await loadAll();await openLot(lid);
- }catch(e){purchasing.lastSendError=e.message;purchasing.lastSentCount=sentCount;if(status)status.textContent=sentCount?`Часть запросов отправлена (${sentCount}). Остальные не отправлены: ${e.message}`:'Не отправлено: '+e.message;toast(e.message,true);await loadAll();await openLot(lid)}finally{if(button.isConnected)button.disabled=false}
+ }catch(e){let outcome={kind:'unknown',sent:sentCount};try{outcome=procurementMailOutcome(await api(`/api/outbox?lot_id=${lid}`),campaign)}catch{}
+ purchasing.lastSendError=e.message;purchasing.lastSendOutcome=outcome;purchasing.lastSentCount=outcome.sent;
+ if(status)status.textContent=outcome.kind==='unknown'?'Результат отправки не подтверждён. Повтор заблокирован; проверьте журнал.':
+   outcome.kind==='sent'?'Отправлено: почтовый сервер принял письмо, но ответ интерфейсу не дошёл.':
+   outcome.sent?`Отправлено: ${outcome.sent}. Остальные не отправлены: ${e.message}`:'Не отправлено: '+e.message;
+ toast(status?.textContent||e.message,true);await loadAll();await openLot(lid)}finally{if(button.isConnected)button.disabled=false}
 }
 function procurementDecisionControls(lot,quotes){if(lot.status==='ordered')return '<p>Заказ уже зафиксирован. Повторный выбор поставщика недоступен.</p>';return quotes.map(q=>`<p>${esc(q.supplier_name)} <button class="btn secondary" onclick="chooseProcurement(${lot.id},${q.id},'awarded')">Выбрать поставщика</button> <button class="btn secondary" onclick="chooseProcurement(${lot.id},${q.id},'ordered')">Зафиксировать заказ</button></p>`).join('')}
 async function openProcurementComparison(lid){state.selectedLot=lid;await loadComparison();showView('comparison');const quotes=await api(`/api/lots/${lid}/quotes`),lot=await api(`/api/lots/${lid}`);if(quotes.length&&lot.status!=='ordered')await launchJson(`/api/procurement/lots/${lid}/comparison`,'POST',{confirmed:true});$('#comparison').insertAdjacentHTML('beforeend',`<section class="panel"><h3>Решение сотрудника</h3>${procurementDecisionControls(lot,quotes)}</section>`)}

@@ -120,7 +120,7 @@ def install(app,settings,service,launch,require_access,write_access,session_clai
         if any(not isinstance(index,int) or isinstance(index,bool) or index<0 or index>=len(table['headers'])
                for index in data.mapping.values()):
             raise HTTPException(422,'Некорректный номер колонки')
-        draft=call(lambda:launch.sheet_preview(table,data.mapping,document,quick_intake=True))
+        draft=call(launch.remap_quick_sheet_preview,pid,table,data.mapping,document)
         return {'status':'needs_review','kind':'sheet','document':visible_document(document),
                 'draft':draft,'reason':'Проверьте распознанные строки перед отправкой'}
 
@@ -137,6 +137,8 @@ def install(app,settings,service,launch,require_access,write_access,session_clai
                 filename=filename,content=content,document_type='project_section',project_id=project_id))
             if suffix in {'.xlsx','.csv'}:
                 table=await run_in_threadpool(call,read_table,content,filename,'',1)
+                if len(table['sheets'])!=1:
+                    raise HTTPException(422,'XLSX содержит несколько листов. Выберите однолистную спецификацию: часть позиций нельзя молча пропустить. Исходный файл сохранён, письмо не отправлено')
                 draft=await run_in_threadpool(call,lambda:launch.sheet_preview(
                     table,None,document,quick_intake=True))
                 if draft.get('needs_mapping') or draft['errors'] or not draft['rows']:
