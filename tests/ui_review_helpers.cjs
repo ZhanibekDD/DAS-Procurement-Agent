@@ -10,7 +10,8 @@ const helpers=script.split('// BEGIN PROCUREMENT REVIEW HELPERS')[1].split('\n')
 // Bind the shipped escaping function without executing page startup or installing its DOM selector.
 const escSource=script.slice(script.indexOf('const esc='),script.indexOf('const money='));
 function context(extra={}){
-  const ctx=vm.createContext({...extra});
+  const ctx=vm.createContext({documentType:value=>value||'Документ',
+    humanStatus:value=>({draft:'Черновик',confirmed:'Подтверждён'})[value]||'Статус уточняется',...extra});
   vm.runInContext(escSource+'\n'+helpers,ctx);
   return ctx;
 }

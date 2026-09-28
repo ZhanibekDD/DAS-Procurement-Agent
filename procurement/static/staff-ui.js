@@ -73,7 +73,11 @@ function openActivity(view, id) {
       const row = document.querySelectorAll('#supplierTable tbody tr')[index];
       row?.scrollIntoView({block:'center'});
       row?.classList.add('activity-target');
-    } else showDeletedSuppliers();
+    } else {
+      const history = document.querySelector('#launchSupplierHistory')?.parentElement;
+      if (history) history.hidden = false;
+      showDeletedSuppliers();
+    }
   }
 }
 
@@ -85,6 +89,12 @@ function staffActivity() {
       <small>${date(item.created_at)}</small></div></div>`).join('')
     : '<p>Пока нет новых действий.</p>'}</div></section>`;
 }
+
+renderOverview = function() {
+  $('#overview').innerHTML = `<section class="panel"><div class="panel-title"><h2>Закупки в работе</h2>
+    <button class="btn" data-open="lot">Новая закупка</button></div>${lotsTable(state.lots.slice(0,6))}</section>${staffActivity()}`;
+  bindOpeners();
+};
 
 const fullRenderLots = renderLots;
 renderLots = function() {
@@ -227,3 +237,5 @@ showView = function(name) {
 document.querySelectorAll('.nav-more button[data-view]').forEach(button => {
   button.onclick = () => showView(button.dataset.view);
 });
+const initialExtra = $('#nav').querySelector('button:not([data-view])');
+if (initialExtra) document.querySelector('.nav-more').append(initialExtra);
