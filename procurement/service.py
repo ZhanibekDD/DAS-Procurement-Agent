@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 from difflib import SequenceMatcher
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from statistics import median
@@ -274,6 +275,15 @@ class ProcurementService:
         lot = self.get_lot(lot_id)
         cluster = self._lot_cluster(lot)
         search_text = " ".join([lot["title"], *(item["name"] for item in lot["items"])]).casefold()
+        from .price_memory import material_key, designation_key
+        from .catalog import normalize
+        today = date.today().isoformat()
+        known = self.db.all('''SELECT supplier_id,item_name,specification,region,valid_until FROM supplier_catalog_prices
+            UNION ALL SELECT q.supplier_id,i.name,i.specification,l.region,COALESCE(q.valid_until,'')
+            FROM quote_items qi JOIN quotes q ON q.id=qi.quote_id
+            JOIN lot_items i ON i.id=qi.lot_item_id JOIN lots l ON l.id=q.lot_id
+            UNION ALL SELECT supplier_id,item_name,'',region,'' FROM purchase_history
+            WHERE review_status='approved' AND supplier_id IS NOT NULL''')
         candidates = []
         for supplier in self.list_suppliers():
             if supplier["cluster"] != cluster:
@@ -284,6 +294,20 @@ class ProcurementService:
             category_hits = sum(
                 1 for category in supplier["categories"] if category.casefold() in search_text
             )
+            def covers(item):
+                label=material_key(item['name'])
+                designation=designation_key(item['name'],item.get('specification',''))
+                category=not item.get('specification') and any(
+                    normalize(c) and normalize(c) in normalize(item['name'])
+                    for c in supplier['categories'])
+                history=any(row['supplier_id']==supplier['id'] and
+                    (not row['valid_until'] or row['valid_until']>=today) and
+                    normalize(row['region'])==normalize(lot['region']) and
+                    material_key(row['item_name'])==label and
+                    designation_key(row['item_name'],row['specification'])==designation
+                    for row in known)
+                return category or history
+            item_coverage=sum(bool(covers(item)) for item in lot['items'])
             score = category_hits * 40 + int(region_match) * 25 + int(supplier["verified"]) * 20 + supplier[
                 "rating"
             ] * 3
@@ -295,6 +319,9 @@ class ProcurementService:
                     "category_hits": category_hits,
                     "verified": supplier["verified"],
                 }
+                supplier['item_coverage']=item_coverage
+                supplier['auto_select']=bool(supplier['email'] and supplier['active'] and supplier['verified']
+                    and region_match and lot['items'] and item_coverage==len(lot['items']))
                 candidates.append(supplier)
         return sorted(candidates, key=lambda row: (-row["match_score"], row["name"]))
 
@@ -317,7 +344,17 @@ class ProcurementService:
         return self.db.all("SELECT * FROM templates ORDER BY code")
 
     def create_campaign(self, lot_id: int, data: CampaignCreate) -> dict[str, Any]:
+        from .procurement_flow import lot_snapshot, items_text as snapshot_items_text, bind_campaign, validate_rendered_items
+        if data.preview_sha256:
+            from .procurement_flow import ProcurementFlow
+            if ProcurementFlow(self).preview(lot_id,data)['preview_sha256'] != data.preview_sha256:
+                raise ConflictError('Предпросмотр изменился; проверьте новый текст и получателей')
+        with self.db.connection() as snapshot_conn:
+            snapshot = lot_snapshot(snapshot_conn,lot_id,data.item_ids)
+        if data.snapshot_sha256 and payload_sha256(snapshot) != data.snapshot_sha256:
+            raise ConflictError('Выбранный лот изменился; обновите предпросмотр')
         lot = self.get_lot(lot_id)
+        lot['items'] = snapshot['items']
         project = self.get_project(lot["project_id"])
         cluster = self._confirmed_cluster(lot["cluster"], project["cluster"])
         template = self.db.one("SELECT * FROM templates WHERE code = ?", (data.template_code,))
@@ -380,6 +417,10 @@ class ProcurementService:
                     render_template(template["body"], context),
                 )
             )
+        items_text_current = snapshot_items_text(snapshot)
+        if items_text_current != items_text:
+            raise ConflictError('Состав запроса не совпадает с immutable snapshot')
+        for _,_,_,body in prepared:validate_rendered_items(snapshot,body)
         fingerprint = payload_sha256({"lot_id": lot_id, "project_id": project["id"], "cluster": cluster,
             "template_code": data.template_code, "template_version": template["version"], "channel": data.channel,
             "attachments": lot.get('attachments', []),
@@ -389,6 +430,8 @@ class ProcurementService:
         expected_messages = sorted((supplier["id"], recipient, subject, body) for supplier, recipient, subject, body in prepared)
         with self.db.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            if payload_sha256(lot_snapshot(conn,lot_id,[i['id'] for i in snapshot['items']])) != payload_sha256(snapshot):
+                raise ConflictError('Лот изменился во время формирования запроса')
             current = conn.execute("""SELECT l.cluster AS lot_cluster,p.cluster AS project_cluster
                 FROM lots l JOIN projects p ON p.id=l.project_id WHERE l.id=?""", (lot_id,)).fetchone()
             if not current or self._confirmed_cluster(current["lot_cluster"], current["project_cluster"]) != cluster:
@@ -398,10 +441,15 @@ class ProcurementService:
             if sorted(lot.get('attachments',[]),key=lambda a:a['document_id']) != current_attachments:
                 raise ConflictError('Вложения изменились; обновите черновик')
             for supplier in suppliers:
-                current_supplier = conn.execute("SELECT cluster,active FROM suppliers WHERE id=?", (supplier["id"],)).fetchone()
+                current_supplier = conn.execute("SELECT * FROM suppliers WHERE id=?", (supplier["id"],)).fetchone()
                 if not current_supplier:
                     raise NotFoundError("supplier not found")
                 self._supplier_cluster(dict(current_supplier), cluster)
+                if any(current_supplier[k] != supplier[k] for k in ('name','email','telegram','max_contact')):
+                    raise ConflictError('Реквизиты поставщика изменились; обновите предпросмотр')
+            current_template = conn.execute('SELECT * FROM templates WHERE code=?',(data.template_code,)).fetchone()
+            if not current_template or any(current_template[k] != template[k] for k in ('subject','body','version')):
+                raise ConflictError('Шаблон изменился; обновите предпросмотр')
 
             def reuse(campaign_id):
                 existing_campaign = conn.execute("SELECT lot_id,template_code,channel FROM campaigns WHERE id=?", (campaign_id,)).fetchone()
@@ -410,6 +458,12 @@ class ProcurementService:
                 if (not existing_campaign or tuple(existing_campaign) != (lot_id, data.template_code, data.channel)
                         or stored_messages != expected_messages):
                     raise ConflictError("stored campaign content changed; fresh human review is required")
+                if not conn.execute('SELECT 1 FROM rfq_snapshots WHERE campaign_id=?',(campaign_id,)).fetchone():
+                    statuses=[r[0] for r in conn.execute('SELECT status FROM outbox_messages WHERE campaign_id=?',(campaign_id,))]
+                    if not data.preview_sha256 or not data.snapshot_sha256 or any(s!='draft' for s in statuses):
+                        raise ConflictError('Архивный запрос требует нового подтверждённого предпросмотра')
+                    bind_campaign(conn,campaign_id,snapshot)
+                    self.db.audit('legacy_draft_reviewed','campaign',campaign_id,conn=conn)
                 return self.get_campaign(campaign_id)
 
             existing = conn.execute("SELECT * FROM campaign_requests WHERE request_key=?", (request_key,)).fetchone()
@@ -449,7 +503,8 @@ class ProcurementService:
                 ).lastrowid
                 conn.executemany('INSERT INTO outbox_attachments VALUES (?,?,?,?,?)',
                     [(message_id,a['document_id'],a['filename'],a['sha256'],a['size_bytes']) for a in lot.get('attachments',[])])
-            conn.execute("UPDATE lots SET status = 'rfq_draft' WHERE id = ?", (lot_id,))
+            bind_campaign(conn,campaign_id,snapshot)
+            self._set_lot_progress(conn,lot_id,'rfq_draft')
             self.db.audit(
                 "drafted",
                 "campaign",
@@ -501,7 +556,7 @@ class ProcurementService:
         clauses: list[str] = []
         params: list[Any] = []
         if status:
-            if status not in {"draft", "approved", "sent", "failed"}:
+            if status not in {"draft", "approved", "queued", "sending", "sent", "failed"}:
                 raise ValueError("unsupported outbox status")
             clauses.append("outbox_messages.status = ?")
             params.append(status)
@@ -529,10 +584,11 @@ class ProcurementService:
             receipt = row.pop("sandbox_receipt_json")
             row["sandbox_receipt"] = json.loads(receipt) if receipt else None
             row['attachments'] = self.db.all('SELECT document_id,filename,sha256,size_bytes FROM outbox_attachments WHERE message_id=? ORDER BY document_id',(row['id'],))
-            row['delivery'] = self.db.one('SELECT status,updated_at FROM mail_deliveries WHERE message_id=?',(row['id'],))
+            from .mail_delivery import journal
+            row['delivery'] = journal(self.db, row['id'])
         return rows
 
-    def _outbox_context(self, conn, message_id: int) -> dict:
+    def _outbox_record(self, conn, message_id: int) -> dict:
         row = conn.execute("""
             SELECT m.*, c.lot_id, l.cluster AS lot_cluster, p.cluster AS project_cluster,
                    s.cluster AS supplier_cluster, s.active AS supplier_active
@@ -544,11 +600,15 @@ class ProcurementService:
             raise NotFoundError("outbox message not found")
         message = dict(row)
         message['attachments'] = [dict(r) for r in conn.execute('SELECT document_id,filename,sha256,size_bytes FROM outbox_attachments WHERE message_id=? ORDER BY document_id',(message_id,))]
+        return message
+
+    def _outbox_context(self, conn, message_id: int) -> dict:
+        message = self._outbox_record(conn, message_id)
         cluster = self._confirmed_cluster(message["lot_cluster"], message["project_cluster"])
         self._supplier_cluster({"cluster": message["supplier_cluster"], "active": message["supplier_active"]}, cluster)
         return message
 
-    def approve_message(self, message_id: int, approved_by: str, comment: str = "") -> dict[str, Any]:
+    def approve_message(self, message_id: int, approved_by: str, comment: str = "", *, admin_policy_approval: bool = False) -> dict[str, Any]:
         approved_by = trusted_actor(approved_by).strip()
         if not approved_by or approved_by == "system":
             raise ValueError("a human approval actor is required")
@@ -560,14 +620,20 @@ class ProcurementService:
             if existing:
                 if message["status"] != "approved" or existing["payload_sha256"] != fingerprint:
                     raise ConflictError("approved content changed; create a new draft for human review")
-                return dict(conn.execute("SELECT * FROM outbox_messages WHERE id=?", (message_id,)).fetchone())
-            if message["status"] != "draft":
+                if not admin_policy_approval:
+                    return dict(conn.execute("SELECT * FROM outbox_messages WHERE id=?", (message_id,)).fetchone())
+            if message["status"] not in ({'draft','approved'} if admin_policy_approval else {'draft'}):
                 raise ConflictError("only draft messages with fresh human approval can be simulated")
             now = utcnow()
-            conn.execute("UPDATE outbox_messages SET status='approved', approved_by=?, approved_at=? WHERE id=? AND status='draft'",
+            conn.execute("UPDATE outbox_messages SET status='approved', approved_by=?, approved_at=? WHERE id=?",
                          (approved_by, now, message_id))
-            conn.execute("INSERT INTO outbox_approvals(message_id,payload_sha256,approved_by,approved_at) VALUES (?,?,?,?)",
+            conn.execute("INSERT OR REPLACE INTO outbox_approvals(message_id,payload_sha256,approved_by,approved_at) VALUES (?,?,?,?)",
                          (message_id, fingerprint, approved_by, now))
+            if admin_policy_approval:
+                from .procurement_flow import ProcurementFlow
+                context=ProcurementFlow(self).approval_context(conn,message['lot_id'])
+                conn.execute('INSERT OR REPLACE INTO procurement_admin_approvals VALUES(?,?,?,?,?)',
+                    (message_id,fingerprint,context,approved_by,now))
             self.db.audit("approved", "outbox_message", message_id, actor=approved_by,
                           details={"comment": comment, "dispatch": "approval_only", "payload_sha256": fingerprint}, conn=conn)
         return self.db.one("SELECT * FROM outbox_messages WHERE id = ?", (message_id,)) or {}
@@ -604,6 +670,8 @@ class ProcurementService:
         submitted_ids = {item.lot_item_id for item in data.items}
         if not submitted_ids.issubset(lot_item_ids):
             raise ValueError("quote contains an item from another lot")
+        if data.price_date and data.valid_until and data.valid_until < data.price_date:
+            raise ValueError("Срок действия КП раньше даты цены")
         with self.db.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             current = conn.execute("""SELECT l.cluster AS lot_cluster,p.cluster AS project_cluster,l.currency
@@ -616,12 +684,19 @@ class ProcurementService:
             if not current_supplier:
                 raise NotFoundError("supplier not found")
             self._supplier_cluster(dict(current_supplier), cluster)
+            if data.source_document_id is not None:
+                source = conn.execute('SELECT * FROM source_documents WHERE id=?', (data.source_document_id,)).fetchone()
+                if not source or source['document_type'] not in {'commercial_offer','price_list'}:
+                    raise ValueError('Нужен исходный прайс или КП с подтверждённым ID')
+                if source['project_id'] not in (None,lot['project_id']) or source['supplier_id'] not in (None,data.supplier_id):
+                    raise ValueError('Исходное КП принадлежит другому объекту или поставщику')
             cursor = conn.execute(
                 """
                 INSERT INTO quotes(
                     lot_id, supplier_id, currency, vat_included, delivery_cost,
-                    lead_days, payment_terms, warranty, valid_until, source_filename, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    lead_days, payment_terms, warranty, valid_until, source_filename, created_at,
+                    source_document_id, price_date, delivery_basis
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     lot_id,
@@ -635,6 +710,9 @@ class ProcurementService:
                     data.valid_until.isoformat() if data.valid_until else None,
                     data.source_filename,
                     utcnow(),
+                    data.source_document_id,
+                    data.price_date.isoformat() if data.price_date else None,
+                    data.delivery_basis,
                 ),
             )
             quote_id = cursor.lastrowid
@@ -642,8 +720,8 @@ class ProcurementService:
                 conn.execute(
                     """
                     INSERT INTO quote_items(
-                        quote_id, lot_item_id, unit_price, offered_quantity, compliant, note
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                        quote_id, lot_item_id, unit_price, offered_quantity, compliant, note, minimum_batch
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         quote_id,
@@ -652,11 +730,22 @@ class ProcurementService:
                         str(item.offered_quantity) if item.offered_quantity is not None else None,
                         int(item.compliant),
                         item.note,
+                        str(item.minimum_batch) if item.minimum_batch is not None else '',
                     ),
                 )
-            conn.execute("UPDATE lots SET status = 'quotes_received' WHERE id = ?", (lot_id,))
+            self._set_lot_progress(conn,lot_id,'quotes_received')
             self.db.audit("received", "quote", quote_id, details={"lot_id": lot_id}, conn=conn)
         return self.db.one("SELECT * FROM quotes WHERE id = ?", (quote_id,)) or {}
+
+    @staticmethod
+    def _set_lot_progress(conn, lot_id: int, stage: str) -> None:
+        """Automatic intake/send cannot undo a human award or finalized order."""
+        if stage not in {'rfq_draft','rfq_sent','quotes_received','comparison'}:
+            raise ValueError('unsupported automatic lot stage')
+        conn.execute('''UPDATE lots SET status=CASE
+            WHEN EXISTS(SELECT 1 FROM procurement_decisions WHERE lot_id=lots.id AND stage='ordered') THEN 'ordered'
+            WHEN EXISTS(SELECT 1 FROM procurement_decisions WHERE lot_id=lots.id AND stage='awarded') THEN 'awarded'
+            WHEN status IN ('awarded','ordered') THEN status ELSE ? END WHERE id=?''',(stage,lot_id))
 
     @staticmethod
     def _normalized_item_name(value: str) -> str:
@@ -1013,7 +1102,7 @@ class ProcurementService:
         if not len(content):raise ValueError('Файл пуст')
         suffix = Path(filename).suffix.lower()
         from .table_ingest import safe_upload
-        if suffix not in {".pdf", ".xlsx", ".csv", ".docx"}:
+        if suffix not in {".pdf", ".xlsx", ".csv", ".docx", '.png', '.jpg', '.jpeg'}:
             raise ValueError("only PDF, DOCX, XLSX and CSV documents are supported")
         if suffix == ".pdf" and not content.startswith(b"%PDF-"):
             raise ValueError("invalid PDF payload")
@@ -1021,7 +1110,15 @@ class ProcurementService:
             raise ValueError("invalid Office document payload")
         # Legacy batch callers supply source-relative names, never destinations.
         filename = filename.replace('\\', '/').rsplit('/', 1)[-1]
-        safe_upload(content, filename, {'.pdf','.xlsx','.csv','.docx'})
+        safe_upload(content, filename, {'.pdf','.xlsx','.csv','.docx','.png','.jpg','.jpeg'})
+        if suffix in {'.png','.jpg','.jpeg'}:
+            from PIL import Image
+            from .upload_io import open_payload
+            with open_payload(content) as image_stream, Image.open(image_stream) as image:
+                expected_format = 'PNG' if suffix == '.png' else 'JPEG'
+                if image.format != expected_format or image.width*image.height>40_000_000:
+                    raise ValueError('Недопустимое или слишком большое изображение')
+                image.verify()
         if project_id is not None:
             self.get_project(project_id)
         if supplier_id is not None:

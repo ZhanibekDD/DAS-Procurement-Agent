@@ -13,6 +13,7 @@ from pydantic import Field, StrictInt
 from .models import StrictModel, SupplierCreate, LotCreate
 from .table_ingest import read_table, MAX_FILE
 from .upload_io import staged_upload
+from .pdf_ocr import MAX_REVIEW_LINES
 
 
 class Confirm(StrictModel):
@@ -36,7 +37,7 @@ class SheetConfirm(Confirm):
 
 
 class PdfConfirm(SheetConfirm):
-    reviewed_line_ids: list[StrictInt] = Field(min_length=1, max_length=1200)
+    reviewed_line_ids: list[StrictInt] = Field(min_length=1, max_length=MAX_REVIEW_LINES)
 
 
 class PriceRejection(StrictModel):
@@ -74,6 +75,11 @@ def install(app, settings, service, launch, require_access, session_claims, doma
         return {'smtp_ready':bool(os.getenv('PROCUREMENT_SMTP_HOST') and os.getenv('PROCUREMENT_SMTP_FROM')),
                 'read_only':bool(getattr(request.state,'das_principal',{}).get('read_only',False)),
                 'max_file_bytes':MAX_FILE}
+
+    @app.post('/api/launch/outbox/{mid}/sent-copy', dependencies=[Depends(write_access)])
+    def sent_copy(mid: int, data: Confirm):
+        from .mail_delivery import copy_sent
+        return call(copy_sent, launch, mid, data.confirmed)
 
     @app.post('/api/launch/imports/{batch_id}/reject', dependencies=[Depends(write_access)])
     def reject_prices(batch_id: int, data: PriceRejection):
@@ -169,3 +175,6 @@ def install(app, settings, service, launch, require_access, session_claims, doma
         if not getattr(request.state,'das_principal',None) and not session_claims(request.cookies.get('procurement_session','')):
             raise HTTPException(403,'Отправка требует личной сессии сотрудника')
         return call(launch.send,mid,data.confirmed)
+
+    from .procurement_routes import install as install_procurement_routes
+    install_procurement_routes(app,settings,service,launch,require_access,write_access,session_claims,domain_error)

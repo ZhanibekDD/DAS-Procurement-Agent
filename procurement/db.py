@@ -375,6 +375,14 @@ class Database:
             conn.executescript(SCHEMA)
             from .launch_workflow import SCHEMA as LAUNCH_SCHEMA
             conn.executescript(LAUNCH_SCHEMA)
+            from .mail_delivery import SCHEMA as MAIL_SCHEMA
+            conn.executescript(MAIL_SCHEMA)
+            from .procurement_flow import SCHEMA as FLOW_SCHEMA
+            conn.executescript(FLOW_SCHEMA)
+            from .catalog import SCHEMA as CATALOG_SCHEMA
+            conn.executescript(CATALOG_SCHEMA)
+            from .price_memory import SCHEMA as MEMORY_SCHEMA
+            conn.executescript(MEMORY_SCHEMA)
             self._migrate_columns(conn)
             for code, template in DEFAULT_TEMPLATES.items():
                 conn.execute(
@@ -389,6 +397,16 @@ class Database:
     @staticmethod
     def _migrate_columns(conn: sqlite3.Connection) -> None:
         additions = {
+            "mail_receipts": (
+                ("sent_copy_started_at", "TEXT"),
+                ("sent_copy_lease", "TEXT"),
+            ),
+            "quotes": (
+                ("source_document_id", "INTEGER REFERENCES source_documents(id) ON DELETE SET NULL"),
+                ("price_date", "TEXT"),
+                ("delivery_basis", "TEXT NOT NULL DEFAULT ''"),
+            ),
+            "quote_items": (("minimum_batch", "TEXT NOT NULL DEFAULT ''"),),
             "projects": (
                 ("cluster", "TEXT NOT NULL DEFAULT ''"),
             ),

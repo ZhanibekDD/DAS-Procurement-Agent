@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
-from typing import Literal
+from typing import Literal, Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, StrictInt
 
 
 class StrictModel(BaseModel):
@@ -109,9 +109,12 @@ class ProcurementSuggestionRejection(StrictModel):
 
 class CampaignCreate(StrictModel):
     template_code: str = Field(default="rfq-email", min_length=2, max_length=80)
-    supplier_ids: list[int] = Field(min_length=1, max_length=500)
+    supplier_ids: list[Annotated[StrictInt, Field(gt=0)]] = Field(min_length=1, max_length=500)
     channel: Literal["email", "telegram", "max"] = "email"
     idempotency_key: str = Field(default="", max_length=128, pattern=r"^[A-Za-z0-9_.:-]*$")
+    item_ids: list[Annotated[StrictInt, Field(gt=0)]] = Field(default_factory=list, max_length=500)
+    snapshot_sha256: str = Field(default='', pattern=r'^(?:[a-f0-9]{64})?$')
+    preview_sha256: str = Field(default='', pattern=r'^(?:[a-f0-9]{64})?$')
 
 
 class QuoteItemCreate(StrictModel):
@@ -120,6 +123,7 @@ class QuoteItemCreate(StrictModel):
     offered_quantity: Decimal | None = Field(default=None, gt=0)
     compliant: bool = True
     note: str = Field(default="", max_length=2000)
+    minimum_batch: Decimal | None = Field(default=None, ge=0)
 
 
 class QuoteCreate(StrictModel):
@@ -133,6 +137,9 @@ class QuoteCreate(StrictModel):
     warranty: str = Field(default="", max_length=1000)
     valid_until: date | None = None
     source_filename: str = Field(default="", max_length=255)
+    source_document_id: int | None = Field(default=None, gt=0)
+    price_date: date | None = None
+    delivery_basis: Literal["included", "pickup", "extra", ""] = ""
     items: list[QuoteItemCreate] = Field(min_length=1, max_length=500)
 
 

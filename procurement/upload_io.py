@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 import io
+import re
 import tempfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -69,8 +70,11 @@ async def staged_upload(file, limit=MAX_FILE):
 
 def upload_request(scope):
     return (scope.get('type')=='http' and scope.get('method')=='POST' and
-            scope.get('path') in {'/api/documents','/api/imports/batch','/api/suppliers/import',
-                '/api/launch/lot-sheet/preview','/api/launch/supplier-import/preview'})
+            (scope.get('path') in {'/api/documents','/api/imports/batch','/api/suppliers/import',
+                '/api/launch/lot-sheet/preview','/api/launch/supplier-import/preview',
+                '/api/procurement/catalog/preview','/api/procurement/catalog/incoming-mail',
+                '/api/procurement/quick-intake'}
+             or bool(re.fullmatch(r'/api/procurement/projects/\d+/workbook',scope.get('path','')))))
 
 
 class UploadBodyLimit:

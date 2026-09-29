@@ -10,6 +10,7 @@ from pypdf import PdfReader
 
 from .models import LotItemCreate, ProcurementSuggestionCreate
 from .upload_io import FilePayload, MAX_FILE, open_payload, UploadTooLarge, TOO_LARGE
+from .pdf_ocr import OCR_PAGE_TIMEOUT, OCR_CPU_LIMIT
 
 
 def _number(value: str) -> Decimal:
@@ -36,19 +37,32 @@ def _extract_pdf_page(content, page_number: int) -> str:
     return text
 
 
+def _count_pdf_pages(content) -> int:
+    if not content.startswith(b"%PDF-"):
+        raise ValueError("invalid PDF payload")
+    with open_payload(content) as stream:
+        reader = PdfReader(stream)
+        if reader.is_encrypted:
+            raise ValueError('PDF is encrypted')
+        return len(reader.pages)
+
+
 def _page_worker(content, page_number, pipe, ocr=False, workspace=None):
     try:
         import os
         if hasattr(os, 'setsid'): os.setsid()
         import resource
         resource.setrlimit(resource.RLIMIT_AS,(512*1024*1024,512*1024*1024))
-        resource.setrlimit(resource.RLIMIT_CPU,(45 if ocr else 15,)*2)
+        resource.setrlimit(resource.RLIMIT_CPU,(OCR_CPU_LIMIT if ocr else 15,)*2)
     except ImportError:
         pass
     try:
         try:
-            text = _extract_pdf_page(content,page_number)
-            result = {'text': text, 'mode': 'text', 'lines': []} if ocr else text
+            if page_number == 0:
+                result = _count_pdf_pages(content)
+            else:
+                text = _extract_pdf_page(content,page_number)
+                result = {'text': text, 'mode': 'text', 'lines': []} if ocr else text
         except ValueError as exc:
             if not ocr or str(exc) != 'PDF page has no extractable text; OCR is required': raise
             from .pdf_ocr import recognize_page
@@ -73,7 +87,7 @@ def _bounded_page(content, page_number: int, *, ocr=False):
     result=None
     try:
         process.start();sender.close()
-        if receiver.poll(55 if ocr else 20):
+        if receiver.poll(OCR_PAGE_TIMEOUT if ocr else 20):
             try:result=receiver.recv()
             except EOFError:pass
     finally:
@@ -97,6 +111,13 @@ def _bounded_page(content, page_number: int, *, ocr=False):
 
 def extract_pdf_page(content, page_number: int) -> str:
     return _bounded_page(content, page_number)
+
+
+def count_pdf_pages(content: FilePayload) -> int:
+    """Count inside the same resource-limited subprocess as page extraction."""
+    if not isinstance(content, FilePayload):
+        raise ValueError('Нужен сохранённый PDF')
+    return _bounded_page(content, 0)
 
 
 def extract_pdf_page_review(content: FilePayload, page_number: int) -> dict:

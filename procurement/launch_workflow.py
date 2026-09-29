@@ -252,25 +252,49 @@ class LaunchWorkflow:
             self.db.audit('supplier_import_rolled_back','supplier_import',pid,details={'changed':len(changes)},conn=conn)
         return {'status':'rolled_back','changed':len(changes)}
 
-    def sheet_preview(self, table, mapping=None, source_document=None):
+    def sheet_preview(self, table, mapping=None, source_document=None, quick_intake=False, persist=True):
         mapping = suggested_mapping(table['headers'], ITEM_ALIASES) if mapping is None else mapping
         if not {'name','quantity','unit'} <= set(mapping):
-            return {**table, 'rows': table['rows'][:20], 'mapping': mapping, 'needs_mapping': True}
+            incomplete={**table,'rows':table['rows'][:20],'mapping':mapping,'needs_mapping':True,
+                'quick_intake':quick_intake,
+                'source_document_id':source_document['id'] if source_document else None,
+                'project_id':source_document['project_id'] if source_document else None}
+            return self.save_preview('lot_sheet',incomplete) if quick_intake and persist else incomplete
         rows, errors = [], []
         for source in table['rows']:
             values = {}
             try:
                 values = mapped(source, mapping, table['headers'], set(ITEM_ALIASES))
                 values['quantity'] = quantity(values['quantity'])
+                values['specification'] = values.get('specification') or ''
                 values['delivery_date'] = delivery_date(values.get('delivery_date', ''))
                 rows.append({'row': source['row'], **values})
             except ValueError as exc:
                 errors.append({'row':source['row'],'reason':str(exc)})
                 rows.append({'row':source['row'],**values,'error':str(exc)})
-        return self.save_preview('lot_sheet', {'headers':table['headers'],'sheets':table['sheets'],
+        data = {'headers':table['headers'],'sheets':table['sheets'],
               'sheet':table['sheet'],'mapping':mapping,'rows':rows,'errors':errors,
+              'quick_intake':quick_intake,
               'source_document_id':source_document['id'] if source_document else None,
-              'project_id':source_document['project_id'] if source_document else None})
+              'project_id':source_document['project_id'] if source_document else None}
+        return self.save_preview('lot_sheet', data) if persist else data
+
+    def remap_quick_sheet_preview(self, pid, table, mapping, document):
+        data = self.sheet_preview(table, mapping, document, quick_intake=True, persist=False)
+        replacement = uuid.uuid4().hex
+        with self.db.connection() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            row, old = self.preview(conn, pid, 'lot_sheet')
+            if (row['status'] != 'preview' or not old.get('quick_intake')
+                    or old.get('source_document_id') != document['id']):
+                raise ConflictError('Черновик уже обработан или заменён')
+            conn.execute('INSERT INTO launch_previews(id,kind,actor,data_json,created_at) VALUES (?,?,?,?,?)',
+                         (replacement, 'lot_sheet', trusted_actor(), encode(data), utcnow()))
+            conn.execute("UPDATE launch_previews SET status='superseded',result_json=? WHERE id=?",
+                         (encode({'replacement_preview_id': replacement}), pid))
+            self.db.audit('quick_draft_remapped', 'lot_sheet', replacement,
+                          details={'superseded_preview_id':pid,'rows':len(data.get('rows',[]))},conn=conn)
+        return {'preview_id':replacement,**data}
 
     def pdf_review(self, document, page, extracted):
         from .pdf_ocr import candidate_rows
@@ -291,13 +315,22 @@ class LaunchWorkflow:
                     'lines': extracted['lines'], 'source_page': page,
                 }}
 
-    def create_sheet_lot(self, pid, data, confirmed, *, kind='lot_sheet', reviewed_line_ids=None):
-        if confirmed is not True:
+    def create_sheet_lot(self, pid, data, confirmed, *, kind='lot_sheet', reviewed_line_ids=None, auto_draft=False):
+        if confirmed is not True and not auto_draft:
             raise ValueError('Подтвердите исправленные позиции')
         lot = LotCreate(**data)
         with self.db.connection() as conn:
             conn.execute('BEGIN IMMEDIATE')
             preview, preview_data = self.preview(conn, pid, kind)
+            if auto_draft:
+                if kind!='lot_sheet' or preview_data.get('errors') or not preview_data.get('rows'):
+                    raise ValueError('Авточерновик возможен только для полностью распознанного листа')
+                source_items=[{key:row.get(key) for key in ('name','quantity','unit','specification','delivery_date')}
+                              for row in preview_data['rows']]
+                submitted=[{key:item.get(key) for key in ('name','quantity','unit','specification','delivery_date')}
+                           for item in data['items']]
+                if encode(source_items)!=encode(submitted):
+                    raise ConflictError('Авточерновик должен совпадать с распознанным листом')
             if kind == 'pdf_ocr':
                 expected = {r['line'] for r in preview_data['lines']}
                 if (not reviewed_line_ids or len(set(reviewed_line_ids)) != len(reviewed_line_ids)
@@ -309,14 +342,20 @@ class LaunchWorkflow:
                     raise ConflictError('Исходный PDF изменился после распознавания')
                 for item in lot.items:
                     item.source_document_id = preview_data['source_document_id']
-                    item.source_page = preview_data['source_page']
-                    item.source_reference = 'Ручная проверка OCR, лист ' + preview_data['sheet']
+                    if preview_data.get('quick_intake'):
+                        if item.source_page is None or not 1 <= item.source_page <= preview_data['page_count']:
+                            raise ValueError('Укажите страницу исходного PDF для каждой позиции')
+                    else:
+                        item.source_page = preview_data['source_page']
+                    item.source_reference = 'Ручная проверка OCR, страница ' + str(item.source_page)
             requested_hash = payload_sha256(lot.model_dump(mode='json'))
             if preview['status'] == 'applied':
                 result = json.loads(preview['result_json'])
                 if result['payload_sha256'] != requested_hash:
                     raise ConflictError('Этот предпросмотр уже использован с другими исправленными данными')
                 return self.service.get_lot(result['lot_id'])
+            if preview['status'] != 'preview':
+                raise ConflictError('Предпросмотр уже заменён или отменён')
             source_id = preview_data.get('source_document_id')
             if source_id:
                 if preview_data.get('project_id') != lot.project_id:
@@ -351,7 +390,7 @@ class LaunchWorkflow:
                      item.source_page,item.source_reference,str(item.delivery_date) if item.delivery_date else None))
             conn.executemany('INSERT INTO lot_attachments VALUES (?,?)',[(sid,d) for d in set(lot.attachment_document_ids)])
             conn.execute("UPDATE launch_previews SET status='applied',result_json=? WHERE id=?",(encode({'lot_id':sid,'payload_sha256':requested_hash}),pid))
-            self.db.audit('lot_created_from_pdf_ocr' if kind == 'pdf_ocr' else 'lot_created_from_sheet','lot',sid,
+            self.db.audit('quick_lot_draft_created' if auto_draft else 'lot_created_from_pdf_ocr' if kind == 'pdf_ocr' else 'lot_created_from_sheet','lot',sid,
                           details={'preview_id':pid,'items':len(lot.items), 'reviewed_line_ids': reviewed_line_ids},conn=conn)
         return self.service.get_lot(sid)
 
@@ -392,69 +431,5 @@ class LaunchWorkflow:
         return content
 
     def send(self, message_id, confirmed):
-        if confirmed is not True:
-            raise ValueError('Подтвердите отправку адресату с указанными вложениями')
-        host, sender = os.getenv('PROCUREMENT_SMTP_HOST',''), os.getenv('PROCUREMENT_SMTP_FROM','')
-        if not host or not sender:
-            raise ConflictError('Отправка не настроена: требуется SMTP-сервер и подтверждённый адрес отправителя')
-        with self.db.connection() as conn:
-            conn.execute('BEGIN IMMEDIATE')
-            message = self.service._outbox_context(conn,message_id)
-            fingerprint = message_fingerprint(message)
-            previous = conn.execute('SELECT * FROM mail_deliveries WHERE message_id=?',(message_id,)).fetchone()
-            if previous:
-                if previous['status'] == 'sent' and previous['payload_sha256'] == fingerprint:
-                    return {'status':'sent','message_id':message_id,'duplicate':True}
-                raise ConflictError('Отправка уже выполнялась; проверьте статус у почтового провайдера, повтор запрещён')
-            approval = conn.execute('SELECT * FROM outbox_approvals WHERE message_id=?',(message_id,)).fetchone()
-            if (message['channel'] != 'email' or message['status'] != 'approved' or not approval
-                    or approval['payload_sha256'] != fingerprint
-                    or approval['approved_by'] != message['approved_by']
-                    or approval['approved_at'] != message['approved_at']):
-                raise ConflictError('Необходим неизменённый черновик с подтверждением сотрудника')
-            contacts({'email':message['recipient']})
-            if any(c in sender + message['subject'] for c in '\r\n'):
-                raise ValueError('Недопустимые заголовки письма')
-            contacts({'email':sender})
-            email = EmailMessage()
-            email['From'],email['To'],email['Subject'] = sender,message['recipient'],message['subject']
-            key = uuid.uuid4().hex
-            email['Message-ID'] = '<' + key + '@' + sender.split('@')[1] + '>'
-            email.set_content(message['body'])
-            attachments=[]
-            for attachment in message.get('attachments',[]):
-                doc = conn.execute('SELECT * FROM source_documents WHERE id=?',(attachment['document_id'],)).fetchone()
-                if not doc or doc['sha256'] != attachment['sha256']:
-                    raise ConflictError('Вложение изменилось после согласования')
-                content = self.document_file(dict(doc))
-                attachments.append((attachment['filename'],content,attachment['sha256']))
-            conn.execute('INSERT INTO mail_deliveries VALUES (?,?,?,?,?,?)',(message_id,fingerprint,'sending',key,trusted_actor(),utcnow()))
-            self.db.audit('mail_send_started','outbox_message',message_id,details={'attachment_count':len(message.get('attachments',[]))},conn=conn)
-        try:
-            port = int(os.getenv('PROCUREMENT_SMTP_PORT','587'))
-            mode = os.getenv('PROCUREMENT_SMTP_TLS','starttls')
-            if mode == 'none' and host not in {'127.0.0.1','localhost','::1'}:
-                raise ValueError('Незащищённый SMTP разрешён только на loopback')
-            smtp_type = smtplib.SMTP_SSL if mode == 'ssl' else smtplib.SMTP
-            with smtp_type(host,port,timeout=30) as smtp:
-                if mode == 'starttls':
-                    smtp.starttls(context=ssl.create_default_context())
-                elif mode not in {'ssl','none'}:
-                    raise ValueError('Недопустимый SMTP TLS режим')
-                user = os.getenv('PROCUREMENT_SMTP_USER','')
-                if user:
-                    password_path = Path(os.environ['PROCUREMENT_SMTP_PASSWORD_FILE'])
-                    if password_path.stat().st_mode & 0o077:
-                        raise ValueError('SMTP secret должен иметь права 0400/0600')
-                    smtp.login(user,password_path.read_text().strip())
-                send_streamed(smtp,email,attachments)
-        except Exception:
-            with self.db.connection() as conn:
-                conn.execute("UPDATE mail_deliveries SET status='unknown',updated_at=? WHERE message_id=?",(utcnow(),message_id))
-                self.db.audit('mail_send_unconfirmed','outbox_message',message_id,details={'retry':'blocked'},conn=conn)
-            raise ConflictError('Доставка не подтверждена. Автоматический повтор запрещён; проверьте почтовый сервер') from None
-        with self.db.connection() as conn:
-            conn.execute("UPDATE mail_deliveries SET status='sent',updated_at=? WHERE message_id=?",(utcnow(),message_id))
-            conn.execute("UPDATE outbox_messages SET status='sent' WHERE id=?",(message_id,))
-            self.db.audit('mail_sent','outbox_message',message_id,details={'attachment_count':len(message.get('attachments',[]))},conn=conn)
-        return {'status':'sent','message_id':message_id,'attachment_count':len(message.get('attachments',[])),'accepted_by_smtp':True}
+        from .mail_delivery import send
+        return send(self, message_id, confirmed)

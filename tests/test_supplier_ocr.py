@@ -54,6 +54,19 @@ def test_no_quantity_guessed_from_drawing_dimensions():
     assert rows[0]['specification']=='ФБС 24.4.6 179 995'
 
 
+def test_explicit_high_confidence_quantities_prefill_without_losing_codes():
+    rows=candidate_rows([
+        {'line':1,'text':'ФБС 24.4.6 218 шт','confidence':.96},
+        {'line':2,'text':'Кабель 001230040500 10 м','confidence':.918},
+        {'line':3,'text':'ФБС 12.4.6 95 шт','confidence':.84},
+    ])
+    assert [(row['name'],row['quantity'],row['unit']) for row in rows]==[
+        ('ФБС 24.4.6','218','шт'),('Кабель 001230040500','10','м'),
+        ('ФБС 12.4.6 95 шт','','')]
+    assert rows[0]['specification']=='ФБС 24.4.6 218 шт'
+    assert rows[2]['error'] and not rows[0].get('error')
+
+
 def test_tsv_preserves_all_lines_and_marks_uncertainty(tmp_path):
     path=tmp_path/'scan.tsv'
     path.write_text('level\tblock_num\tpar_num\tline_num\tleft\ttop\theight\tconf\ttext\n'
@@ -63,6 +76,81 @@ def test_tsv_preserves_all_lines_and_marks_uncertainty(tmp_path):
     result=parse_tsv(path)
     assert [r['text'] for r in result]==['ФБС 24.4.6','???']
     assert [r['confidence'] for r in result]==[.4,.3]
+
+
+def test_tesseract_literal_quote_cannot_consume_following_records(tmp_path):
+    path=tmp_path/'literal-quotes.tsv'
+    path.write_text('level\tblock_num\tpar_num\tline_num\tleft\ttop\twidth\theight\tconf\ttext\n'
+        '5\t1\t1\t1\t10\t10\t20\t20\t90\t"\n'
+        '5\t2\t1\t1\t10\t50\t30\t20\t95\tФБС\n'
+        '5\t2\t1\t1\t50\t50\t80\t20\t95\t24.4.6\n',encoding='utf8')
+    result=parse_tsv(path)
+    assert [row['text'] for row in result]==['"','ФБС 24.4.6']
+    assert result[1]['bbox']=={'left':10,'top':50,'width':120,'height':20}
+    assert all('\t' not in row['text'] and '\n' not in row['text'] for row in result)
+
+
+def table_line(number,text,x,y,width=80,confidence=.96,page=1):
+    return {'line':number,'text':text,'confidence':confidence,'page':page,
+            'bbox':{'left':x,'top':y,'width':width,'height':20}}
+
+
+def test_specification_table_uses_quantity_not_mass_or_drawing_dimensions():
+    lines=[table_line(1,'Наименование',100,40,180),table_line(2,'Кол.',420,40,40),
+           table_line(3,'ФБС 24.4.6',110,100,170),table_line(4,'218',425,100,30),
+           table_line(5,'179995',510,100,70),table_line(6,'ФБС 12.4.6',110,150,170),
+           table_line(7,'95',425,150,30),table_line(8,'ФБС 9.4.6',110,200,170),
+           table_line(9,'128',425,200,30)]
+    rows=candidate_rows(lines)
+    assert [(r['name'],r['quantity'],r['unit']) for r in rows]==[
+        ('ФБС 24.4.6','218','шт'),('ФБС 12.4.6','95','шт'),('ФБС 9.4.6','128','шт')]
+    assert all(not row.get('error') for row in rows)
+    # Same coordinates on a different page cannot supply a missing quantity.
+    lines[3]['page']=2
+    assert candidate_rows(lines)[0]['quantity']==''
+    assert candidate_rows(lines)[0]['error']
+
+
+def test_uncertain_table_cells_are_not_repaired_or_silently_trusted():
+    lines=[table_line(1,'Наименование',100,40,180),table_line(2,'Кол.',420,40,40),
+           table_line(3,'ФБС 12.4.6',110,100,170),table_line(4,'9я',425,100,30,.4),
+           table_line(5,'ФБС 94.6',110,150,170),table_line(6,'128',425,150,30),
+           table_line(7,'ФБС 24.4.6',110,200,170,.85),table_line(8,'218',425,200,30)]
+    rows=candidate_rows(lines)
+    assert rows[0]['quantity']=='' and rows[0]['error']
+    assert rows[1]['name']=='ФБС 94.6' and rows[1]['unit']=='' and rows[1]['error']
+    assert rows[2]['quantity']=='218' and rows[2]['error']
+    no_header=candidate_rows([line for line in lines if line['line']!=2])
+    assert all(not row['quantity'] for row in no_header)
+
+
+def test_full_budget_ocr_is_indexed_once_and_matching_is_bounded(monkeypatch):
+    import procurement.pdf_ocr as ocr
+    class CountingLines(list):
+        iterations = 0
+        def __iter__(self):
+            self.iterations += 1
+            return super().__iter__()
+    lines = CountingLines()
+    for page in range(1,13):
+        lines.extend([table_line(len(lines)+1,'Наименование',100,0,180,page=page),
+                      table_line(len(lines)+2,'Кол.',420,0,40,page=page)])
+        for row in range(599):
+            lines.extend([table_line(len(lines)+1,'ФБС 24.4.6',110,40+row*24,170,page=page),
+                          table_line(len(lines)+2,'218',425,40+row*24,30,page=page)])
+    assert len(lines)==ocr.MAX_REVIEW_LINES
+    calls = []
+    original = ocr._table_quantity
+    def counted(line,index):
+        calls.append(id(index))
+        return original(line,index)
+    monkeypatch.setattr(ocr,'_table_quantity',counted)
+    rows=ocr.candidate_rows(lines)
+    assert len(rows)==500
+    assert rows[0]['quantity']=='218'
+    assert lines.iterations==2  # Index build + bounded candidate traversal only.
+    assert len(calls)==500 and len(set(calls))==1
+    assert len(lines)==ocr.MAX_REVIEW_LINES  # No raw line silently removed.
 
 
 def test_native_russian_image_only_pdf_opens_and_source_unchanged(tmp_path):
@@ -120,3 +208,31 @@ def test_missing_ocr_and_native_timeout_are_honest(monkeypatch,tmp_path):
     def timeout(*a,**kw):raise subprocess.TimeoutExpired('tesseract',1)
     monkeypatch.setattr(subprocess,'run',timeout)
     with pytest.raises(ValueError,match='слишком долго'):_run(['tesseract'],1)
+
+
+def test_dense_scan_has_bounded_native_budget_inside_worker_deadline(monkeypatch,tmp_path):
+    from procurement import pdf_ocr as ocr
+    from procurement import document_analysis as analysis
+    calls=[]
+    def run(command,timeout):
+        calls.append((command[0],timeout))
+        if command[0]=='pdftoppm':(tmp_path/'page.png').write_bytes(b'fixture')
+    monkeypatch.setattr(ocr,'_run',run)
+    monkeypatch.setattr(ocr,'parse_tsv',lambda _: [{'line':1,'text':'ФБС 24.4.6 218 шт','confidence':.96}])
+    assert ocr.recognize_page(tmp_path/'scan.pdf',2,tmp_path)['mode']=='ocr'
+    assert calls==[('pdftoppm',18),('tesseract',45)]
+    assert 0 < ocr.RASTER_TIMEOUT + ocr.OCR_TIMEOUT < analysis.OCR_PAGE_TIMEOUT <= 75
+    assert ocr.OCR_TIMEOUT < analysis.OCR_CPU_LIMIT <= 60
+
+
+def test_native_timeout_does_not_retry_and_keeps_thread_limit(monkeypatch):
+    import subprocess
+    from procurement.pdf_ocr import _run,OCR_TIMEOUT
+    calls=[]
+    def run(command,**kwargs):
+        calls.append(kwargs)
+        raise subprocess.TimeoutExpired(command,kwargs['timeout'])
+    monkeypatch.setattr(subprocess,'run',run)
+    with pytest.raises(ValueError,match='слишком долго'):_run(['tesseract'],OCR_TIMEOUT)
+    assert len(calls)==1 and calls[0]['timeout']==45
+    assert calls[0]['env']['OMP_THREAD_LIMIT']==calls[0]['env']['OMP_NUM_THREADS']=='1'

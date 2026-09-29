@@ -13,14 +13,15 @@ const tick=()=>new Promise(resolve=>setImmediate(resolve));
 function harness(api,archive=async()=>{}){
   const buttons=['lot','document','quote','price-history','project'].map(open=>({dataset:{open}}));
   const nodes={};
-  for(const id of ['modal','modalBody','modalTitle','modalSubmit','pName','pRegion','pAddress','pDescription'])
+  for(const id of ['modal','modalBody','modalTitle','modalSubmit','pName','pRegion','pAddress','pDescription','adminMenu'])
     nodes['#'+id]={value:'Synthetic',innerHTML:'',classList:{add(){},remove(){}}};
   let opens=0,closes=0,renders=0;
   nodes['#modal'].showModal=()=>{opens++};nodes['#modal'].close=()=>{closes++};
   const messages=[];
   const state={projects:[],suppliers:[],view:'projects',demo:false};
   const ctx=vm.createContext({state,$:selector=>nodes[selector],document:{querySelectorAll:()=>buttons},
-    api,loadArchive:archive,setConnection(){},toast:(text,error)=>messages.push({text,error}),
+    api:async(url,options)=>{const response=await api(url,options);return url==='/api/ui-context'?{role:'staff'}:response},
+    loadArchive:archive,setConnection(){},toast:(text,error)=>messages.push({text,error}),
     render:()=>{renders++},showView(){},setTimeout(){},createLot(){}});
   vm.runInContext(section('const esc=','const money=')+'\n'+section('const refreshUI=','function setConnection')+
     '\n'+section('function bindOpeners()','function addItemRow()')+'\n'+section('async function modalAction(','const commitSupplierImport='),ctx);
@@ -45,7 +46,7 @@ test('dependent modal is blocked on first load and after failed refresh until GE
   assert.equal(await h.ctx.loadAll(),false);
   h.ctx.openModal('lot');assert.equal(h.opens,0);assert.equal(h.buttons[0].disabled,true);
   fail=false;assert.equal(await h.ctx.loadAll(),true);h.ctx.openModal('lot');assert.equal(h.opens,1);
-  assert.equal(requests,20);
+  assert.equal(requests,22);
 });
 
 test('newly rendered openers remain disabled until archive/render is complete',async()=>{

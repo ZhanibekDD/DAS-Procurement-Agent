@@ -60,7 +60,7 @@ from .table_ingest import MAX_FILE, read_table
 from .upload_io import staged_upload, UploadBodyLimit, upload_request, UploadTooLarge, MAX_BATCH
 from .passwords import verify_password
 from .service import ConflictError, NotFoundError, ProcurementService
-from .identity import authenticated_actor, trusted_actor
+from .identity import authenticated_actor, authenticated_role, trusted_actor, trusted_role
 from . import sso
 
 
@@ -117,9 +117,11 @@ _READ_ONLY_GET = (
     r"/api/documents", r"/api/procurement-suggestions", r"/api/procurement-suggestions/\d+/reference-checks",
     r"/api/lots(?:/\d+(?:/(?:supplier-matches|quotes|comparison|price-benchmark))?)?",
     r"/api/campaigns", r"/api/outbox", r"/api/price-history", r"/api/templates", r"/api/audit",
+    r"/api/activity", r"/api/ui-context",
     r"/api/imports(?:/\d+)?", r"/api/supplier-drafts", r"/api/price-history-entries", r"/assets/[^/]+",
     r"/api/launch/config", r"/api/launch/suppliers(?:/\d+)?", r"/api/launch/imports",
     r"/api/launch/documents/\d+/download",
+    r"/api/procurement/(?:catalog|price-memory|policy|projects/\d+|documents/\d+/view)",
 )
 
 
@@ -135,10 +137,12 @@ async def das_identity_boundary(request: Request, call_next):
         if upload_request(request.scope) and not actor and (settings.environment=='production' or settings.api_key or settings.local_auth_configured):
             return JSONResponse({'detail':'access denied'},status_code=403)
         context = authenticated_actor.set(actor)
+        role_context=authenticated_role.set(claims.get('role','staff') if claims else 'staff')
         try:
             return await call_next(request)
         finally:
             authenticated_actor.reset(context)
+            authenticated_role.reset(role_context)
     path = request.url.path
     if path in {"/login", "/auth/login"}:
         return JSONResponse({"detail": "local login is disabled; use DAS SSO"}, status_code=404)
@@ -170,10 +174,12 @@ async def das_identity_boundary(request: Request, call_next):
                     or not hmac.compare_digest(principal["csrf"], csrf)):
                 raise sso.SSOError(403)
         context = authenticated_actor.set(principal["sub"])
+        role_context=authenticated_role.set(principal.get('role','staff'))
         try:
             response = await call_next(request)
         finally:
             authenticated_actor.reset(context)
+            authenticated_role.reset(role_context)
         if not getattr(request.state, "sso_logout", False):
             _set_sso_session(response, principal)
         response.headers["Cache-Control"] = "no-store"
@@ -495,6 +501,12 @@ def index(
     launch_digest = hashlib.sha256((path.parent / "launch.js").read_bytes()).hexdigest()
     content = content.replace('src="/assets/launch.js"',
                               'src="/assets/launch.js?v=' + launch_digest + '"')
+    flow_digest = hashlib.sha256((path.parent / 'procurement.js').read_bytes()).hexdigest()
+    content = content.replace('src="/assets/procurement.js"','src="/assets/procurement.js?v='+flow_digest+'"')
+    memory_digest = hashlib.sha256((path.parent / 'price-memory.js').read_bytes()).hexdigest()
+    content = content.replace('src="/assets/price-memory.js"','src="/assets/price-memory.js?v='+memory_digest+'"')
+    staff_digest = hashlib.sha256((path.parent / 'staff-ui.js').read_bytes()).hexdigest()
+    content = content.replace('src="/assets/staff-ui.js"','src="/assets/staff-ui.js?v='+staff_digest+'"')
     if not settings.sso_enabled and session_token:
         csrf = hmac.new(settings.auth_secret.encode(), ('launch:' + session_token).encode(), hashlib.sha256).hexdigest()
         content = content.replace('<head>', '<head><meta name="procurement-launch-csrf" content="' + csrf + '">')
@@ -511,6 +523,11 @@ def index(
     response.headers["Cache-Control"] = "no-store"
     response.headers["Referrer-Policy"] = "strict-origin"
     return response
+
+
+@app.get("/assets/staff-ui.js", dependencies=[Depends(require_access)])
+def staff_ui_script():
+    return FileResponse(Path(__file__).parent / "static" / "staff-ui.js", media_type="application/javascript")
 
 
 @app.get("/api/dashboard", dependencies=[Depends(require_access)])
@@ -748,9 +765,15 @@ def list_outbox(
 
 
 @app.post("/api/outbox/{message_id}/approve", dependencies=[Depends(require_access)])
-def approve_message(message_id: int, decision: ApprovalDecision):
+def approve_message(message_id: int, decision: ApprovalDecision, request: Request):
     try:
-        return service.approve_message(message_id, decision.approved_by, decision.comment)
+        from .procurement_flow import ProcurementFlow
+        principal=getattr(request.state,'das_principal',{}) or _session_claims(request.cookies.get('procurement_session','')) or {}
+        with service.db.connection() as conn:
+            message=service._outbox_context(conn,message_id)
+            if ProcurementFlow(service).approval_required(conn,message['lot_id'],'staff') and principal.get('role')!='admin':
+                raise ConflictError('Согласование правила закупки доступно администратору')
+        return service.approve_message(message_id, decision.approved_by, decision.comment,admin_policy_approval=principal.get('role')=='admin')
     except Exception as exc:
         raise handle_domain_error(exc) from exc
 
@@ -830,10 +853,71 @@ def upsert_template(code: str, data: TemplateUpsert):
 
 @app.get("/api/audit", dependencies=[Depends(require_access)])
 def list_audit(limit: int = Query(default=50, ge=1, le=200)):
+    if trusted_role() != "admin":
+        raise HTTPException(status_code=403, detail="Журнал аудита доступен администратору")
     try:
         return service.list_audit(limit)
     except Exception as exc:
         raise handle_domain_error(exc) from exc
+
+
+@app.get("/api/ui-context", dependencies=[Depends(require_access)])
+def ui_context():
+    return {"role": trusted_role()}
+
+
+_ACTIVITY_LABELS = {
+    ("supplier_edited", "supplier"): "Поставщик изменён",
+    ("supplier_soft_deleted", "supplier"): "Поставщик удалён",
+    ("supplier_restored", "supplier"): "Поставщик восстановлен",
+    ("created", "supplier"): "Поставщик добавлен",
+    ("created_from_price", "supplier"): "Поставщик добавлен из прайса",
+    ("updated_from_price", "supplier"): "Поставщик обновлён из прайса",
+    ("drafted", "campaign"): "Запрос КП подготовлен",
+    ("mail_sent", "outbox_message"): "Запрос КП отправлен",
+    ("price_catalog_import", "source_document"): "Прайс проверен",
+    ("created", "project"): "Проект создан",
+    ("created", "lot"): "Закупка создана",
+}
+
+
+@app.get("/api/activity", dependencies=[Depends(require_access)])
+def recent_activity(limit: int = Query(default=8, ge=1, le=30)):
+    """A deliberately small, human-readable projection; raw audit remains admin-only."""
+    result = []
+    filter_sql = " OR ".join("(action = ? AND entity_type = ?)" for _ in _ACTIVITY_LABELS)
+    filter_args = tuple(part for pair in _ACTIVITY_LABELS for part in pair)
+    events = service.db.all(
+        f"SELECT action, entity_type, entity_id, created_at FROM audit_log WHERE {filter_sql} ORDER BY id DESC LIMIT ?",
+        (*filter_args, min(200, limit * 10)),
+    )
+    for event in events:
+        label = _ACTIVITY_LABELS.get((event["action"], event["entity_type"]))
+        if not label:
+            continue
+        kind, raw_id = event["entity_type"], event["entity_id"]
+        try:
+            entity_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        query = {
+            "supplier": ("SELECT name FROM suppliers WHERE id = ?", "suppliers"),
+            "project": ("SELECT name FROM projects WHERE id = ?", "projects"),
+            "lot": ("SELECT title AS name FROM lots WHERE id = ?", "lots"),
+            "source_document": ("SELECT filename AS name FROM source_documents WHERE id = ?", "documents"),
+            "campaign": ("SELECT lots.title AS name, lots.id AS target_id FROM campaigns JOIN lots ON lots.id = campaigns.lot_id WHERE campaigns.id = ?", "lots"),
+            "outbox_message": ("SELECT suppliers.name, campaigns.lot_id AS target_id FROM outbox_messages JOIN suppliers ON suppliers.id = outbox_messages.supplier_id JOIN campaigns ON campaigns.id = outbox_messages.campaign_id WHERE outbox_messages.id = ?", "lots"),
+        }.get(kind)
+        if not query:
+            continue
+        rows = service.db.all(query[0], (entity_id,))
+        if not rows:
+            continue
+        result.append({"label": label, "name": rows[0]["name"], "view": query[1],
+                       "target_id": rows[0].get("target_id", entity_id), "created_at": event["created_at"]})
+        if len(result) >= limit:
+            break
+    return result
 
 
 # ── PR #8: batch import & supplier-drafts endpoints ──────────────────────────

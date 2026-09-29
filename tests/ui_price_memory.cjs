@@ -1,0 +1,34 @@
+const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
+const source=fs.readFileSync('procurement/static/price-memory.js','utf8');
+const nodes=new Map(),node=()=>({innerHTML:'',textContent:'',className:'',firstChild:null,after(){},append(){},appendChild(){},replaceChildren(){},insertAdjacentHTML(){}});
+const context={console,URLSearchParams,Date,Math,Number,String,Object,JSON,Promise,Set,document:{createElement:node,createDocumentFragment:node,querySelector(){return null},querySelectorAll(){return []}},$:key=>{if(!nodes.has(key))nodes.set(key,node());return nodes.get(key)},pages:{},state:{view:'overview',documents:[]},purchasing:{},renderComparison(){},loadComparison(){},openProcurementComparison(){},render(){},showView(){},openPortfolio:async()=>{},showModalForm(){},loadAll:async()=>false,api:async()=>({unread_alerts:0}),launchJson:async()=>{},toast(){},modalAction(){},explicitMoneyBasis(){},esc:s=>String(s??'').replaceAll('<','&lt;'),refreshUI:{ready:false}};
+vm.createContext(context);
+vm.runInContext('const createQuote=()=>"legacy";',context);
+vm.runInContext(source,context); // catches assignment to const/runtime setup errors.
+assert.equal(context.pages.comparison[0],'Сравнение · Память цен');
+assert.ok(context.pages.lotcomparison);
+assert.ok(source.includes('project_id=${id}'));
+assert.ok(source.includes('data-memory-read'));
+assert.ok(source.includes('price_index_pct'));
+assert.ok(source.includes('source_document_id'));
+assert.ok(!source.includes('createQuote='));
+const graph=context.memoryGraph({item_name:'ФБС',specification:'B7.5',region:'Воронеж',currency:'RUB',unit:'шт',change_pct:'20',change_from:'2026-09-01',change_to:'2026-09-27',timeline:[{date:'2026-09-01',median:'100',count:2},{date:'2026-09-10',median:null,count:0},{date:'2026-09-27',median:'120',count:2}]});
+assert.ok(graph.includes('role="img"'));
+assert.ok(graph.includes('разрыв'));
+assert.ok(!graph.includes('NaN')&&!graph.includes('Infinity'));
+assert.ok(source.includes("$('#memoryResult').querySelectorAll('[data-memory-group]')"));
+assert.ok(source.includes('data-portfolio-memory-graph'));
+assert.ok(source.includes('portfolioMemoryEpoch'));
+assert.ok(source.includes('await refreshMemoryNotice()'));
+assert.ok(context.memoryGraph({timeline:[{median:'1e999',date:'2026-09-01'}]}).includes('диапазон графика'));
+console.log('price memory UI: independent global/lot views, const safety, history chart, project scope, source links and alerts PASS');
+;(async()=>{
+ let posts=0,html='';
+ context.api=async url=>url.endsWith('/quotes')?[{id:2,supplier_name:'Тест'}]:{id:1,status:'ordered'};
+ context.launchJson=async()=>{posts++};
+ context.procurementDecisionControls=lot=>lot.status==='ordered'?'Заказ уже зафиксирован':'Выбрать поставщика';
+ context.$=()=>({insertAdjacentHTML(_position,value){html+=value}});
+ await context.openProcurementComparison(1);
+ assert.equal(posts,0);assert.ok(html.includes('Заказ уже зафиксирован'));assert.ok(!html.includes('Выбрать поставщика'));
+ console.log('final comparison override preserves ordered guard PASS');
+})().catch(error=>{console.error(error);process.exitCode=1});

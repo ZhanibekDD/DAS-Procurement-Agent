@@ -145,13 +145,21 @@ def introspect(settings, token: str) -> dict:
                 or not isinstance(result["username"], str) or not 1 <= len(result["username"]) <= 150
                 or not isinstance(result["email"], str) or len(result["email"]) > 320):
             raise ValueError
+        # Role is part of the mandatory server-to-server contract. An older
+        # authority without it is incompatible, not proof of a staff role.
+        # Keep SSO disabled and use the isolated local login until the provider
+        # explicitly supplies both positive and negative entitlements.
+        access_admin = result["access_admin"]
+        if type(access_admin) is not bool:
+            raise ValueError
     except (ValueError, KeyError, TypeError, AttributeError):
         raise SSOError(503) from None
     if "procurement" not in modules:
         raise SSOError(403)
     token, expires = _access_token(result)
     return {"sub": subject, "username": result["username"], "email": result["email"], "modules": modules,
-        "read_only": result["read_only"], "epoch": result["epoch"], "token": token, "expires": expires}
+        "read_only": result["read_only"], "epoch": result["epoch"], "token": token, "expires": expires,
+        "role": "admin" if access_admin and not result["read_only"] else "staff"}
 
 
 def complete(settings, state_cookie: str, code: str, state: str) -> dict:

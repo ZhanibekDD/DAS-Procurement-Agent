@@ -1,0 +1,515 @@
+"""Real DB/SMTP/HTTP regressions for lot-bound purchasing and append-only prices."""
+import hashlib
+import io
+import json
+from concurrent.futures import ThreadPoolExecutor
+from email.message import EmailMessage
+
+import pytest
+from openpyxl import Workbook
+from pydantic import ValidationError
+
+from procurement.catalog import Catalog, ALIASES, workbook_rows
+from procurement.document_viewer import office_html
+from procurement.models import CampaignCreate, LotCreate, SupplierCreate
+from procurement.procurement_flow import ProcurementFlow, lot_snapshot, validate_message
+from procurement.service import ConflictError
+from procurement.table_ingest import read_table
+from procurement.upload_io import upload_request
+from test_launch_workflow import workflow, project, lot_payload, FIXTURES
+from test_launch_http import http_boundary
+from test_launch_mail import smtp_env
+from test_sso_adapter import login, headers, ALICE, BOB
+from smtp_capture import CaptureSMTP
+
+FBS=[('ФБС 24.4.6','218'),('ФБС 12.4.6','95'),('ФБС 9.4.6','128')]
+
+
+def fbs(service):
+    pr=project(service)
+    data=lot_payload(pr['id']);data['title']='Блоки ФБС'
+    data['items']=[{'name':name,'quantity':qty,'unit':'шт'} for name,qty in FBS]
+    lot=service.create_lot(LotCreate(**data))
+    supplier=service.create_supplier(SupplierCreate(name='ТЕСТ ФБС',email='fbs@example.test',region='Воронеж'))
+    return lot,supplier
+
+
+def campaign(service,lot,supplier):
+    flow=ProcurementFlow(service)
+    data=CampaignCreate(supplier_ids=[supplier['id']],item_ids=[r['id'] for r in lot['items']])
+    p=flow.preview(lot['id'],data)
+    data=data.model_copy(update={'snapshot_sha256':p['snapshot_sha256'],'preview_sha256':p['preview_sha256']})
+    return p,service.create_campaign(lot['id'],data)
+
+
+def test_fbs_exact_preview_smtp_and_idempotency(workflow,monkeypatch):
+    db,s,w=workflow;lot,supplier=fbs(s);p,c=campaign(s,lot,supplier)
+    assert not p['approval_required']
+    assert [(i['name'],i['quantity']) for i in p['items']]==FBS
+    m=c['messages'][0];s.approve_message(m['id'],'staff-a')
+    with CaptureSMTP() as smtp:
+        smtp_env(monkeypatch,smtp)
+        assert w.send(m['id'],True)['status']=='sent'
+        assert w.send(m['id'],True)['duplicate']
+        assert len(smtp.messages)==1
+        text=smtp.messages[0].get_body(preferencelist=('plain',)).get_content()
+        for name,qty in FBS:assert f'{name}: {qty} шт' in text
+        assert 'ПБ' not in text
+    assert s.get_lot(lot['id'])['status']=='rfq_sent'
+
+
+@pytest.mark.parametrize('tamper',['quantity','name','lot','body','recipient','attachment'])
+def test_changed_snapshot_fail_closed_before_smtp(workflow,monkeypatch,tamper):
+    db,s,w=workflow;lot,supplier=fbs(s);_,c=campaign(s,lot,supplier);m=c['messages'][0]
+    s.approve_message(m['id'],'staff-a')
+    with db.connection() as conn:
+        if tamper in {'quantity','name'}:
+            column=tamper;value='219' if tamper=='quantity' else 'ПБ 63.12'
+            conn.execute(f'UPDATE lot_items SET {column}=? WHERE id=?',(value,lot['items'][0]['id']))
+        elif tamper=='lot':conn.execute("UPDATE lots SET delivery_address='чужой адрес' WHERE id=?",(lot['id'],))
+        elif tamper in {'body','recipient'}:conn.execute(f'UPDATE outbox_messages SET {tamper}=? WHERE id=?',('ПБ' if tamper=='body' else 'other@example.test',m['id']))
+        else:
+            doc=s.register_source_document(filename='items.xlsx',content=(FIXTURES/'items.xlsx').read_bytes(),document_type='project_section')
+            conn.execute('INSERT INTO outbox_attachments VALUES (?,?,?,?,?)',(m['id'],doc['id'],doc['filename'],doc['sha256'],doc['size_bytes']))
+    with CaptureSMTP() as smtp:
+        smtp_env(monkeypatch,smtp)
+        with pytest.raises(ConflictError):w.send(m['id'],True)
+        assert not smtp.messages
+    assert not db.all('SELECT * FROM mail_deliveries')
+
+
+def test_foreign_items_wrong_fbs_quantity_and_stale_preview(workflow):
+    db,s,w=workflow;lot,supplier=fbs(s)
+    other=s.create_lot(LotCreate(**lot_payload(lot['project_id'])))
+    with pytest.raises(ConflictError):ProcurementFlow(s).preview(lot['id'],CampaignCreate(supplier_ids=[supplier['id']],item_ids=[other['items'][0]['id']]))
+    p=ProcurementFlow(s).preview(lot['id'],CampaignCreate(supplier_ids=[supplier['id']]))
+    with db.connection() as conn:conn.execute("UPDATE suppliers SET email='changed@example.test' WHERE id=?",(supplier['id'],))
+    with pytest.raises(ConflictError):s.create_campaign(lot['id'],CampaignCreate(supplier_ids=[supplier['id']],preview_sha256=p['preview_sha256']))
+    with db.connection() as conn:conn.execute("UPDATE lot_items SET quantity='219' WHERE id=?",(lot['items'][0]['id'],))
+    with pytest.raises(ConflictError):ProcurementFlow(s).preview(lot['id'],CampaignCreate(supplier_ids=[supplier['id']]))
+    assert not db.all('SELECT * FROM campaigns')
+
+
+def test_legacy_rows_retained_explicit_review_backfills_only_draft(workflow):
+    db,s,w=workflow;lot,supplier=fbs(s);p,c=campaign(s,lot,supplier)
+    before=db.all('SELECT * FROM outbox_messages')
+    with db.connection() as conn:
+        conn.execute('DELETE FROM rfq_message_snapshots');conn.execute('DELETE FROM rfq_snapshots')
+    db.initialize();assert db.all('SELECT * FROM outbox_messages')==before
+    with pytest.raises(ConflictError):s.create_campaign(lot['id'],CampaignCreate(supplier_ids=[supplier['id']]))
+    _,reviewed=campaign(s,lot,supplier);assert reviewed['id']==c['id']
+    assert db.all('SELECT * FROM outbox_messages')==before
+    with db.connection() as conn:validate_message(conn,s._outbox_context(conn,c['messages'][0]['id']))
+    assert db.one('PRAGMA quick_check')['quick_check']=='ok'
+
+
+@pytest.mark.parametrize('field', ['item_ids','supplier_ids'])
+@pytest.mark.parametrize('value',[True,0,-1,'2'])
+def test_immutable_ids_are_strict(field,value):
+    with pytest.raises(ValidationError):CampaignCreate(**{'supplier_ids':[1],field:[value]})
+
+
+def price_csv(supplier='Поставщик A',email='a@example.test',price='112',date='2020-01-01',vat='с НДС',until='2099-01-01'):
+    keys=list(ALIASES)
+    row=dict(item_name='ФБС 24.4.6',specification='бетон B7.5',category='ФБС',unit='шт',unit_price=price,currency='RUB',vat=vat,delivery='доставка включена',region='Воронежская область',minimum_batch='10',price_date=date,valid_until=until,supplier_name=supplier,email=email)
+    return (';'.join(keys)+'\n'+';'.join(row.get(k,'') for k in keys)+'\n').encode()
+
+
+def import_price(s,w,raw,filename='price.csv'):
+    doc=s.register_source_document(filename=filename,content=raw,document_type='price_list')
+    cat=Catalog(s,w);p=cat.price_preview(doc,read_table(raw,filename));assert not p['errors'],p
+    return cat,doc,p,cat.apply_prices(p['preview_id'],True)
+
+
+def test_prices_exact_dedupe_history_median_not_reliability(workflow):
+    db,s,w=workflow
+    cat,doc,p,r=import_price(s,w,price_csv());assert r['added']==1
+    assert cat.apply_prices(p['preview_id'],True)==r
+    rating=s.list_suppliers()[0]['rating']
+    import_price(s,w,price_csv('Поставщик B','b@example.test','88'))
+    prices=cat.prices('ФБС','B7.5');assert len(prices)==2
+    assert {p['price_index_pct'] for p in prices}=={12.0,-12.0}
+    assert all(p['market_median']=='100' for p in prices)
+    import_price(s,w,price_csv(price='124',date='2020-01-02'))
+    assert len(s.list_suppliers())==2 and s.list_suppliers()[0]['rating']==rating
+    history=cat.prices();assert len(history)==3 and sum(p['current'] for p in history)==2
+    assert db.one('SELECT unit_price FROM supplier_catalog_prices WHERE id=1')['unit_price']=='112'
+    assert not cat.prices('ПБ')
+
+
+def test_unknown_basis_does_not_duplicate_current_or_fake_market(workflow):
+    db,s,w=workflow
+    cat,_,_,_=import_price(s,w,price_csv(vat='',until=''))
+    import_price(s,w,price_csv(price='125',date='2020-01-02',vat='',until=''))
+    rows=cat.prices();assert sum(r['current'] for r in rows)==1
+    assert all(r['market_median'] is None for r in rows)
+
+
+@pytest.mark.parametrize('unknown',['vat','minimum_batch','delivery'])
+def test_market_index_not_computed_for_explicit_unknown_conditions(workflow,unknown):
+    db,s,w=workflow
+    for name,email in [('Поставщик A','a@example.test'),('Поставщик B','b@example.test')]:
+        raw=price_csv(name,email).decode()
+        lines=raw.splitlines();keys=lines[0].split(';');values=lines[1].split(';')
+        values[keys.index(unknown)]='' if unknown=='minimum_batch' else 'не определено'
+        cat,_,_,_=import_price(s,w,(lines[0]+'\n'+';'.join(values)+'\n').encode())
+    assert all(r['price_index_pct'] is None for r in cat.prices())
+
+
+def test_price_reimport_changed_payload_corrupt_source_and_cross_owner(workflow):
+    from procurement.identity import authenticated_actor
+    db,s,w=workflow;cat,doc,p,_=import_price(s,w,price_csv())
+    other=cat.price_preview(doc,read_table(price_csv(price='999'),'price.csv'))
+    with pytest.raises(ConflictError):cat.apply_prices(other['preview_id'],True)
+    assert db.one('SELECT count(*) n FROM supplier_catalog_prices')['n']==1
+    token=authenticated_actor.set('other-user')
+    try:
+        with pytest.raises(Exception):cat.apply_prices(p['preview_id'],True)
+    finally:authenticated_actor.reset(token)
+
+
+def test_catalog_xlsx_exact_conflicting_identifiers_and_parallel_import(workflow):
+    from procurement.identity import authenticated_actor
+    db,s,w=workflow
+    b=Workbook();ws=b.active;ws.title='Прайс'
+    for line in price_csv().decode().strip().splitlines():ws.append(line.split(';'))
+    stream=io.BytesIO();b.save(stream)
+    cat,doc,p,_=import_price(s,w,stream.getvalue(),'price.xlsx')
+    assert cat.prices()[0]['source_sheet']=='Прайс'
+    raw=price_csv(price='100',date='2020-01-02')
+    doc=s.register_source_document(filename='new.csv',content=raw,document_type='price_list')
+    preview=cat.price_preview(doc,read_table(raw,'new.csv'))
+    def apply(_):
+        token=authenticated_actor.set('staff-a')
+        try:return cat.apply_prices(preview['preview_id'],True)
+        finally:authenticated_actor.reset(token)
+    with ThreadPoolExecutor(max_workers=8) as pool:results=list(pool.map(apply,range(8)))
+    assert all(r==results[0] for r in results) and results[0]['added']==1
+    assert db.one('SELECT count(*) n FROM supplier_catalog_prices')['n']==2
+    s.create_supplier(SupplierCreate(name='Другая организация',tax_id='7707083893',region='Воронеж'))
+    raw=price_csv().decode().replace(';;a@example.test',';7707083893;a@example.test').encode()
+    doc=s.register_source_document(filename='conflict.csv',content=raw,document_type='price_list')
+    preview=cat.price_preview(doc,read_table(raw,'conflict.csv'))
+    with pytest.raises(ConflictError):cat.apply_prices(preview['preview_id'],True)
+
+
+def test_pdf_catalog_requires_human_review_reuses_strict_validator(workflow):
+    from types import SimpleNamespace
+    db,s,w=workflow
+    doc=s.register_source_document(filename='scan.pdf',content=(FIXTURES/'russian_scan.pdf').read_bytes(),document_type='price_list')
+    extracted=SimpleNamespace(items=[],errors=['Нужна ручная проверка'],supplier_region='',supplier_name='',supplier_tax_id='',supplier_email='',supplier_phone='',document_date='',valid_until='')
+    cat=Catalog(s,w);p=cat.extracted_price_preview(doc,extracted)
+    assert p['requires_review'] and not db.all('SELECT * FROM supplier_catalog_prices')
+    row={k:price_csv().decode().strip().splitlines()[1].split(';')[n] for n,k in enumerate(ALIASES)}
+    checked=cat.review_pdf(p['preview_id'],[row]);assert not checked['errors']
+    assert cat.apply_prices(checked['preview_id'],True)['added']==1
+    assert cat.prices()[0]['source_document_id']==doc['id']
+
+
+def test_price_dates_not_import_order_and_future_prices_not_current(workflow):
+    db,s,w=workflow
+    cat,_,_,_=import_price(s,w,price_csv(price='200',date='2020-01-02'))
+    import_price(s,w,price_csv(price='100',date='2020-01-01'))
+    import_price(s,w,price_csv(price='999',date='2099-01-01'))
+    rows=cat.prices()
+    assert [r['unit_price'] for r in rows if r['current']]==['200']
+
+
+def test_material_search_before_history_limit_and_russian_normalization(workflow):
+    db,s,w=workflow;cat,_,_,_=import_price(s,w,price_csv())
+    fields=[r['name'] for r in db.all('PRAGMA table_info(supplier_catalog_prices)') if r['name']!='id']
+    previous=db.one('SELECT * FROM supplier_catalog_prices WHERE id=1')
+    values=[tuple((n if k=='source_row' else 'Другой материал' if k=='item_name' else 'Другая категория' if k=='category' else previous[k]) for k in fields) for n in range(3,5004)]
+    with db.connection() as conn:conn.executemany('INSERT INTO supplier_catalog_prices('+','.join(fields)+') VALUES ('+','.join('?' for _ in fields)+')',values)
+    assert len(cat.prices('  фбс   24.4.6 ','бетон b7.5'))==1
+
+
+def test_fbs_custom_template_wrong_content_blocked(workflow):
+    from procurement.models import TemplateUpsert
+    db,s,w=workflow;lot,supplier=fbs(s)
+    s.upsert_template('wrong',TemplateUpsert(name='Неверный шаблон',subject='ФБС',body='Плиты ПБ: 30 шт'))
+    with pytest.raises(ConflictError):ProcurementFlow(s).preview(lot['id'],CampaignCreate(template_code='wrong',supplier_ids=[supplier['id']]))
+    with pytest.raises(ConflictError):s.create_campaign(lot['id'],CampaignCreate(template_code='wrong',supplier_ids=[supplier['id']]))
+    assert not db.all('SELECT * FROM campaigns')
+
+
+def workbook():
+    b=Workbook();b.active.title='Итоги';b.active.append(['Материал','Количество','Статус','Источник'])
+    b.active.append(['ФБС','441','по ведомости','КР лист 14'])
+    for name,status in [('Исходные','по проекту'),('Спецификации','предварительно'),('Источники','не определено')]:
+        ws=b.create_sheet(name);ws.append(['Материал','Значение','Статус']);ws.append(['001230040500','0',status])
+    b['Спецификации'].append(['ФБС 24.4.6',218,'шт','КР лист 14'])
+    raw=io.BytesIO();b.save(raw);return raw.getvalue()
+
+
+def test_workbook_original_provenance_idempotent_and_safe_office_view(workflow):
+    db,s,w=workflow;pr=project(s);raw=workbook();rows=workbook_rows(raw,'calc.xlsx')
+    assert {r['status'] for r in rows}>={'по ведомости','по проекту','предварительно','не определено'}
+    doc=s.register_source_document(filename='calc.xlsx',content=raw,document_type='project_section',project_id=pr['id'])
+    cat=Catalog(s,w);assert not cat.import_workbook(doc,rows,True)['duplicate']
+    assert cat.import_workbook(doc,rows,True)['duplicate']
+    p=cat.portfolio(pr['id']);assert len(p['workbook_rows'])==len(rows)
+    assert all(r['document_id']==doc['id'] and r['sha256']==hashlib.sha256(raw).hexdigest() for r in p['workbook_rows'])
+    assert w.document_file(doc).path.read_bytes()==raw
+    assert '001230040500' in office_html(raw,'calc.xlsx','Исходные')
+    assert 'ФБС' in office_html(raw,'calc.xlsx','Спецификации')
+
+
+def test_real_http_preview_send_inline_policy_deny_and_wrong_lot(http_boundary,monkeypatch):
+    client,a,settings,db=http_boundary;u=login(client,a);h=headers(u)
+    import procurement.app as app
+    s=app.service;lot,supplier=fbs(s);path=f"/api/procurement/lots/{lot['id']}/preview"
+    data={'supplier_ids':[supplier['id']],'item_ids':[r['id'] for r in lot['items']]}
+    p=client.post(path,headers=h,json=data).json();assert p['lot_id']==lot['id']
+    c=client.post(f"/api/lots/{lot['id']}/campaigns",headers=h,json={**data,'snapshot_sha256':p['snapshot_sha256'],'preview_sha256':p['preview_sha256']}).json()
+    mid=c['messages'][0]['id'];url=f'/api/procurement/outbox/{mid}/send'
+    assert client.post(url,headers=h,json={'lot_id':999,'snapshot_sha256':p['snapshot_sha256'],'confirmed':True}).status_code==409
+    with CaptureSMTP() as smtp:
+        smtp_env(monkeypatch,smtp)
+        r=client.post(url,headers=h,json={'lot_id':lot['id'],'snapshot_sha256':p['snapshot_sha256'],'confirmed':True})
+        assert r.status_code==200,r.text
+        assert len(smtp.messages)==1
+    assert db.one('SELECT actor FROM mail_deliveries')['actor']==ALICE
+    assert client.put('/api/procurement/policy',headers=h,json={'required_roles':['staff']}).status_code==403
+    with db.connection() as conn:conn.execute("INSERT INTO procurement_policy VALUES(1,NULL,'RUB','[\"staff\"]','test')")
+    lot2=s.create_lot(LotCreate(**lot_payload(lot['project_id'])))
+    p2,c2=campaign(s,lot2,supplier);mid2=c2['messages'][0]['id']
+    assert p2['approval_required']
+    assert client.post(f'/api/procurement/outbox/{mid2}/send',headers=h,json={'lot_id':lot2['id'],'snapshot_sha256':p2['snapshot_sha256'],'confirmed':True}).status_code==409
+    assert client.post(f'/api/procurement/outbox/{mid2}/approve',headers=h,json={'confirmed':True}).status_code==403
+    assert client.post(f'/api/outbox/{mid2}/approve',headers=h,json={'approved_by':'forged admin'}).status_code==409
+
+
+def test_ordered_decision_is_immutable_and_same_order_is_idempotent(http_boundary):
+    from procurement.models import QuoteCreate
+    import procurement.app as app
+    client,a,settings,db=http_boundary;u=login(client,a);h=headers(u)
+    lot,supplier=fbs(app.service)
+    quotes=[app.service.add_quote(lot['id'],QuoteCreate(supplier_id=supplier['id'],currency='RUB',vat_included=True,
+            items=[{'lot_item_id':item['id'],'unit_price':price} for item in lot['items']])) for price in (100,120)]
+    path=f"/api/procurement/lots/{lot['id']}/decision"
+    chosen={'quote_id':quotes[0]['id']}
+    assert client.post(path,headers=h,json={**chosen,'stage':'awarded'}).status_code==200
+    assert client.post(path,headers=h,json={**chosen,'stage':'ordered'}).status_code==200
+    original=db.one('SELECT * FROM procurement_decisions WHERE lot_id=?',(lot['id'],))
+    audit=db.all("SELECT * FROM audit_log WHERE action LIKE 'procurement_%'")
+    for qid,stage in ((quotes[0]['id'],'awarded'),(quotes[1]['id'],'awarded'),(quotes[1]['id'],'ordered')):
+        response=client.post(path,headers=h,json={'quote_id':qid,'stage':stage})
+        assert response.status_code==409 and 'Заказ уже зафиксирован' in response.json()['detail']
+    assert client.post(path,headers=h,json={**chosen,'stage':'ordered'}).status_code==200
+    assert db.one('SELECT * FROM procurement_decisions WHERE lot_id=?',(lot['id'],))==original
+    assert db.all("SELECT * FROM audit_log WHERE action LIKE 'procurement_%'")==audit
+    assert app.service.get_lot(lot['id'])['status']=='ordered'
+    # Late price intake and a new RFQ do not reopen human decisions.
+    app.service.add_quote(lot['id'],QuoteCreate(supplier_id=supplier['id'],currency='RUB',vat_included=True,
+        items=[{'lot_item_id':item['id'],'unit_price':90} for item in lot['items']]))
+    campaign(app.service,lot,supplier)
+    for automatic in ('rfq_draft','rfq_sent','quotes_received','comparison'):
+        with db.connection() as conn:
+            app.service._set_lot_progress(conn,lot['id'],automatic)
+        assert app.service.get_lot(lot['id'])['status']=='ordered'
+        assert db.one('SELECT * FROM procurement_decisions WHERE lot_id=?',(lot['id'],))==original
+
+
+@pytest.mark.parametrize('kind,expected',[('partial',True),('complete',False),('short_quantity',True),('noncompliant',True),('delivery_over_threshold',True)])
+def test_amount_threshold_requires_complete_compliant_quantity_coverage(workflow,kind,expected):
+    from procurement.models import QuoteCreate
+    db,s,w=workflow;lot,supplier=fbs(s)
+    items=[{'lot_item_id':item['id'],'unit_price':100} for item in lot['items']]
+    if kind=='partial':items=items[:1]
+    if kind=='short_quantity':items[0]['offered_quantity']=1
+    if kind=='noncompliant':items[0]['compliant']=False
+    s.add_quote(lot['id'],QuoteCreate(supplier_id=supplier['id'],currency='RUB',vat_included=True,items=items,
+        delivery_cost=60000 if kind=='delivery_over_threshold' else 0))
+    with db.connection() as conn:
+        conn.execute("INSERT INTO procurement_policy VALUES(1,'100000','RUB','[]','test')")
+        assert ProcurementFlow(s).approval_required(conn,lot['id'],'staff') is expected
+
+
+@pytest.mark.parametrize('restriction',['policy','partial_quote','noncompliant','quantity'])
+def test_current_rule_rejects_stale_staff_approval_until_admin_reconfirms(workflow,monkeypatch,restriction):
+    from procurement.models import QuoteCreate
+    db,s,w=workflow;lot,supplier=fbs(s)
+    items=[{'lot_item_id':i['id'],'unit_price':100} for i in lot['items']]
+    s.add_quote(lot['id'],QuoteCreate(supplier_id=supplier['id'],currency='RUB',vat_included=True,items=items))
+    with db.connection() as conn:conn.execute("INSERT INTO procurement_policy VALUES(1,'100000','RUB','[]','before')")
+    p,c=campaign(s,lot,supplier);mid=c['messages'][0]['id']
+    s.approve_message(mid,'staff-a')
+    if restriction=='policy':
+        with db.connection() as conn:conn.execute("UPDATE procurement_policy SET required_roles_json='[\"staff\"]',updated_at='after'")
+    else:
+        if restriction=='partial_quote':items=items[:1]
+        if restriction=='noncompliant':items[0]['compliant']=False
+        if restriction=='quantity':items[0]['offered_quantity']=1
+        s.add_quote(lot['id'],QuoteCreate(supplier_id=supplier['id'],currency='RUB',vat_included=True,items=items))
+    with CaptureSMTP() as smtp:
+        smtp_env(monkeypatch,smtp)
+        with pytest.raises(ConflictError,match='администратором'):w.send(mid,True)
+        assert not smtp.messages and not db.one('SELECT * FROM mail_deliveries WHERE message_id=?',(mid,))
+        s.approve_message(mid,'admin',admin_policy_approval=True)
+        # A subsequent policy change invalidates even the admin proof.
+        with db.connection() as conn:conn.execute("UPDATE procurement_policy SET updated_at='later'")
+        with pytest.raises(ConflictError,match='администратором'):w.send(mid,True)
+        s.approve_message(mid,'admin',admin_policy_approval=True)
+        assert w.send(mid,True)['accepted_by_smtp']
+        assert len(smtp.messages)==1
+
+
+def test_final_smtp_guard_uses_verified_current_admin_role(workflow,monkeypatch):
+    from procurement.identity import authenticated_role
+    db,s,w=workflow;lot,supplier=fbs(s);p,c=campaign(s,lot,supplier);mid=c['messages'][0]['id']
+    s.approve_message(mid,'staff-a')
+    with db.connection() as conn:
+        conn.execute("INSERT INTO procurement_policy VALUES(1,NULL,'RUB','[\"admin\"]','current')")
+    with CaptureSMTP() as smtp:
+        smtp_env(monkeypatch,smtp)
+        context=authenticated_role.set('admin')
+        try:
+            with pytest.raises(ConflictError,match='администратором'):w.send(mid,True)
+            assert not smtp.messages
+            s.approve_message(mid,'admin',admin_policy_approval=True)
+            assert w.send(mid,True)['accepted_by_smtp']
+            assert len(smtp.messages)==1
+        finally:
+            authenticated_role.reset(context)
+
+
+@pytest.mark.parametrize('kind',['csv','xlsx','pdf','mail'])
+def test_global_price_import_reuses_provided_owned_bytes_without_reassigning_acl(http_boundary,monkeypatch,kind):
+    import procurement.app as app
+    from procurement.launch_workflow import LaunchWorkflow
+    client,a,settings,db=http_boundary;u=login(client,a);h=headers(u)
+    pr=project(app.service);supplier=app.service.create_supplier(SupplierCreate(name='Владелец исходника',region='Воронеж'))
+    raw=price_csv();name='owned.csv'
+    if kind=='xlsx':
+        import csv
+        book=Workbook()
+        for row in csv.reader(io.StringIO(raw.decode()),delimiter=';'):book.active.append(row)
+        stream=io.BytesIO();book.save(stream);raw=stream.getvalue();name='owned.xlsx'
+    if kind=='pdf':
+        raw=(FIXTURES/'russian_scan.pdf').read_bytes();name='owned.pdf'
+        # Ownership test does not replace the separate actual Linux OCR gate.
+        from types import SimpleNamespace
+        monkeypatch.setattr('procurement.imports.extract_document',lambda *args:SimpleNamespace(items=[],errors=['Прайс требует проверки']))
+    doc=app.service.register_source_document(filename=name,content=raw,document_type='price_list',project_id=pr['id'],supplier_id=supplier['id'])
+    original=db.one('SELECT * FROM source_documents WHERE id=?',(doc['id'],))
+    if kind=='mail':
+        email=EmailMessage();email['From']='controlled@example.test';email.set_content('Тест прайса')
+        email.add_attachment(raw,maintype='text',subtype='csv',filename=name)
+        response=client.post('/api/procurement/catalog/incoming-mail',headers=h,files={'file':('owned.eml',email.as_bytes())})
+        assert response.status_code==200,response.text
+        preview=response.json()['previews'][0]
+    else:
+        response=client.post('/api/procurement/catalog/preview',headers=h,files={'file':(name,raw)})
+        assert response.status_code==200,response.text
+        preview=response.json()
+    assert preview['document_id']==doc['id']
+    assert db.one('SELECT * FROM source_documents WHERE id=?',(doc['id'],))==original
+    assert LaunchWorkflow(app.service).document_file(doc).path.read_bytes()==raw
+
+
+@pytest.mark.parametrize('supplier_name,email,allowed',[
+    ('Поставщик A','a@example.test',True),
+    ('Поставщик B','b@example.test',False),
+    ('Поставщик A','b@example.test',False),
+])
+def test_owned_price_source_cannot_be_assigned_to_another_supplier(workflow,supplier_name,email,allowed):
+    db,s,w=workflow
+    owner=s.create_supplier(SupplierCreate(name='Поставщик A',email='a@example.test',region='Воронежская область'))
+    raw=price_csv(supplier=supplier_name,email=email)
+    doc=s.register_source_document(filename='owned-price.csv',content=raw,document_type='price_list',supplier_id=owner['id'])
+    catalog=Catalog(s,w);preview=catalog.price_preview(doc,read_table(raw,'owned-price.csv'))
+    assert not preview['errors']
+    if allowed:
+        assert catalog.apply_prices(preview['preview_id'],True)['added']==1
+        assert db.one('SELECT supplier_id FROM supplier_catalog_prices')['supplier_id']==owner['id']
+    else:
+        with pytest.raises(ConflictError,match='владельцем исходного прайса'):
+            catalog.apply_prices(preview['preview_id'],True)
+        assert not db.one('SELECT * FROM supplier_catalog_prices')
+        if email!='a@example.test':assert not db.one('SELECT * FROM suppliers WHERE email=?',(email,))
+    assert db.one('SELECT supplier_id FROM source_documents WHERE id=?',(doc['id'],))['supplier_id']==owner['id']
+
+
+def test_http_mail_catalog_workbook_views_acl_range(http_boundary):
+    client,a,settings,db=http_boundary;u=login(client,a);h=headers(u)
+    mail=EmailMessage();mail['From']='untrusted@example.test';mail['To']='test@example.test';mail.set_content('Прайс')
+    mail.add_attachment(price_csv(),maintype='text',subtype='csv',filename='price.csv')
+    r=client.post('/api/procurement/catalog/incoming-mail',headers=h,files={'file':('mail.eml',mail.as_bytes())})
+    assert r.status_code==200,r.text
+    p=r.json()['previews'][0]
+    assert client.post(f"/api/procurement/catalog/{p['preview_id']}/apply",headers=h,json={'confirmed':True}).status_code==200
+    assert client.get('/api/procurement/catalog?q=ФБС').json()[0]['supplier_name']=='Поставщик A'
+    pr=client.post('/api/projects',headers=h,json={'name':'ТЕСТ','region':'Воронеж','delivery_address':'Тест'}).json()
+    raw=workbook();url=f"/api/procurement/projects/{pr['id']}/workbook"
+    p=client.post(url,headers=h,files={'file':('calc.xlsx',raw)}).json()
+    assert client.post(url,headers=h,data={'confirmed':'true','expected_sha256':'0'*64},files={'file':('calc.xlsx',raw)}).status_code==409
+    r=client.post(url,headers=h,data={'confirmed':'true','expected_sha256':p['sha256']},files={'file':('calc.xlsx',raw)})
+    assert r.status_code==200,r.text
+    did=r.json()['document_id'];view=f'/api/procurement/documents/{did}/view?sheet=Исходные'
+    assert '001230040500' in client.get(view).text and client.head(view).status_code==200
+    dl=f'/api/launch/documents/{did}/download'
+    assert client.get(dl,headers={'Range':'bytes=0-15'}).content==raw[:16]
+    login(client,a,BOB);a.users[BOB]['modules']=[]
+    for method in ['GET','HEAD']:
+        assert client.request(method,view,headers={'Range':'bytes=0-15'}).status_code==403
+    client.cookies.clear()
+    assert client.get(view,headers={'X-OpenWebUI-User-Id':ALICE}).status_code==401
+
+
+def test_native_pdf_view_not_plugin_sandboxed_office_is_sandboxed(http_boundary):
+    client,a,settings,db=http_boundary;u=login(client,a);h=headers(u)
+    for name,data,native in [('scan.pdf',(FIXTURES/'russian_scan.pdf').read_bytes(),True),('calc.xlsx',workbook(),False),('price.csv',price_csv(),False)]:
+        r=client.post('/api/documents',headers=h,params={'document_type':'project_section'},files={'file':(name,data)})
+        assert r.status_code==201,r.text
+        path=f"/api/procurement/documents/{r.json()['id']}/view"
+        r=client.get(path);assert r.status_code==200
+        assert "frame-ancestors 'self'" in r.headers['content-security-policy']
+        assert ('sandbox' not in r.headers['content-security-policy']) is native
+        if native:assert r.headers['content-type']=='application/pdf' and r.content==data
+        else:assert '<table>' in r.text
+
+
+@pytest.mark.parametrize('filename,payload_format,accepted,mime',[
+    ('scan.png','PNG',True,'image/png'),
+    ('scan.jpg','JPEG',True,'image/jpeg'),
+    ('scan.jpeg','JPEG',True,'image/jpeg'),
+    ('scan.png','JPEG',False,None),
+    ('scan.jpg','PNG',False,None),
+    ('scan.jpeg','PNG',False,None),
+])
+def test_image_upload_requires_format_matching_extension_and_inline_mime(
+    http_boundary,filename,payload_format,accepted,mime
+):
+    from PIL import Image
+    client,a,settings,db=http_boundary;u=login(client,a);h=headers(u)
+    output=io.BytesIO();Image.new('RGB',(3,2),(10,20,30)).save(output,format=payload_format)
+    data=output.getvalue()
+    response=client.post('/api/documents',headers=h,params={'document_type':'project_section'},
+                         files={'file':(filename,data)})
+    if not accepted:
+        assert response.status_code==422
+        assert 'Недопустимое' in response.json()['detail']
+        assert not db.one('SELECT id FROM source_documents WHERE sha256=?',(hashlib.sha256(data).hexdigest(),))
+        return
+    assert response.status_code==201,response.text
+    view=f"/api/procurement/documents/{response.json()['id']}/view"
+    opened=client.get(view)
+    assert opened.status_code==200 and opened.content==data
+    assert opened.headers['content-type']==mime
+    assert opened.headers['x-content-type-options']=='nosniff'
+
+
+@pytest.mark.parametrize('path',['/api/procurement/catalog/preview','/api/procurement/catalog/incoming-mail','/api/procurement/projects/2/workbook'])
+def test_new_uploads_share_streaming_body_limit(path):
+    assert upload_request({'type':'http','method':'POST','path':path})
+
+
+def test_docx_preview_escapes_markup_and_keeps_original():
+    import zipfile
+    xml=b'<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>&lt;script&gt;001230040500&lt;/script&gt;</w:t></w:r></w:p></w:body></w:document>'
+    raw=io.BytesIO()
+    with zipfile.ZipFile(raw,'w') as z:z.writestr('word/document.xml',xml)
+    data=raw.getvalue();digest=hashlib.sha256(data).hexdigest()
+    text=office_html(data,'doc.docx');assert '<script>' not in text and '&lt;script&gt;001230040500' in text
+    assert hashlib.sha256(data).hexdigest()==digest
