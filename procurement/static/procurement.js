@@ -5,7 +5,7 @@ function procurementMailOutcome(outbox,campaign){
  const ids=(campaign?.messages||[]).map(m=>m.id);
  if(!ids.length)return {kind:'unknown',sent:0};
  const messages=ids.map(id=>outbox.find(m=>m.id===id));
- const sent=messages.filter(m=>m?.delivery?.status==='sent'||m?.status==='sent').length;
+ const sent=messages.filter(m=>m?.delivery?.status==='sent'&&m.delivery.accepted_at).length;
  if(messages.some(m=>!m||['unknown','queued','sending'].includes(m.delivery?.status)||['queued','sending'].includes(m.status)
    ||(m.status==='failed'&&!m.delivery)))return {kind:'unknown',sent};
  if(sent===ids.length)return {kind:'sent',sent};

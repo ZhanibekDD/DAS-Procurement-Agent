@@ -102,11 +102,16 @@ def event(db, conn, mid, name, **details):
 def journal(db, mid):
     delivery = db.one('SELECT status,updated_at FROM mail_deliveries WHERE message_id=?', (mid,))
     if not delivery:
+        old = db.one('SELECT status FROM outbox_messages WHERE id=?', (mid,))
+        if old and old['status'] == 'sent':
+            return {'status':'unknown','legacy':True,'retry_allowed':False,'events':[],
+                    'sent_copy_status':'unavailable','delivery_status':'unconfirmed',
+                    'warning':'Старый статус «Отправлен» не подтверждён журналом SMTP. Автоматический повтор заблокирован, чтобы не отправить дубликат.'}
         return None
     row = db.one('SELECT * FROM mail_receipts WHERE message_id=?', (mid,))
     if not row:
         # Legacy SMTP acceptance is known, but exact reply/MIME was not retained.
-        return {**delivery, 'legacy': True, 'sent_copy_status': 'unavailable',
+        return {**delivery, 'status':'unknown', 'legacy': True, 'sent_copy_status': 'unavailable',
                 'delivery_status': 'unconfirmed', 'retry_allowed': False,
                 'warning': COPY_WARNING if delivery['status'] == 'sent' else 'Исход старой отправки требует проверки',
                 'events': []}

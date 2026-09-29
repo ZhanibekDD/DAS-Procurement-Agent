@@ -227,8 +227,11 @@ class Catalog:
                 'delivery':'','region':result.supplier_region,'minimum_batch':'','price_date':result.document_date or '',
                 'valid_until':result.valid_until or '','supplier_name':result.supplier_name,'tax_id':result.supplier_tax_id,
                 'email':result.supplier_email,'phone':result.supplier_phone})
+        errors = list(result.errors)
+        if not rows:
+            errors.append('Позиции и цены не распознаны. Проверьте исходный файл или добавьте строки вручную; прайс пока не импортирован.')
         return self.launch.save_preview('price_catalog_pdf',{'document_id':doc['id'],'rows':rows,
-            'errors':result.errors,'requires_review':True,'source_filename':doc['filename']})
+            'errors':errors,'requires_review':True,'source_filename':doc['filename']})
 
     def review_pdf(self,pid,rows):
         with self.db.connection() as conn:

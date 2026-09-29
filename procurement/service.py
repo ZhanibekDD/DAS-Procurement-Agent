@@ -160,7 +160,9 @@ class ProcurementService:
 
     def create_lot(self, data: LotCreate) -> dict[str, Any]:
         project = self.get_project(data.project_id)
-        cluster = resolve_cluster(data.region, data.cluster or project["cluster"])
+        cluster = resolve_cluster(data.region, data.cluster or infer_cluster(data.region) or project["cluster"])
+        if data.currency != 'RUB':
+            raise ValueError('Новые закупки ведутся только в рублях (RUB)')
         if data.section_id is not None:
             section = self.db.one(
                 "SELECT id FROM project_sections WHERE id = ? AND project_id = ?",

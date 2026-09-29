@@ -454,6 +454,40 @@ def _extract_pdf_text(content: bytes) -> tuple[list[str], list[str]]:
         return [], [f'PDF parse error: {exc}']
 
 
+def _pdf_price(value: str, currency: str) -> str:
+    """Parse an explicit price cell, not arbitrary numbers in a PDF row."""
+    value = value.strip()
+    if currency == 'RUB':
+        value = re.sub(r'\s*(?:руб\.?|₽|RUB)\s*$', '', value, flags=re.I)
+    value = re.sub(r'[\s\u00a0\u202f]', '', value)
+    if re.fullmatch(r'\d{1,3}(?:,\d{3})+\.\d{2}', value):
+        value = value.replace(',', '')
+    elif re.fullmatch(r'\d{1,3}(?:\.\d{3})+,\d{2}', value):
+        value = value.replace('.', '')
+    return _decimal_price(value)
+
+
+def _price_table_header(table):
+    """Join adjacent header tiers by column; never absorb a priced data row."""
+    combined = []
+    for ri, row in enumerate(table[:3]):
+        cells = [str(c or '').strip() for c in (row or [])]
+        if not cells:
+            continue
+        if combined and len(cells) != len(combined):
+            break
+        if not combined:
+            combined = [''] * len(cells)
+        # A two-tier heading has empty/label cells, not a numeric price.
+        if ri and any(re.search(r'\d', c) for c in cells):
+            break
+        combined = [' '.join(filter(None, (a, b))) for a, b in zip(combined, cells)]
+        nc, pc = _col_index(combined, _NAME_COL_NAMES), _col_index(combined, _PRICE_COL_NAMES)
+        if nc is not None and pc is not None and nc != pc:
+            return ri, (nc, pc, _col_index(combined, _QTY_COL_NAMES), _col_index(combined, _UNIT_COL_NAMES))
+    return None
+
+
 def _extract_items_from_pdf_tables(
     content: bytes, currency: str, vat_included: bool
 ) -> tuple[list[ExtractedItem], bool]:
@@ -471,6 +505,7 @@ def _extract_items_from_pdf_tables(
     """
     items: list[ExtractedItem] = []
     has_tables = False  # True once pdfplumber finds any non-trivial table
+    continuation = None
     try:
         import pdfplumber
         import io as _io_plumb
@@ -480,32 +515,39 @@ def _extract_items_from_pdf_tables(
             for page_num, page in enumerate(pdf.pages, start=1):
                 if len(page.chars) > 100000:
                     raise ValueError('PDF page complexity exceeds limits')
-                tables = page.extract_tables()
+                table_objects = page.find_tables()
+                tables = [t.extract() for t in table_objects]
                 page.close()
                 if len(tables) > 100:
                     raise ValueError('PDF page complexity exceeds limits')
-                for table in tables:
+                for table_index, table in enumerate(tables):
                     if not table or len(table) < 2:
                         continue
                     has_tables = True  # at least one real table found
-                    # Search first 3 rows for a header row with name + price cols
-                    name_col = qty_col = price_col = unit_col = None
-                    header_row_idx = None
-                    for ri, row in enumerate(table[:3]):
-                        if row is None:
+                    geometry = tuple(round(c.bbox[0], 1) for c in table_objects[table_index].columns)
+                    header = _price_table_header(table)
+                    if header:
+                        header_row_idx, columns = header
+                    elif (continuation and table_index == 0 and continuation[0] == page_num - 1
+                          and len(geometry) == len(continuation[1])
+                          and all(abs(a-b) <= 2 for a,b in zip(geometry,continuation[1]))):
+                        columns = continuation[2]
+                        nc, pc, _, _ = columns
+                        first = table[0]
+                        # Only a same-layout adjacent page beginning with an actual
+                        # priced row can inherit the already verified table header.
+                        try:
+                            assert len(first) == len(geometry) and first[nc]
+                            _pdf_price(str(first[pc] or ''), currency)
+                        except (ValueError, AssertionError, IndexError):
+                            continuation = None
                             continue
-                        headers = [str(c or '').strip() for c in row]
-                        nc = _col_index(headers, _NAME_COL_NAMES)
-                        pc = _col_index(headers, _PRICE_COL_NAMES)
-                        qc = _col_index(headers, _QTY_COL_NAMES)
-                        uc = _col_index(headers, _UNIT_COL_NAMES)
-                        if nc is not None and pc is not None:
-                            name_col, price_col = nc, pc
-                            qty_col, unit_col = qc, uc
-                            header_row_idx = ri
-                            break
-                    if header_row_idx is None:
-                        continue  # no recognised price-table header
+                        header_row_idx = -1
+                    else:
+                        continuation = None
+                        continue
+                    name_col, price_col, qty_col, unit_col = columns
+                    continuation = (page_num, geometry, columns)
                     for row_num, row in enumerate(
                         table[header_row_idx + 1:], start=header_row_idx + 2
                     ):
@@ -527,14 +569,7 @@ def _extract_items_from_pdf_tables(
                         if raw_name.isdigit():
                             continue
                         # Normalise price — remove thousands separators, convert comma to dot
-                        price_clean = (
-                            raw_price
-                            .replace(' ', '')
-                            .replace(' ', '')
-                            .replace(' ', '')
-                            .replace(',', '.')
-                        )
-                        price_clean = _decimal_price(price_clean)
+                        price_clean = _pdf_price(raw_price, currency)
                         raw_qty = ''
                         if qty_col is not None and qty_col < len(row):
                             raw_qty = str(row[qty_col] or '').strip()

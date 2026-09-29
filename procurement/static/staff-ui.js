@@ -24,7 +24,7 @@ badge = function(value) {
 
 function staffMailStatus(message) {
   const delivery = message.delivery;
-  if (delivery?.status === 'sent' && !delivery.accepted_at && !delivery.legacy)
+  if ((delivery?.status === 'sent' && !delivery.accepted_at) || (message.status === 'sent' && !delivery))
     return 'Результат отправки не подтверждён';
   return mailStatus[delivery?.status || message.status] || 'Результат отправки не подтверждён';
 }
@@ -44,8 +44,8 @@ mailJournal = function(message) {
   if (!delivery) return '';
   const files = delivery.attachments || message.attachments || [];
   return `<details><summary>Отправка: ${esc(staffMailStatus(message))}</summary>
-    <p>Получатель: ${esc(message.recipient)}<br>Время: ${esc(delivery.accepted_at || delivery.updated_at || 'ещё не отправлено')}<br>
-    Копия в «Отправленных»: ${delivery.sent_copy_status === 'saved' ? 'сохранена' : 'не подтверждена'}<br>
+    <p>Отправитель: ${esc(delivery.sender || 'не подтверждён в старом журнале')}<br>Получатель: ${esc(message.recipient)}<br>Время: ${esc(delivery.accepted_at || delivery.updated_at || 'ещё не отправлено')}<br>
+    Копия в «Отправленных» ящика ${esc(delivery.sender || 'отправителя')}: ${delivery.sent_copy_status === 'saved' ? 'сохранена' : 'не подтверждена'}<br>
     Вложения: ${files.length ? files.map(file => esc(file.filename)).join(', ') : 'нет'}</p>
     ${delivery.error ? `<p role="alert">${esc(staffMailError(delivery.error))}</p>` : ''}
     ${delivery.warning ? `<p role="alert">${esc(delivery.warning)}</p>` : ''}
@@ -346,6 +346,7 @@ renderRfq = function() {
   const lot = purchasing.lot?.id === state.selectedLot ? purchasing.lot : null;
   const header = root.querySelector(':scope > section.panel');
   header?.querySelector('p')?.remove();
+  if (launchState.config.sender) header?.insertAdjacentHTML('beforeend', `<p>Письма отправляются с <b>${esc(launchState.config.sender)}</b>. Копия сохраняется в «Отправленных» этого ящика, а не в личной почте сотрудника.</p>`);
   if (lot) header?.insertAdjacentHTML('beforeend', `<small class="purchase-stage">Этап: ${esc(procurementStages[procurementStage(lot)])}</small>`);
   root.querySelectorAll('#procurementLot option').forEach(option => { option.textContent = option.textContent.replace(/^#\d+\s*·\s*/, ''); });
   const title = root.querySelector('h3');

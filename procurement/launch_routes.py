@@ -73,6 +73,7 @@ def install(app, settings, service, launch, require_access, session_claims, doma
     @app.get('/api/launch/config', dependencies=[Depends(require_access)])
     def config(request: Request):
         return {'smtp_ready':bool(os.getenv('PROCUREMENT_SMTP_HOST') and os.getenv('PROCUREMENT_SMTP_FROM')),
+                'sender':os.getenv('PROCUREMENT_SMTP_FROM', ''),
                 'read_only':bool(getattr(request.state,'das_principal',{}).get('read_only',False)),
                 'max_file_bytes':MAX_FILE}
 
