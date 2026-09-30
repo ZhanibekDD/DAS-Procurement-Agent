@@ -247,10 +247,12 @@ class Catalog:
         if currencies is None:
             doc=self.db.one('SELECT * FROM source_documents WHERE id=?',(data['document_id'],))
             if not doc:raise ConflictError('Исходный прайс отсутствует')
-            if Path(doc['filename']).suffix.lower()=='.pdf':
+            source=self.launch.document_file(doc)
+            # SHA deduplication can retain an older upload's filename. Detect
+            # PDF bytes from the verified source, never from that mutable label.
+            if source.startswith(b'%PDF-'):
                 from .price_ocr import extract_price_document
-                source=self.launch.document_file(doc)
-                currencies=self.document_currency_evidence(extract_price_document(source,doc['filename']))
+                currencies=self.document_currency_evidence(extract_price_document(source,'source.pdf'))
             else:currencies=[]
         if any(c!='RUB' for c in currencies):
             raise ValueError('В исходнике указана другая валюта. Автоматической конвертации в рубли нет')
