@@ -489,6 +489,11 @@ def _price_table_header(table):
         cells = [str(c or '').strip() for c in (row or [])]
         if not cells:
             continue
+        # A merged report title is not a header tier. In particular, its
+        # "прайс" label must never turn an article column into a price column.
+        if not combined and (sum(bool(c) for c in cells) < 2
+                             or _col_index(cells, _NAME_COL_NAMES) is None):
+            continue
         if combined and len(cells) != len(combined):
             break
         if not combined:
@@ -496,7 +501,13 @@ def _price_table_header(table):
         # A two-tier heading has empty/label cells, not a numeric price.
         if ri and any(re.search(r'\d', c) for c in cells):
             break
-        combined = [' '.join(filter(None, (a, b))) for a, b in zip(combined, cells)]
+        # A complete explicit header takes precedence over preceding tiers.
+        # Merge only genuinely split headings, retaining their column geometry.
+        row_nc, row_pc = _col_index(cells, _NAME_COL_NAMES), _col_index(cells, _PRICE_COL_NAMES)
+        if row_nc is not None and row_pc is not None and row_nc != row_pc:
+            combined = cells
+        else:
+            combined = [' '.join(filter(None, (a, b))) for a, b in zip(combined, cells)]
         nc, pc = _col_index(combined, _NAME_COL_NAMES), _col_index(combined, _PRICE_COL_NAMES)
         if nc is not None and pc is not None and nc != pc:
             quantities = ['' if re.search(r'\b(?:масса|вес)\b|\b(?:м3|м³|кг|kg)\b', label, re.I) else label
