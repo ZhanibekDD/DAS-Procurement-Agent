@@ -10,7 +10,7 @@ from unittest.mock import patch
 import pytest
 from openpyxl import Workbook
 
-from procurement.incoming_mail import Inbox, extract_draft, download, poll, network_deadline
+from procurement.incoming_mail import Inbox, extract_draft, download, poll, poll_bounded, network_deadline
 from procurement.catalog import Catalog, ALIASES
 from procurement.identity import authenticated_actor
 from test_launch_workflow import workflow, FIXTURES
@@ -116,6 +116,33 @@ def test_auth_outage_one_attempt_then_later_recovery(workflow,mailbox_env,error)
     assert poll(inbox,offline)['status']=='error' and len(attempts)==1
     assert 'SENSITIVE' not in json.dumps(inbox.listing())
     assert poll(inbox,lambda:Mailbox({1:message()}))['status']=='ok'
+
+
+def test_transport_failure_has_one_bounded_retry_and_no_duplicate(workflow,mailbox_env):
+    db,s,w=workflow;inbox=Inbox(s,w);attempts=[]
+    def connect():
+        attempts.append(1)
+        if len(attempts)==1:raise TimeoutError('PASSWORD private failure')
+        return Mailbox({1:message()})
+    result=poll_bounded(inbox,connect,pause=lambda _:None)
+    assert result['status']=='ok' and result['received']==1 and len(attempts)==2
+    assert db.one('SELECT error,last_uid FROM inbox_state')['error']==''
+    assert len(db.all('SELECT id FROM inbox_messages'))==1
+    assert 'PASSWORD' not in json.dumps(result)+json.dumps(inbox.listing())
+
+
+def test_auth_failure_does_not_retry_and_transport_outage_stays_degraded(workflow,mailbox_env):
+    import imaplib
+    db,s,w=workflow;inbox=Inbox(s,w);attempts=[]
+    def denied():attempts.append(1);raise imaplib.IMAP4.error('PASSWORD invalid')
+    result=poll_bounded(inbox,denied,pause=lambda _:pytest.fail('Auth retry'))
+    assert result['status']=='error' and result['retryable'] is False and len(attempts)==1
+    attempts.clear()
+    def outage():attempts.append(1);raise ConnectionResetError('PASSWORD transport')
+    result=poll_bounded(inbox,outage,pause=lambda _:None)
+    assert result['status']=='error' and result['retryable'] is True and len(attempts)==2
+    assert db.one('SELECT error FROM inbox_state')['error']
+    assert 'PASSWORD' not in json.dumps(result)+json.dumps(inbox.listing())
 
 
 def test_raw_mail_html_never_rendered_and_many_parts_fail_closed(workflow,tmp_path):
