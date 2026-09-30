@@ -124,3 +124,71 @@ const procurementLotsWithStages=renderLots;
 renderLots=function(){procurementLotsWithStages();const select=$('#lotStatusFilter');if(select){select.innerHTML='<option value="">Все статусы</option>'+[['draft','Черновик'],['rfq_draft','Черновик запроса'],['rfq_queued','В очереди'],['rfq_sending','Отправляется'],['rfq_failed','Ошибка отправки'],['rfq_unconfirmed','Отправка не подтверждена'],['rfq_partial','Отправлено не всем'],['rfq_sent','Запрос отправлен'],['quotes_received','Получены цены'],['comparison','Сравнение'],['awarded','Поставщик выбран'],['ordered','Заказ']].map(([k,v])=>`<option value="${k}">${v}</option>`).join('')}};
 const procurementOverview=renderOverview;
 renderOverview=function(){procurementOverview();const pipeline=document.querySelector('#overview .pipeline');if(pipeline)pipeline.innerHTML=procurementStages.map((name,n)=>`<div class="pipe-step"><b>${String(n+1).padStart(2,'0')} · ${esc(name)}</b><span>${n===1?'Предпросмотр → Отправить запрос':n===3?'Надёжность отдельно от индекса цены':esc(name)}</span></div>`).join('')};
+
+// Corporate mailbox content is private until an administrator verifies a price.
+const pricebookWithInbox=renderPricebook;
+renderPricebook=function(){
+  pricebookWithInbox();
+  if(state.role!=='admin')return;
+  $('#pricebook').insertAdjacentHTML('afterbegin','<section class="panel"><h2>КП из почты</h2><p>Вложения получаем автоматически. Компании и цены сохраняются только после вашей проверки.</p><button class="btn secondary" onclick="loadIncomingPrices()">Обновить</button><div id="mailPriceInbox" aria-live="polite">Загрузка…</div></section>');
+  loadIncomingPrices();
+};
+async function loadIncomingPrices(before=null){
+  const target=$('#mailPriceInbox');if(!target)return;
+  try{
+    const result=await api('/api/procurement/inbox'+(before?'?before='+encodeURIComponent(before):''));
+    if(target!==$('#mailPriceInbox'))return;
+    const connections=result.connections.map(c=>{
+      const stale=!c.checked_at||Date.now()-Date.parse(c.checked_at)>180000;
+      return `<p ${c.error||stale?'role="alert"':''}>${esc(c.error||(stale?'Автоматическая проверка почты задерживается.':'Почта проверяется автоматически.'))} Последняя проверка: ${esc(c.checked_at?new Date(c.checked_at).toLocaleString('ru-RU'):'ещё не выполнена')}${c.next_uid>c.last_uid+1?' · Обрабатываем предыдущие письма.':''}</p>`;
+    }).join('')||'<p>Автоматический сбор ещё не запущен.</p>';
+    target.innerHTML=connections+(result.messages.length?result.messages.map(m=>`<article class="message-card"><h3>${esc(m.subject||'Без темы')}</h3><p>${esc(m.sender||'Отправитель не определён')} · ${esc(new Date(m.received_at).toLocaleString('ru-RU'))}</p>${m.error?`<p role="alert">${esc(m.error)}</p>`:''}${m.status==='duplicate'?'<p>Повторное письмо. Повторный импорт не требуется.</p>':''}${m.attachments.length?m.attachments.map(a=>`<p>${esc(a.filename)} · ${a.applied?'Цены сохранены':'Требует проверки'} <button class="btn secondary" data-inbox-attachment="${esc(a.id)}">${a.applied?'Открыть исходник':'Проверить КП'}</button></p>`).join(''):'<p>Поддерживаемых прайсов для проверки нет.</p>'}</article>`).join(''):'<p>Входящих писем пока нет. Новые PDF, XLSX и CSV появятся здесь после проверки ящика.</p>')+(result.next_before?'<button class="btn secondary" id="olderIncomingPrices">Предыдущие письма</button>':'');
+    target.querySelectorAll('[data-inbox-attachment]').forEach(b=>b.onclick=()=>openInboxAttachment(b.dataset.inboxAttachment));
+    if(result.next_before)$('#olderIncomingPrices').onclick=()=>loadIncomingPrices(result.next_before);
+  }catch(e){if(target===$('#mailPriceInbox'))target.textContent=e.message;}
+}
+async function openInboxAttachment(id){
+  try{
+    const p=await api('/api/procurement/inbox/attachments/'+encodeURIComponent(id));
+    launchModal('Проверка входящего КП',`<p><a href="/api/procurement/inbox/attachments/${encodeURIComponent(id)}/original" target="_blank" rel="noopener">Открыть оригинал: ${esc(p.filename)}</a></p><p>Проверьте компанию по документу. Отправитель письма не подтверждает ИНН и реквизиты.</p><div id="inboxCommon"></div><div id="catalogImportPreview"></div><label><input id="inboxVerified" type="checkbox"> Реквизиты сверены с оригиналом, цены указаны в рублях</label>`,'Проверить строки',()=>{});
+    showInboxPriceRows(p);
+    const common=['supplier_name','tax_id','email','phone','region','price_date','valid_until','vat','delivery'];
+    $('#inboxCommon').innerHTML='<details><summary>Заполнить общие реквизиты в пустых полях всех строк</summary>'+common.map(k=>`<label>${esc(catalogFieldLabels[k])}<input data-inbox-common="${k}"></label>`).join('')+'<button type="button" class="btn secondary" id="fillInboxCommon">Применить к пустым полям</button></details>';
+    $('#fillInboxCommon').onclick=()=>{
+      document.querySelectorAll('[data-inbox-common]').forEach(input=>{
+        if(!input.value.trim())return;
+        document.querySelectorAll('[data-price-field]').forEach(cell=>{
+          if(cell.dataset.priceField===input.dataset.inboxCommon&&!cell.value.trim()){
+            cell.value=input.value.trim();cell.dispatchEvent(new Event('input'));
+          }
+        });
+      });
+    };
+    $('#modalSubmit').onclick=async()=>{
+      if(!$('#inboxVerified').checked)return toast('Подтвердите реквизиты по оригиналу и цены в рублях',true);
+      const button=$('#modalSubmit');button.disabled=true;
+      try{
+        const rows=catalogPdfRows.map(r=>Object.fromEntries(Object.keys(catalogFieldLabels).map(k=>[k,String(r[k]||'')])));
+        const checked=await launchJson('/api/procurement/inbox/attachments/'+encodeURIComponent(id)+'/review','POST',{rows,confirmed_source:true});
+        if(checked.requires_correction){
+          toast(checked.errors.map(e=>`Строка ${e.row}: ${e.error}`).slice(0,5).join('; '),true);return;
+        }
+        showConfirmedCatalog(checked);
+      }catch(e){toast(e.message,true)}finally{button.disabled=false}
+    };
+  }catch(e){toast(e.message,true)}
+}
+
+function showInboxPriceRows(p){
+  catalogPdfRows=p.rows.map(r=>({...Object.fromEntries(Object.keys(catalogFieldLabels).map(k=>[k,String(r[k]||'')])),review_warning:r.review_warning||''}));
+  const main=['item_name','unit_price','unit','specification'];
+  const remaining=Object.keys(catalogFieldLabels).filter(k=>!main.includes(k)&&k!=='currency');
+  const field=(r,n,k)=>`<label style="display:flex;flex-direction:column;min-width:0">${esc(catalogFieldLabels[k])}<input style="box-sizing:border-box;width:100%;min-width:0" data-price-row="${n}" data-price-field="${k}" value="${esc(r[k])}" ${k==='unit_price'&&!r[k]?'aria-invalid="true"':''}></label>`;
+  const draw=()=>{
+    $('#catalogImportPreview').innerHTML=`<p>Позиций: ${catalogPdfRows.length}. Цены — в рублях. Проверьте данные по оригиналу.</p>${(p.errors||[]).length?`<div role="alert">${p.errors.map(e=>`<p>${esc(e)}</p>`).join('')}</div>`:''}${catalogPdfRows.map((r,n)=>`<fieldset style="border:1px solid #dbe2e5;border-radius:12px;margin:12px 0;padding:12px;min-width:0"><legend>Позиция ${n+1}</legend><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px">${main.map(k=>field(r,n,k)).join('')}</div>${r.review_warning?`<p role="note">${esc(r.review_warning)}</p>`:''}${r.currency!=='RUB'?`<p role="alert">В исходнике другая или неизвестная валюта. Автоматическая конвертация не выполняется.</p>`:''}<details><summary>Поставщик и условия</summary><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-top:12px">${remaining.map(k=>field(r,n,k)).join('')}</div></details><button type="button" class="btn secondary small" data-price-remove="${n}">Убрать строку</button></fieldset>`).join('')}<button type="button" class="btn secondary" id="pdfPriceAdd">Добавить строку</button>`;
+    document.querySelectorAll('[data-price-row]').forEach(e=>e.oninput=()=>{catalogPdfRows[Number(e.dataset.priceRow)][e.dataset.priceField]=e.value});
+    document.querySelectorAll('[data-price-remove]').forEach(e=>e.onclick=()=>{catalogPdfRows.splice(Number(e.dataset.priceRemove),1);draw()});
+    $('#pdfPriceAdd').onclick=()=>{catalogPdfRows.push({...Object.fromEntries(Object.keys(catalogFieldLabels).map(k=>[k,''])),currency:'RUB'});draw()};
+  };
+  draw();
+}
