@@ -62,7 +62,8 @@ const classify=(messages,campaign)=>vm.runInNewContext(`${outcomeSource};procure
 const campaign={messages:[{id:1},{id:2}]};
 assert.equal(classify([{id:1,delivery:{status:'sent'}},{id:2,delivery:{status:'unknown'}}],campaign).kind,'unknown');
 assert.equal(classify([{id:1,delivery:{status:'sent'}},{id:2,delivery:{status:'failed'}}],campaign).kind,'failed');
-assert.equal(classify([{id:1,delivery:{status:'sent'}},{id:2,delivery:{status:'sent'}}],campaign).kind,'sent');
+assert.notEqual(classify([{id:1,delivery:{status:'sent'}},{id:2,delivery:{status:'sent'}}],campaign).kind,'sent');
+assert.equal(classify([{id:1,delivery:{status:'sent',accepted_at:'2026-09-30T00:00:00Z'}},{id:2,delivery:{status:'sent',accepted_at:'2026-09-30T00:00:00Z'}}],campaign).kind,'sent');
 assert.equal(classify([],campaign).kind,'unknown');
 assert(flow.includes("outcome==='unknown'||outcome==='sent'?'':`<button"),'uncertain SMTP result cannot expose Retry');
 const sendSource=flow.match(/async function sendProcurement\(\)\{[\s\S]*?\n\}/)?.[0];
