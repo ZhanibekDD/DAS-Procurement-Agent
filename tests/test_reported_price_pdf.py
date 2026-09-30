@@ -56,6 +56,24 @@ def test_multi_cell_caption_does_not_become_header(caption):
 def test_supplier_alias_substring_does_not_form_a_header():
     assert _price_table_header([['Прайс-лист','ООО Товарный дом',''],['Артикул','Каталог',''],['529000','ФБС','8897']]) is None
 
+@pytest.mark.parametrize('name',['Наименование','Наименование ГОСТ 13579-2018'])
+@pytest.mark.parametrize('price',['Цена за 1 шт.','Цена за 1000 шт.','Стоимость 1 единицы'])
+def test_digits_inside_column_labels_are_not_data_rows(name,price):
+    assert _price_table_header([[name,price],['ФБС 24.4.6','8897']])==(0,(0,1,None,None))
+
+@pytest.mark.parametrize('ancillary',['Стоимость доставки','Цена доставки','Стоимость итоговая','Цена общая','Unit price shipping'])
+@pytest.mark.parametrize('explicit',['Цена','Unit price','Цена, руб.'])
+@pytest.mark.parametrize('explicit_first',[True,False])
+def test_unit_price_is_not_delivery_or_total_price(ancillary,explicit,explicit_first):
+    prices=[explicit,ancillary] if explicit_first else [ancillary,explicit]
+    rows=[['Наименование',*prices],['ФБС','200','8897']]
+    assert _price_table_header(rows)==(0,(0,1 if explicit_first else 2,None,None))
+    assert _price_table_header([['Наименование',ancillary],['ФБС','200']]) is None
+
+def test_exact_name_and_unit_take_precedence_over_qualified_columns():
+    rows=[['Наименование поставщика','Наименование','Цена','Единица упаковки','Единица'],['Завод','ФБС','8897','уп','шт']]
+    assert _price_table_header(rows)==(0,(1,2,None,4))
+
 @pytest.mark.parametrize('raw,expected',[('8,897.46 руб.','8897.46'),('1 093,12 руб.','1093.12'),('1.093,12 ₽','1093.12'),('1093.12','1093.12')])
 def test_explicit_pdf_prices(raw,expected):
     assert _pdf_price(raw,'RUB')==expected

@@ -484,11 +484,19 @@ def _reviewable_pdf_price(value: str, currency: str) -> tuple[str, str]:
 
 def _pdf_header_col(cells, aliases):
     """Header labels begin with an alias; supplier/title substrings are not labels."""
-    for i, cell in enumerate(cells):
-        for tier in cell.splitlines():
-            label = ' '.join(tier.casefold().split())
-            if any(re.match(r'^' + re.escape(alias) + r'(?!\w)', label) for alias in aliases):
-                return i
+    labels = [(i, ' '.join(tier.casefold().split()))
+              for i, cell in enumerate(cells) for tier in cell.splitlines()]
+    # Exact labels win across all columns, before considering qualified labels.
+    for i, label in labels:
+        if label in aliases:
+            return i
+    for i, label in labels:
+        if aliases is _PRICE_COL_NAMES and re.search(r'\b(?:доставк\w*|итого|сумма|общая|итоговая|shipping|delivery|total)\b', label):
+            continue
+        if aliases is _UNIT_COL_NAMES and re.match(r'^unit\s+(?:price|cost)\b', label):
+            continue
+        if any(re.match(r'^' + re.escape(alias) + r'(?!\w)', label) for alias in aliases):
+            return i
     return None
 
 
@@ -508,8 +516,9 @@ def _price_table_header(table):
             break
         if not combined:
             combined = [''] * len(cells)
-        # A two-tier heading has empty/label cells, not a numeric price.
-        if any(re.search(r'\d', re.sub(r'\b[мm][23]\b', '', c, flags=re.I)) for c in cells):
+        # Standalone numeric data stops header merging. Digits inside genuine
+        # labels (ГОСТ 13579-2018, Цена за 1 шт., м3) remain header text.
+        if any(re.fullmatch(r'[+\-]?\d[\d\s.,]*(?:руб\.?|₽|RUB|USD|EUR|KZT)?', c, re.I) for c in cells):
             break
         # A complete explicit header takes precedence over preceding tiers.
         # Merge only genuinely split headings, retaining their column geometry.
