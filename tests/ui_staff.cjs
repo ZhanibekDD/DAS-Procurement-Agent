@@ -42,6 +42,18 @@ assert.deepEqual(Array.from(context.staffLotCounts([
   {status:'awarded'}, {status:'ordered'}
 ]), row => [row.label, row.count]), [
   ['Черновики', 2], ['Запрос отправлен', 2],
-  ['Получены цены', 2], ['Поставщик выбран', 2]
+  ['Получены цены', 2], ['Поставщик выбран', 2], ['Проверить отправку', 0], ['Отправляется', 0]
 ]);
+const uncertain=context.staffLotCounts([{status:'rfq_sent',display_status:'rfq_unconfirmed'}]);
+assert.equal(uncertain.find(x=>x.label==='Запрос отправлен').count,0);
+assert.equal(uncertain.find(x=>x.label==='Проверить отправку').count,1);
+assert.equal(context.humanStatus('rfq_unconfirmed'),'Отправка не подтверждена');
+const summary=context.staffLotSummary([{status:'rfq_sent',display_status:'rfq_unconfirmed'},
+  {status:'rfq_sent',display_status:'rfq_partial'}, {status:'draft',display_status:'rfq_failed'},
+  {status:'rfq_sent'}, {status:'draft',display_status:'rfq_queued'}]);
+assert.equal((summary.match(/class="mini-stat"/g)||[]).length,6);
+assert(summary.includes('<span>Проверить отправку</span><b>3</b>'));
+assert(summary.includes('<span>Запрос отправлен</span><b>1</b>'));
+assert(summary.includes('<span>Отправляется</span><b>1</b>'));
+assert(source.includes('summary.innerHTML = staffLotSummary(state.lots)'));
 console.log('staff UI: Russian statuses, server-confirmed send, safe activity and admin-only audit PASS');

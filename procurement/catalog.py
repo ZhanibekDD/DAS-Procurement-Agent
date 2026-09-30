@@ -226,9 +226,13 @@ class Catalog:
                 'vat':'с НДС' if item.vat_included is True else 'без НДС' if item.vat_included is False else '',
                 'delivery':'','region':result.supplier_region,'minimum_batch':'','price_date':result.document_date or '',
                 'valid_until':result.valid_until or '','supplier_name':result.supplier_name,'tax_id':result.supplier_tax_id,
-                'email':result.supplier_email,'phone':result.supplier_phone})
+                'email':result.supplier_email,'phone':result.supplier_phone,
+                'review_warning':item.review_warning,'source_page':item.source_page})
+        errors = list(result.errors)
+        if not rows:
+            errors.append('Позиции и цены не распознаны. Проверьте исходный файл или добавьте строки вручную; прайс пока не импортирован.')
         return self.launch.save_preview('price_catalog_pdf',{'document_id':doc['id'],'rows':rows,
-            'errors':result.errors,'requires_review':True,'source_filename':doc['filename']})
+            'errors':errors,'requires_review':True,'source_filename':doc['filename']})
 
     def review_pdf(self,pid,rows):
         with self.db.connection() as conn:

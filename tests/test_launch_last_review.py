@@ -69,7 +69,10 @@ def test_structured_pdf_price_uses_positive_finite_decimal(monkeypatch,price,exp
     from procurement.imports import _extract_items_from_pdf_tables
     class Page:
         chars=[]
-        def extract_tables(self):return [[['Наименование','Цена'],['ТЕСТ кабель',price]]]
+        def find_tables(self):
+            from types import SimpleNamespace
+            return [SimpleNamespace(columns=[SimpleNamespace(bbox=(0,0,100,100)),SimpleNamespace(bbox=(100,0,200,100))],
+                                    extract=lambda:[['Наименование','Цена'],['ТЕСТ кабель',price]])]
         def close(self):pass
     class PDF:
         pages=[Page()]

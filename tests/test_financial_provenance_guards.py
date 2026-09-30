@@ -217,20 +217,24 @@ def test_supplier_identity_confirmation_does_not_approve_prices_or_payment(workf
             'source_document_id': entry['source_document_id']}))
 
 
-def test_ui_requires_explicit_currency_and_vat_and_does_not_offer_xls():
+def test_currency_follows_original_financial_record_and_vat_stays_explicit():
     html = (Path(__file__).parents[1] / 'procurement/static/index.html').read_text(encoding='utf-8')
     for prefix in ('q', 'h'):
-        assert f'id="{prefix}Currency"><option value="" selected disabled>' in html
         assert f'id="{prefix}Vat"><option value="" selected disabled>' in html
         assert f"...explicitMoneyBasis('{prefix}')" in html
     assert "currency:'RUB',vat_included:true" not in html
     assert 'accept=".pdf,.xlsx,.xls"' not in html
     assert "!['true','false'].includes(vat)" in html
+    assert 'id="hCurrency"><option value="" selected disabled>' in html
+    assert '<input type="hidden" id="qCurrency" value="">' in html
+    assert '<select id="qCurrency"' not in html
+    assert 'setQuoteMoneyBasis(full)' in html
 
 
-def test_lot_ui_requires_currency_instead_of_hardcoding_rub():
+def test_lot_ui_uses_requested_ruble_only_policy_without_currency_selector():
     html = (Path(__file__).parents[1] / 'procurement/static/index.html').read_text(encoding='utf-8')
-    assert 'id="lCurrency"><option value="" selected disabled>' in html
+    assert '<input type="hidden" id="lCurrency" value="RUB">' in html
+    assert '<select id="lCurrency"' not in html
     assert 'currency:explicitLotCurrency(),items:' in html
     assert "currency:'RUB',items:" not in html
     assert "function explicitLotCurrency()" in html

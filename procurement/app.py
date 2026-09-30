@@ -913,6 +913,12 @@ def recent_activity(limit: int = Query(default=8, ge=1, le=30)):
         rows = service.db.all(query[0], (entity_id,))
         if not rows:
             continue
+        if event['action'] == 'mail_sent' and kind == 'outbox_message':
+            from .mail_evidence import smtp_accepted
+            receipt = service.db.one('''SELECT r.*, m.recipient FROM outbox_messages m
+                LEFT JOIN mail_receipts r ON r.message_id=m.id WHERE m.id=?''', (entity_id,))
+            if not smtp_accepted(receipt):
+                label = 'Отправка запроса КП не подтверждена'
         result.append({"label": label, "name": rows[0]["name"], "view": query[1],
                        "target_id": rows[0].get("target_id", entity_id), "created_at": event["created_at"]})
         if len(result) >= limit:

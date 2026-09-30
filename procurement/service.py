@@ -158,9 +158,17 @@ class ProcurementService:
             result.append(row)
         return result
 
+    @staticmethod
+    def validate_new_lot_policy(currency, cluster, project_cluster):
+        if cluster and project_cluster and cluster != project_cluster:
+            raise ValueError('Регион закупки не соответствует региону объекта. Выберите верный объект или исправьте регион.')
+        if currency != 'RUB':
+            raise ValueError('Новые закупки ведутся только в рублях (RUB)')
+
     def create_lot(self, data: LotCreate) -> dict[str, Any]:
         project = self.get_project(data.project_id)
-        cluster = resolve_cluster(data.region, data.cluster or project["cluster"])
+        cluster = resolve_cluster(data.region, data.cluster or infer_cluster(data.region) or project["cluster"])
+        self.validate_new_lot_policy(data.currency, cluster, project['cluster'])
         if data.section_id is not None:
             section = self.db.one(
                 "SELECT id FROM project_sections WHERE id = ? AND project_id = ?",
@@ -236,6 +244,7 @@ class ProcurementService:
         row["items"] = self.db.all("SELECT * FROM lot_items WHERE lot_id = ? ORDER BY id", (lot_id,))
         row['attachments'] = self.db.all('''SELECT d.id AS document_id,d.filename,d.sha256,d.size_bytes
             FROM lot_attachments a JOIN source_documents d ON d.id=a.document_id WHERE a.lot_id=?''', (lot_id,))
+        self._lot_mail_status([row])
         return row
 
     def list_lots(self) -> list[dict[str, Any]]:
@@ -250,7 +259,28 @@ class ProcurementService:
             row["rfq_requirements"] = json.loads(
                 row.pop("rfq_requirements_json", "{}") or "{}"
             )
+        self._lot_mail_status(rows)
         return rows
+
+    def _lot_mail_status(self, lots):
+        from .mail_evidence import lot_mail_projection
+        by_lot = {lot['id']: [] for lot in lots}
+        if not by_lot:
+            return
+        # Batched projection scoped to the requested lots, never per-message queries.
+        ids = list(by_lot)
+        for offset in range(0, len(ids), 200):
+            batch = ids[offset:offset + 200]
+            records = self.db.all('''SELECT c.lot_id, m.status AS message_status, m.recipient,
+                r.status, r.recipients_json, r.accepted_recipients_json, r.accepted_at,
+                r.rfc_message_id, r.smtp_code
+            FROM outbox_messages m JOIN campaigns c ON c.id=m.campaign_id
+            LEFT JOIN mail_receipts r ON r.message_id=m.id
+            WHERE c.lot_id IN (''' + ','.join('?' for _ in batch) + ')', tuple(batch))
+            for record in records:
+                by_lot[record['lot_id']].append(record)
+        for lot in lots:
+            lot.update(lot_mail_projection(lot, by_lot[lot['id']]))
 
     @staticmethod
     def _confirmed_cluster(lot_cluster: str, project_cluster: str) -> str:
@@ -1426,6 +1456,7 @@ class ProcurementService:
         suggestion = self.get_procurement_suggestion(suggestion_id)
         if suggestion["status"] != "needs_review":
             raise ConflictError("only suggestions awaiting review can be approved")
+        self.validate_new_lot_policy(data.currency, suggestion['project_cluster'], suggestion['project_cluster'])
         with self.db.connection() as conn:
             claimed = conn.execute(
                 "UPDATE procurement_suggestions SET status='approving' WHERE id=? AND status='needs_review'",

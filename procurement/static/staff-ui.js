@@ -7,6 +7,8 @@ Object.assign(mailStatus, {
 });
 const statusNames = {
   draft:'Черновик', rfq_draft:'Черновик', rfq_sent:'Запрос отправлен',
+  rfq_unconfirmed:'Отправка не подтверждена', rfq_partial:'Отправлено не всем',
+  rfq_sending:'Отправляется', rfq_queued:'В очереди', rfq_failed:'Не отправлено',
   queued:'Готов к отправке', approved:'Подтверждён', sending:'Отправляется',
   sent:'Отправлен', failed:'Не отправлено', unknown:'Результат отправки не подтверждён',
   quotes_received:'Получены цены', comparison:'Сравнение', awarded:'Поставщик выбран',
@@ -24,7 +26,7 @@ badge = function(value) {
 
 function staffMailStatus(message) {
   const delivery = message.delivery;
-  if (delivery?.status === 'sent' && !delivery.accepted_at && !delivery.legacy)
+  if ((delivery?.status === 'sent' && !delivery.accepted_at) || (message.status === 'sent' && !delivery))
     return 'Результат отправки не подтверждён';
   return mailStatus[delivery?.status || message.status] || 'Результат отправки не подтверждён';
 }
@@ -44,8 +46,8 @@ mailJournal = function(message) {
   if (!delivery) return '';
   const files = delivery.attachments || message.attachments || [];
   return `<details><summary>Отправка: ${esc(staffMailStatus(message))}</summary>
-    <p>Получатель: ${esc(message.recipient)}<br>Время: ${esc(delivery.accepted_at || delivery.updated_at || 'ещё не отправлено')}<br>
-    Копия в «Отправленных»: ${delivery.sent_copy_status === 'saved' ? 'сохранена' : 'не подтверждена'}<br>
+    <p>Отправитель: ${esc(delivery.sender || 'не подтверждён в старом журнале')}<br>Получатель: ${esc(message.recipient)}<br>Время: ${esc(delivery.accepted_at || delivery.updated_at || 'ещё не отправлено')}<br>
+    Копия в «Отправленных» ящика ${esc(delivery.sender || 'отправителя')}: ${delivery.sent_copy_status === 'saved' ? 'сохранена' : 'не подтверждена'}<br>
     Вложения: ${files.length ? files.map(file => esc(file.filename)).join(', ') : 'нет'}</p>
     ${delivery.error ? `<p role="alert">${esc(staffMailError(delivery.error))}</p>` : ''}
     ${delivery.warning ? `<p role="alert">${esc(delivery.warning)}</p>` : ''}
@@ -95,11 +97,17 @@ function staffLotCounts(lots) {
     ['Черновики', ['draft', 'rfq_draft']],
     ['Запрос отправлен', ['rfq_sent']],
     ['Получены цены', ['quotes_received', 'comparison']],
-    ['Поставщик выбран', ['awarded', 'ordered']]
+    ['Поставщик выбран', ['awarded', 'ordered']],
+    ['Проверить отправку', ['rfq_unconfirmed', 'rfq_partial', 'rfq_failed']],
+    ['Отправляется', ['rfq_queued', 'rfq_sending']]
   ];
   return stages.map(([label, statuses]) => ({
-    label, count: lots.filter(lot => statuses.includes(lot.status)).length
+    label, count: lots.filter(lot => statuses.includes(lot.display_status || lot.status)).length
   }));
+}
+
+function staffLotSummary(lots) {
+  return staffLotCounts(lots).map(stage => `<div class="mini-stat"><div><span>${esc(stage.label)}</span><b>${stage.count}</b></div></div>`).join('');
 }
 
 renderOverview = function() {
@@ -169,11 +177,7 @@ renderLots = function() {
   renderPendingQuickDrafts();
   const summary = root.querySelector('.lot-summary');
   if (summary) {
-    const stages = staffLotCounts(state.lots);
-    summary.querySelectorAll('.mini-stat').forEach((card, index) => {
-      card.querySelector('span').textContent = stages[index].label;
-      card.querySelector('b').textContent = stages[index].count;
-    });
+    summary.innerHTML = staffLotSummary(state.lots);
   }
   root.querySelectorAll(':scope > section.panel').forEach(panel => {
     if (panel.querySelector('h2')?.textContent === 'Закупочный процесс') panel.remove();
@@ -346,7 +350,8 @@ renderRfq = function() {
   const lot = purchasing.lot?.id === state.selectedLot ? purchasing.lot : null;
   const header = root.querySelector(':scope > section.panel');
   header?.querySelector('p')?.remove();
-  if (lot) header?.insertAdjacentHTML('beforeend', `<small class="purchase-stage">Этап: ${esc(procurementStages[procurementStage(lot)])}</small>`);
+  if (launchState.config.sender) header?.insertAdjacentHTML('beforeend', `<p>Письма отправляются с <b>${esc(launchState.config.sender)}</b>. Копия сохраняется в «Отправленных» этого ящика, а не в личной почте сотрудника.</p>`);
+  if (lot) header?.insertAdjacentHTML('beforeend', `<small class="purchase-stage">Этап: ${esc(humanStatus(lot.display_status || lot.status))}</small>`);
   root.querySelectorAll('#procurementLot option').forEach(option => { option.textContent = option.textContent.replace(/^#\d+\s*·\s*/, ''); });
   const title = root.querySelector('h3');
   if (title?.textContent.startsWith('Позиции лота')) title.textContent = 'Позиции закупки';

@@ -331,6 +331,7 @@ class ExtractedItem:
     source_row: int | None
     source_cell: str
     source_text: str
+    review_warning: str = ''
 
 
 @dataclass
@@ -454,6 +455,87 @@ def _extract_pdf_text(content: bytes) -> tuple[list[str], list[str]]:
         return [], [f'PDF parse error: {exc}']
 
 
+def _pdf_price_without_suffix(value: str, currency: str) -> str:
+    value = value.strip()
+    if currency == 'RUB':
+        value = re.sub(r'\s*(?:руб\.?|₽|RUB)\s*$', '', value, flags=re.I)
+    return value
+
+
+def _pdf_price(value: str, currency: str) -> str:
+    """Parse an explicit price cell, not arbitrary numbers in a PDF row."""
+    value = _pdf_price_without_suffix(value, currency)
+    value = re.sub(r'[\s\u00a0\u202f]', '', value)
+    if re.fullmatch(r'\d{1,3}(?:,\d{3})+\.\d{2}', value):
+        value = value.replace(',', '')
+    elif re.fullmatch(r'\d{1,3}(?:\.\d{3})+,\d{2}', value):
+        value = value.replace('.', '')
+    return _decimal_price(value)
+
+
+def _reviewable_pdf_price(value: str, currency: str) -> tuple[str, str]:
+    # An explicitly negotiated price is not zero and not a parseable amount.
+    # Retain the row for review without weakening numeric financial validation.
+    label = ' '.join(_pdf_price_without_suffix(value, currency).casefold().split()).strip(' .')
+    if re.fullmatch(r'(?:договорная(?: цена)?|цена договорная|(?:цена |стоимость )?по (?:запросу|согласованию)|уточняйте(?: цену)?)', label):
+        return '', f'Цена «{value.strip()}» не указана числом. Уточните цену или исключите строку перед импортом.'
+    return _pdf_price(value, currency), ''
+
+
+def _pdf_header_col(cells, aliases):
+    """Header labels begin with an alias; supplier/title substrings are not labels."""
+    labels = [(i, ' '.join(tier.casefold().split()))
+              for i, cell in enumerate(cells) for tier in cell.splitlines()]
+    # Exact labels win across all columns, before considering qualified labels.
+    for i, label in labels:
+        if label in aliases:
+            return i
+    for i, label in labels:
+        if aliases is _PRICE_COL_NAMES and re.search(r'\b(?:доставк\w*|итого|сумма|общая|итоговая|shipping|delivery|total)\b', label):
+            continue
+        if aliases is _UNIT_COL_NAMES and re.match(r'^unit\s+(?:price|cost)\b', label):
+            continue
+        if any(re.match(r'^' + re.escape(alias) + r'(?!\w)', label) for alias in aliases):
+            return i
+    return None
+
+
+def _price_table_header(table):
+    """Join adjacent header tiers by column; never absorb a priced data row."""
+    combined = []
+    for ri, row in enumerate(table[:3]):
+        cells = [str(c or '').strip() for c in (row or [])]
+        if not cells:
+            continue
+        # Captions can occupy several cells (including supplier names/dates).
+        # They are not column labels, unlike a legitimate price-only first tier.
+        if any(re.match(r'^(?:прайс[\s\-–—]*лист|price\s*list|прейскурант)(?!\w)', c, re.I)
+               or re.match(r'^(?:ООО|АО|ЗАО|ПАО|ИП)\s', c, re.I) for c in cells):
+            continue
+        if combined and len(cells) != len(combined):
+            break
+        if not combined:
+            combined = [''] * len(cells)
+        # Standalone numeric data stops header merging. Digits inside genuine
+        # labels (ГОСТ 13579-2018, Цена за 1 шт., м3) remain header text.
+        if any(re.fullmatch(r'[+\-]?\d[\d\s.,]*(?:руб\.?|₽|RUB|USD|EUR|KZT)?', c, re.I) for c in cells):
+            break
+        # A complete explicit header takes precedence over preceding tiers.
+        # Merge only genuinely split headings, retaining their column geometry.
+        row_nc, row_pc = _pdf_header_col(cells, _NAME_COL_NAMES), _pdf_header_col(cells, _PRICE_COL_NAMES)
+        if row_nc is not None and row_pc is not None and row_nc != row_pc:
+            combined = cells
+        else:
+            combined = ['\n'.join(filter(None, (a, b))) for a, b in zip(combined, cells)]
+        nc, pc = _pdf_header_col(combined, _NAME_COL_NAMES), _pdf_header_col(combined, _PRICE_COL_NAMES)
+        if nc is not None and pc is not None and nc != pc:
+            ancillary = ['' if i in (nc, pc) else label for i, label in enumerate(combined)]
+            quantities = ['' if re.search(r'\b(?:масса|вес)\b|\b(?:м3|м³|кг|kg)\b', label, re.I) else label
+                          for label in ancillary]
+            return ri, (nc, pc, _pdf_header_col(quantities, _QTY_COL_NAMES), _pdf_header_col(ancillary, _UNIT_COL_NAMES))
+    return None
+
+
 def _extract_items_from_pdf_tables(
     content: bytes, currency: str, vat_included: bool
 ) -> tuple[list[ExtractedItem], bool]:
@@ -471,6 +553,7 @@ def _extract_items_from_pdf_tables(
     """
     items: list[ExtractedItem] = []
     has_tables = False  # True once pdfplumber finds any non-trivial table
+    continuation = None
     try:
         import pdfplumber
         import io as _io_plumb
@@ -480,32 +563,39 @@ def _extract_items_from_pdf_tables(
             for page_num, page in enumerate(pdf.pages, start=1):
                 if len(page.chars) > 100000:
                     raise ValueError('PDF page complexity exceeds limits')
-                tables = page.extract_tables()
+                table_objects = page.find_tables()
+                tables = [t.extract() for t in table_objects]
                 page.close()
                 if len(tables) > 100:
                     raise ValueError('PDF page complexity exceeds limits')
-                for table in tables:
+                for table_index, table in enumerate(tables):
                     if not table or len(table) < 2:
                         continue
                     has_tables = True  # at least one real table found
-                    # Search first 3 rows for a header row with name + price cols
-                    name_col = qty_col = price_col = unit_col = None
-                    header_row_idx = None
-                    for ri, row in enumerate(table[:3]):
-                        if row is None:
+                    geometry = tuple(round(c.bbox[0], 1) for c in table_objects[table_index].columns)
+                    header = _price_table_header(table)
+                    if header:
+                        header_row_idx, columns = header
+                    elif (continuation and table_index == 0 and continuation[0] == page_num - 1
+                          and len(geometry) == len(continuation[1])
+                          and all(abs(a-b) <= 2 for a,b in zip(geometry,continuation[1]))):
+                        columns = continuation[2]
+                        nc, pc, _, _ = columns
+                        first = table[0]
+                        # Only a same-layout adjacent page beginning with an actual
+                        # priced row can inherit the already verified table header.
+                        try:
+                            assert len(first) == len(geometry) and first[nc]
+                            _reviewable_pdf_price(str(first[pc] or ''), currency)
+                        except (ValueError, AssertionError, IndexError):
+                            continuation = None
                             continue
-                        headers = [str(c or '').strip() for c in row]
-                        nc = _col_index(headers, _NAME_COL_NAMES)
-                        pc = _col_index(headers, _PRICE_COL_NAMES)
-                        qc = _col_index(headers, _QTY_COL_NAMES)
-                        uc = _col_index(headers, _UNIT_COL_NAMES)
-                        if nc is not None and pc is not None:
-                            name_col, price_col = nc, pc
-                            qty_col, unit_col = qc, uc
-                            header_row_idx = ri
-                            break
-                    if header_row_idx is None:
-                        continue  # no recognised price-table header
+                        header_row_idx = -1
+                    else:
+                        continuation = None
+                        continue
+                    name_col, price_col, qty_col, unit_col = columns
+                    continuation = (page_num, geometry, columns)
                     for row_num, row in enumerate(
                         table[header_row_idx + 1:], start=header_row_idx + 2
                     ):
@@ -527,14 +617,7 @@ def _extract_items_from_pdf_tables(
                         if raw_name.isdigit():
                             continue
                         # Normalise price — remove thousands separators, convert comma to dot
-                        price_clean = (
-                            raw_price
-                            .replace(' ', '')
-                            .replace(' ', '')
-                            .replace(' ', '')
-                            .replace(',', '.')
-                        )
-                        price_clean = _decimal_price(price_clean)
+                        price_clean, review_warning = _reviewable_pdf_price(raw_price, currency)
                         raw_qty = ''
                         if qty_col is not None and qty_col < len(row):
                             raw_qty = str(row[qty_col] or '').strip()
@@ -561,6 +644,7 @@ def _extract_items_from_pdf_tables(
                             source_row=row_num,
                             source_cell='',
                             source_text=source_text,
+                            review_warning=review_warning,
                         ))
     except ImportError:
         pass  # pdfplumber not available — caller falls back to text method
@@ -662,6 +746,9 @@ def extract_from_pdf(content: bytes, filename: str) -> DocumentExtractResult:
     # drawings) → return 0 items; do NOT mine masses/quantities as fake prices.
     if not items and not _has_tables:
         items = _extract_items_from_pdf_text(pages, currency, vat_included)
+
+    errors.extend(f'Страница {item.source_page}, строка {item.source_row}: {item.review_warning}'
+                  for item in items if item.review_warning)
 
     return DocumentExtractResult(
         filename=filename,
