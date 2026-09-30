@@ -1,9 +1,19 @@
 """Provider search failure must neither duplicate mail nor claim an absent copy."""
 import pytest
+import socket
+import threading
+import time
 from procurement import sent_mail
 
 MID = '<' + 'a' * 32 + '@example.test>'
 OTHER = '<' + 'b' * 32 + '@example.test>'
+
+
+class Transport:
+    timeout = 30
+    def gettimeout(self):return self.timeout
+    def settimeout(self, timeout):self.timeout = timeout
+    def shutdown(self, how):pass
 
 
 class Mailbox:
@@ -12,6 +22,7 @@ class Mailbox:
         self.fault = fault
         self.searches = 0
         self.fetches = []
+        self.sock = Transport()
 
     def _quote(self, value):return '"' + value + '"'
 
@@ -74,6 +85,47 @@ def test_provider_scan_size_and_time_limits_fail_closed(monkeypatch):
     assert not mailbox.fetches
     monkeypatch.setattr(sent_mail, 'SCAN_SECONDS', 0)
     with pytest.raises(ValueError):sent_mail.find_message(Mailbox(), b'Sent', MID)
+
+
+def test_late_final_search_is_rejected_and_watchdog_is_cancelled(monkeypatch):
+    monkeypatch.setattr(sent_mail, 'SCAN_SECONDS', 0.05)
+    mailbox = Mailbox([])
+    original = mailbox.uid
+    def slow_final(*args):
+        result = original(*args)
+        if mailbox.searches == 2:time.sleep(0.08)
+        return result
+    mailbox.uid = slow_final
+    with pytest.raises(ValueError):sent_mail.find_message(mailbox, b'Sent', MID)
+    normal = Mailbox([])
+    assert sent_mail.find_message(normal, b'Sent', MID) == []
+    assert normal.sock.gettimeout() == 30
+
+
+def test_trickling_socket_is_interrupted_at_scan_deadline(monkeypatch):
+    monkeypatch.setattr(sent_mail, 'SCAN_SECONDS', 0.15)
+    left, right = socket.socketpair()
+    stopped = threading.Event()
+    mailbox = Mailbox([]);mailbox.sock = left
+    left.settimeout(2)
+    original = mailbox.uid
+    def stalled_search(*args):
+        if args == ('SEARCH', None, 'ALL'):
+            while left.recv(1):pass
+            raise OSError('socket interrupted')
+        return original(*args)
+    mailbox.uid = stalled_search
+    def trickle():
+        while not stopped.wait(0.01):
+            try:right.sendall(b'x')
+            except OSError:break
+    thread = threading.Thread(target=trickle);thread.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(OSError):sent_mail.find_message(mailbox, b'Sent', MID)
+        assert time.monotonic() - started < 1
+    finally:
+        stopped.set();thread.join(timeout=2);left.close();right.close()
 
 
 @pytest.mark.parametrize('fault', ['normal', 'transport'])

@@ -7,7 +7,9 @@ import hashlib
 import imaplib
 import os
 import re
+import socket
 import ssl
+import threading
 import time
 from email.parser import BytesHeaderParser
 from pathlib import Path
@@ -113,7 +115,40 @@ def _search_uids(data):
 
 
 def _scan_message_headers(client, message_id):
+    """A wall-clock watchdog also interrupts trickling socket reads."""
+    if SCAN_SECONDS <= 0:
+        raise ValueError('Проверка копии письма превысила время ожидания')
     deadline = time.monotonic() + SCAN_SECONDS
+    transport = client.sock
+    previous_timeout = transport.gettimeout()
+    expired = threading.Event()
+
+    def expire():
+        expired.set()
+        try:
+            # shutdown interrupts a blocked SSL/socket read. Closing imaplib's
+            # buffered file here could instead wait for that read's lock.
+            transport.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    watchdog = threading.Timer(SCAN_SECONDS, expire)
+    watchdog.daemon = True
+    transport.settimeout(min(previous_timeout, SCAN_SECONDS) if previous_timeout else SCAN_SECONDS)
+    watchdog.start()
+    try:
+        result = _read_message_headers(client, message_id, deadline)
+        if expired.is_set() or time.monotonic() >= deadline:
+            raise ValueError('Проверка копии письма превысила время ожидания')
+        return result
+    finally:
+        watchdog.cancel()
+        watchdog.join()
+        if not expired.is_set():
+            transport.settimeout(previous_timeout)
+
+
+def _read_message_headers(client, message_id, deadline):
 
     def all_uids():
         if time.monotonic() >= deadline:
