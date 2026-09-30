@@ -4,6 +4,7 @@ import re
 import statistics
 from datetime import date
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 
 from .db import utcnow
 from .identity import trusted_actor, trusted_role
@@ -92,7 +93,7 @@ class Catalog:
     def __init__(self,service,launch):
         self.service,self.launch,self.db=service,launch,service.db
 
-    def price_preview(self,doc,table,mapping=None):
+    def price_preview(self,doc,table,mapping=None,document_currencies=None):
         chosen=mapping if mapping is not None else suggested_mapping(table['headers'],ALIASES)
         rows=[];errors=[]
         for source in table['rows']:
@@ -121,8 +122,9 @@ class Catalog:
                 rows.append({'source_row':source['row'],**values})
             except (ValueError,TypeError) as exc:
                 errors.append({'row':source['row'],'error':str(exc)})
+        evidence={} if document_currencies is None else {'document_currencies':document_currencies}
         return self.launch.save_preview('price_catalog',{'document_id':doc['id'],'rows':rows,'errors':errors,
-             'headers':table['headers'],'mapping':chosen,'sheet':table['sheet']})
+             'headers':table['headers'],'mapping':chosen,'sheet':table['sheet'],**evidence})
 
     def _supplier(self,conn,values):
         # Conflicting exact identifiers are not reconciled by fuzzy name.
@@ -159,6 +161,8 @@ class Catalog:
             if trusted_role()!='admin':raise ConflictError('Проверка входящего КП недоступна')
             from .incoming_mail import Inbox
             Inbox(self.service,self.launch).validate_currency(data['inbox_attachment_id'])
+        elif preview['status']=='preview':
+            self.pdf_currency_evidence(data)
         with self.db.connection() as conn:
             conn.execute('BEGIN IMMEDIATE')
             preview,data=self.launch.preview(conn,pid,'price_catalog')
@@ -229,12 +233,31 @@ class Catalog:
             r['price_index_pct']=round(float((Decimal(r['unit_price'])/median-1)*100),2) if median else None
         return rows[:1000]
 
-    def extracted_price_preview(self,doc,result):
+    @staticmethod
+    def document_currency_evidence(result):
         from .imports import _explicit_currencies
         evidence='\n'.join(getattr(result,'page_texts',[]) or [])+'\n'+'\n'.join(
             line['text'] for line in getattr(result,'review_lines',[]) if line.get('confidence',0)>=.9)
         currencies=_explicit_currencies(evidence)
         if getattr(result,'currency',''):currencies.add(result.currency)
+        return sorted(currencies)
+
+    def pdf_currency_evidence(self,data):
+        currencies=data.get('document_currencies')
+        if currencies is None:
+            doc=self.db.one('SELECT * FROM source_documents WHERE id=?',(data['document_id'],))
+            if not doc:raise ConflictError('Исходный прайс отсутствует')
+            if Path(doc['filename']).suffix.lower()=='.pdf':
+                from .price_ocr import extract_price_document
+                source=self.launch.document_file(doc)
+                currencies=self.document_currency_evidence(extract_price_document(source,doc['filename']))
+            else:currencies=[]
+        if any(c!='RUB' for c in currencies):
+            raise ValueError('В исходнике указана другая валюта. Автоматической конвертации в рубли нет')
+        return currencies
+
+    def extracted_price_preview(self,doc,result):
+        currencies=self.document_currency_evidence(result)
         rows=[]
         for n,item in enumerate(result.items,1):
             rows.append({'source_row':n,'item_name':item.item_name,'specification':item.brand,'category':'',
@@ -249,12 +272,13 @@ class Catalog:
             errors.append('Позиции и цены не распознаны. Проверьте исходный файл или добавьте строки вручную; прайс пока не импортирован.')
         return self.launch.save_preview('price_catalog_pdf',{'document_id':doc['id'],'rows':rows,
             'errors':errors,'requires_review':True,'source_filename':doc['filename'],
-            'review_lines':getattr(result,'review_lines',[]),'document_currencies':sorted(currencies)})
+            'review_lines':getattr(result,'review_lines',[]),'document_currencies':currencies})
 
     def review_pdf(self,pid,rows,confirmed_rub=False):
         with self.db.connection() as conn:
             preview,data=self.launch.preview(conn,pid,'price_catalog_pdf')
             if preview['status']!='preview':raise ConflictError('Предпросмотр уже обработан')
+        currencies=self.pdf_currency_evidence(data)
         if (any(c!='RUB' for c in data.get('document_currencies',[]))
                 or any(r.get('currency') not in ('','RUB') for r in data['rows'])):
             raise ValueError('В исходнике указана другая валюта. Автоматической конвертации в рубли нет')
@@ -267,7 +291,7 @@ class Catalog:
         headers=list(ALIASES)
         # Reuse the same strict validation/dedup/import, not another permissive PDF path.
         table={'headers':headers,'sheet':'PDF','rows':[{'row':n,'cells':[r.get(k,'') for k in headers]} for n,r in enumerate(rows,1)]}
-        return self.price_preview({'id':data['document_id']},table,{k:n for n,k in enumerate(headers)})
+        return self.price_preview({'id':data['document_id']},table,{k:n for n,k in enumerate(headers)},document_currencies=currencies)
 
     def import_workbook(self,doc,rows,confirmed):
         if confirmed is not True:

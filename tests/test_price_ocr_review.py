@@ -254,6 +254,33 @@ def test_legacy_pending_pdf_rechecks_evidence_without_changing_reviewed_rows(wor
     assert not inbox.db.all('SELECT * FROM supplier_catalog_prices')
 
 
+@pytest.mark.parametrize('currency',['USD','EUR'])
+@pytest.mark.parametrize('phase',['review','apply'])
+def test_legacy_standalone_pdf_rechecks_original_not_empty_preview(workflow,monkeypatch,currency,phase):
+    from test_procurement_redesign import price_csv
+    from pathlib import Path
+    from procurement.table_ingest import read_table
+    db,service,launch=workflow
+    raw=(Path(__file__).parent/'fixtures/russian_scan.pdf').read_bytes()
+    doc=service.register_source_document(filename='legacy.pdf',content=raw,document_type='price_list',_price_import=True)
+    catalog=Catalog(service,launch)
+    row={k:price_csv().decode().strip().splitlines()[1].split(';')[n] for n,k in enumerate(ALIASES)}
+    if phase=='review':p=launch.save_preview('price_catalog_pdf',{'document_id':doc['id'],'rows':[]})
+    else:p=catalog.price_preview(doc,read_table(price_csv(),'prices.csv'))
+    before=db.one('SELECT data_json FROM launch_previews WHERE id=?',(p['preview_id'],))['data_json']
+    def extract_saved_source(content,filename):
+        from procurement.upload_io import open_payload
+        with open_payload(content) as stream:assert stream.read()==raw
+        assert filename=='legacy.pdf'
+        return result(items=[],currency=currency)
+    monkeypatch.setattr('procurement.price_ocr.extract_price_document',extract_saved_source)
+    with pytest.raises(ValueError,match='другая валюта'):
+        if phase=='review':catalog.review_pdf(p['preview_id'],[row],True)
+        else:catalog.apply_prices(p['preview_id'],True)
+    assert db.one('SELECT data_json FROM launch_previews WHERE id=?',(p['preview_id'],))['data_json']==before
+    assert not db.all('SELECT * FROM supplier_catalog_prices')
+
+
 def test_native_scan_preserves_transcript_without_mining_quantities_as_prices():
     import shutil
     from pathlib import Path
