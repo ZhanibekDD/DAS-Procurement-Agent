@@ -318,6 +318,30 @@ def test_smtp_protocol_receipt_never_exposes_auth_reply_or_secret_echo():
     assert code==451 and password not in reply and encoded not in reply and '\x00' not in reply
 
 
+@pytest.mark.parametrize('trusted_certificate',[False,True])
+def test_smtp_ssl_requires_verified_certificate_and_hostname(workflow,monkeypatch,trusted_certificate):
+    import ssl
+    db,s,w=workflow;m,_=prepare(workflow)
+    contexts=[]
+    with CaptureSMTP() as smtp:
+        smtp_env(monkeypatch,smtp);monkeypatch.setenv('PROCUREMENT_SMTP_TLS','ssl')
+        def verified_transport(host,port,*,timeout,context):
+            contexts.append(context)
+            assert context.verify_mode==ssl.CERT_REQUIRED and context.check_hostname
+            if not trusted_certificate:
+                raise ssl.SSLCertVerificationError('untrusted certificate')
+            # Only the test fixture uses plaintext loopback, after validating
+            # the context supplied to the production SMTP_SSL constructor.
+            return smtplib.SMTP(host,port,timeout=timeout)
+        monkeypatch.setattr(smtplib,'SMTP_SSL',verified_transport)
+        if trusted_certificate:
+            assert w.send(m['id'],True)['status']=='sent' and len(smtp.messages)==1
+        else:
+            with pytest.raises(ConflictError):w.send(m['id'],True)
+            assert journal(db,m['id'])['status']=='failed' and not smtp.messages
+        assert len(contexts)==1
+
+
 def test_copy_lease_migration_preserves_existing_receipt(workflow,monkeypatch):
     db,s,w=workflow;m,_=prepare(workflow)
     with CaptureSMTP() as smtp:
