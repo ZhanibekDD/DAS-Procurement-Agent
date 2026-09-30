@@ -16,5 +16,7 @@ vm.createContext(ctx);vm.runInContext(source,ctx);
  ctx.api=async()=>{throw new Error('Почта недоступна')};await ctx.loadIncomingPrices();assert.equal(target.textContent,'Почта недоступна');
  assert(source.includes("if(state.role!=='admin')return"));assert(source.includes('confirmed_source:true'));
  assert(!source.includes('setInterval('));
+ assert(source.includes("const main=['item_name','unit_price','unit','specification']"));
+ assert(source.includes("k!=='currency'"));assert(source.includes('showInboxPriceRows(p)'));
  console.log('incoming mail UI: escaped content, explicit review, no false import, admin-only PASS');
 })().catch(e=>{console.error(e);process.exitCode=1});

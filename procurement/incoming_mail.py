@@ -214,13 +214,26 @@ class Inbox:
             except (ValueError, TypeError):
                 warnings.append('Опасное имя или повреждённое вложение заблокировано.')
                 continue
-            attachment_path = stage / (aid + Path(filename).suffix.lower())
-            self.storage_budget(len(payload) + draft_bytes)
-            with attachment_path.open('xb') as output:
-                os.chmod(attachment_path, 0o600)
-                output.write(payload)
-                output.flush()
-                os.fsync(output.fileno())
+            name = aid + Path(filename).suffix.lower()
+            final = self.root / name
+            sha = hashlib.sha256(payload).hexdigest()
+            recovered = final.exists() or final.is_symlink()
+            if recovered:
+                # A crash may have published this immutable file before commit.
+                # It is already charged by storage_budget; reuse it in place,
+                # reserving only the new draft rather than another payload.
+                if final.is_symlink() or not final.is_file() or payload_sha256(FilePayload(final)) != sha:
+                    raise ConflictError('Конфликт неизменяемого исходника')
+                attachment_path = final
+                self.storage_budget(draft_bytes)
+            else:
+                attachment_path = stage / name
+                self.storage_budget(len(payload) + draft_bytes)
+                with attachment_path.open('xb') as output:
+                    os.chmod(attachment_path, 0o600)
+                    output.write(payload)
+                    output.flush()
+                    os.fsync(output.fileno())
             try:
                 draft = extract_draft(attachment_path, filename)
                 encoded = bounded_draft(draft)
@@ -230,7 +243,7 @@ class Inbox:
                 encoded, error = bounded_draft({'rows': [], 'errors': [RECOGNITION_ERROR]}), RECOGNITION_ERROR
             draft_bytes += len(encoded.encode('utf-8'))
             self.storage_budget(draft_bytes)
-            saved.append((aid, mid, number, filename, hashlib.sha256(payload).hexdigest(), len(payload), encoded, error))
+            saved.append((aid, mid, number, filename, sha, len(payload), encoded, error))
         try:
             with self.db.connection() as conn:
                 conn.execute('BEGIN IMMEDIATE')
@@ -240,6 +253,10 @@ class Inbox:
                 for aid, _, _, filename, sha, *_ in saved:
                     name = aid + Path(filename).suffix.lower()
                     final = self.root / name
+                    if final.exists() or final.is_symlink():
+                        if final.is_symlink() or not final.is_file() or payload_sha256(FilePayload(final)) != sha:
+                            raise ConflictError('Конфликт неизменяемого исходника')
+                        continue
                     try:
                         os.link(stage / name, final)  # exclusive, no overwritten originals
                         published.append((aid, final))

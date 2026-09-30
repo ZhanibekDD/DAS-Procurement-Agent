@@ -2,7 +2,8 @@ import hashlib
 import json
 from email.message import EmailMessage
 import pytest
-from procurement.incoming_mail import Inbox, MAX_DRAFT_BYTES
+from procurement.incoming_mail import Inbox, MAX_DRAFT_BYTES, bounded_draft, extract_draft
+from procurement.service import ConflictError
 from test_launch_workflow import workflow
 from test_incoming_mail import ingest, message
 from test_procurement_redesign import price_csv
@@ -71,3 +72,35 @@ def test_after_crash_stable_file_is_reused_and_stale_staging_cleaned(workflow,tm
     path=tmp_path/'one.eml';path.write_bytes(message());inbox.ingest('account',1,1,path)
     assert original.stat().st_mtime_ns==old and len(list(inbox.root.iterdir()))==1
     assert inbox.db.one('SELECT id FROM inbox_attachments')['id']==aid
+
+
+@pytest.mark.parametrize('recovered_count',[1,2])
+def test_recovery_at_exact_quota_charges_each_payload_once(workflow,tmp_path,monkeypatch,recovered_count):
+    db,s,w=workflow;inbox=Inbox(s,w);inbox.root.mkdir()
+    path=tmp_path/'two.eml';two_attachments(path);originals=[]
+    for number in range(1,recovered_count+1):
+        aid=hashlib.sha256(json.dumps(['account',1,1,number]).encode()).hexdigest()[:32]
+        original=inbox.root/(aid+'.csv');original.write_bytes(price_csv())
+        originals.append((original,original.stat().st_mtime_ns))
+    draft_size=len(bounded_draft(extract_draft(originals[0][0],'first.csv')).encode())
+    second_size=len(bounded_draft(extract_draft(originals[0][0],'second.csv')).encode())
+    limit=2*len(price_csv())+draft_size+second_size
+    monkeypatch.setattr('procurement.incoming_mail.MAX_PRIVATE_BYTES',limit)
+    inbox.ingest('account',1,1,path)
+    assert len(db.all('SELECT * FROM inbox_attachments'))==2
+    assert len(list(inbox.root.iterdir()))==2
+    assert all(p.stat().st_mtime_ns==mtime and p.read_bytes()==price_csv() for p,mtime in originals)
+    inbox.storage_budget()  # exact total fits, another byte does not
+    with pytest.raises(RuntimeError,match='inbox_storage_limit'):inbox.storage_budget(1)
+    inbox.ingest('account',1,1,path)
+    assert len(db.all('SELECT * FROM inbox_messages'))==1
+
+
+def test_recovery_rejects_conflicting_bytes_without_overwrite(workflow,tmp_path):
+    db,s,w=workflow;inbox=Inbox(s,w);inbox.root.mkdir()
+    aid=hashlib.sha256(json.dumps(['account',1,1,1]).encode()).hexdigest()[:32]
+    original=inbox.root/(aid+'.csv');original.write_bytes(b'other immutable bytes')
+    path=tmp_path/'one.eml';path.write_bytes(message())
+    with pytest.raises(ConflictError):inbox.ingest('account',1,1,path)
+    assert original.read_bytes()==b'other immutable bytes'
+    assert not db.all('SELECT * FROM inbox_messages') and len(list(inbox.root.iterdir()))==1
