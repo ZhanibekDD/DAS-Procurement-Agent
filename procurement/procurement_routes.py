@@ -305,7 +305,7 @@ def install(app,settings,service,launch,require_access,write_access,session_clai
         async with staged_upload(file) as content:
             suffix=Path(file.filename or '').suffix.lower()
             if suffix=='.pdf':
-                from .imports import extract_document
+                from .price_ocr import extract_price_document as extract_document
                 result=await run_in_threadpool(call,extract_document,content,file.filename)
                 doc=await run_in_threadpool(call,lambda:service.register_source_document(filename=file.filename,content=content,document_type='price_list',_price_import=True))
                 return await run_in_threadpool(call,catalog.extracted_price_preview,doc,result)
@@ -328,7 +328,7 @@ def install(app,settings,service,launch,require_access,write_access,session_clai
         from email.parser import BytesParser
         from .upload_io import open_payload,payload_sha256
         from .table_ingest import safe_upload
-        from .imports import extract_document
+        from .price_ocr import extract_price_document as extract_document
         async with staged_upload(file) as content:
             if Path(file.filename or '').suffix.lower()!='.eml' or len(content)>20*1024*1024:
                 raise HTTPException(422,'Ожидается исходное входящее письмо EML не больше 20 МБ')

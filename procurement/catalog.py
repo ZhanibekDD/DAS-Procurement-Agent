@@ -237,7 +237,8 @@ class Catalog:
         if not rows:
             errors.append('Позиции и цены не распознаны. Проверьте исходный файл или добавьте строки вручную; прайс пока не импортирован.')
         return self.launch.save_preview('price_catalog_pdf',{'document_id':doc['id'],'rows':rows,
-            'errors':errors,'requires_review':True,'source_filename':doc['filename']})
+            'errors':errors,'requires_review':True,'source_filename':doc['filename'],
+            'review_lines':getattr(result,'review_lines',[])})
 
     def review_pdf(self,pid,rows):
         with self.db.connection() as conn:

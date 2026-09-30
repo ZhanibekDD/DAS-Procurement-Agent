@@ -110,8 +110,25 @@ async function previewCatalogImport(){const file=$('#catalogFile').files[0];if(!
  }catch(e){toast(e.message,true)}}
 const catalogFieldLabels={item_name:'Товар',specification:'Характеристики',category:'Категория',unit:'Единица',unit_price:'Цена',currency:'Валюта',vat:'НДС',delivery:'Доставка',region:'Регион',minimum_batch:'Минимальная партия',price_date:'Дата прайса',valid_until:'Действует до',supplier_name:'Поставщик',tax_id:'ИНН',email:'Email',phone:'Телефон'};
 let catalogPdfRows=[];
-function showPdfPricePreview(p){catalogPdfRows=p.rows.map(r=>({...Object.fromEntries(Object.keys(catalogFieldLabels).map(k=>[k,String(r[k]||'')])),review_warning:r.review_warning||''}));const draw=()=>{$('#catalogImportPreview').innerHTML=`<p>Исходник: ${esc(p.source_filename)}. Найдено позиций: ${catalogPdfRows.length}. Неизвестные поля пусты; заполните их по оригиналу.</p>${(p.errors||[]).length?`<details><summary>Требуют проверки: ${p.errors.length}. Замечания также показаны у соответствующих цен.</summary><ul>${p.errors.map(e=>`<li>${esc(e)}</li>`).join('')}</ul></details>`:''}<div class="table-wrap"><table>${catalogPdfRows.map((r,n)=>`<tr>${Object.entries(catalogFieldLabels).map(([k,label])=>`<td><label>${label}<input data-price-row="${n}" data-price-field="${k}" value="${esc(r[k])}" ${k==='unit_price'&&r.review_warning&&!r.unit_price?'aria-invalid="true" style="border:2px solid #b91c1c"':''}></label>${k==='unit_price'&&r.review_warning?`<small role="note">${esc(r.review_warning)}</small>`:''}</td>`).join('')}<td><button type="button" data-price-remove="${n}">Убрать</button></td></tr>`).join('')}</table></div><button type="button" id="pdfPriceAdd">Добавить строку</button>`;
-document.querySelectorAll('[data-price-row]').forEach(e=>e.oninput=()=>{catalogPdfRows[Number(e.dataset.priceRow)][e.dataset.priceField]=e.value});document.querySelectorAll('[data-price-remove]').forEach(e=>e.onclick=()=>{catalogPdfRows.splice(Number(e.dataset.priceRemove),1);draw()});$('#pdfPriceAdd').onclick=()=>{catalogPdfRows.push(Object.fromEntries(Object.keys(catalogFieldLabels).map(k=>[k,''])));draw()};};draw();$('#modalSubmit').textContent='Проверить строки';$('#modalSubmit').onclick=async()=>{try{const checked=await launchJson(`/api/procurement/catalog/${p.preview_id}/review-pdf`,'POST',{rows:catalogPdfRows});showConfirmedCatalog(checked)}catch(e){toast(e.message,true)}}}
+function catalogEditableRows(){return catalogPdfRows.map(r=>Object.fromEntries(Object.keys(catalogFieldLabels).map(k=>[k,String(r[k]??'')])));}
+function catalogRowErrors(errors){
+  const target=$('#catalogRowErrors');
+  if(target)target.innerHTML='<p><b>Прайс пока не сохранён. Исправьте указанные строки:</b></p>'+errors.map(e=>`<p>Строка ${Number(e.row)}: ${esc(e.error)}</p>`).join('');
+  toast(errors.map(e=>`Строка ${e.row}: ${e.error}`).slice(0,5).join('; '),true);
+}
+function showPdfPricePreview(p){
+  showInboxPriceRows({...p,filename:p.source_filename});
+  if($('#catalogMapping'))catalogCommonFields($('#catalogMapping'));
+  $('#modalSubmit').textContent='Проверить строки';
+  $('#modalSubmit').onclick=async()=>{
+    const button=$('#modalSubmit');button.disabled=true;
+    try{
+      const checked=await launchJson(`/api/procurement/catalog/${p.preview_id}/review-pdf`,'POST',{rows:catalogEditableRows()});
+      if(checked.errors?.length){catalogRowErrors(checked.errors);return;}
+      showConfirmedCatalog(checked);
+    }catch(e){toast(e.message,true)}finally{button.disabled=false}
+  };
+}
 function showConfirmedCatalog(p){$('#catalogImportPreview').innerHTML=`<p>Корректных строк ${p.rows.length}; ошибок ${p.errors.length}</p>${p.errors.map(e=>`<p>Строка ${e.row}: ${esc(e.error)}</p>`).join('')}<details><summary>Проверенные строки</summary>${p.rows.map(r=>`<p>${esc(JSON.stringify(r))}</p>`).join('')}</details><label><input id="catalogConfirmed" type="checkbox"> Подтверждаю корректные строки; строки с указанными ошибками пропустить</label>`;$('#modalSubmit').textContent='Импортировать';$('#modalSubmit').onclick=async()=>{if(!$('#catalogConfirmed').checked)return toast('Подтвердите строки',true);try{const r=await launchJson(`/api/procurement/catalog/${p.preview_id}/apply`,'POST',{confirmed:true});$('#modal').close();await loadAll();showView('pricebook');toast(`Добавлено ${r.added}, пропущено ${r.skipped}; ошибок ${r.errors.length}`)}catch(e){toast(e.message,true)}}}
 function openIncomingPrices(){launchModal('Прайсы из входящей почты',`<p>Сохраните исходное входящее письмо как EML и загрузите сюда. Вложения XLSX/CSV/PDF разбираются отдельно; отправитель письма не считается подтверждённым поставщиком.</p><input id="incomingPriceMail" type="file" accept=".eml"><div id="incomingPriceChoices"></div><div id="catalogImportPreview"></div>`,'Предпросмотр',async()=>{const file=$('#incomingPriceMail').files[0];if(!file)return toast('Выберите EML',true);try{const fd=new FormData();fd.append('file',file);const result=await api('/api/procurement/catalog/incoming-mail',{method:'POST',body:fd});$('#incomingPriceChoices').innerHTML=result.previews.map((p,n)=>`<button type="button" id="incomingPrice${n}" class="btn secondary">Вложение ${n+1}</button>`).join('');result.previews.forEach((p,n)=>{$('#incomingPrice'+n).onclick=()=>p.requires_review?showPdfPricePreview(p):showConfirmedCatalog(p)});toast('Вложения извлечены; выберите и проверьте каждое')}catch(e){toast(e.message,true)}})}
 const catalogWithMail=renderPricebook;
@@ -149,29 +166,22 @@ async function loadIncomingPrices(before=null){
 }
 async function openInboxAttachment(id){
   try{
-    const p=await api('/api/procurement/inbox/attachments/'+encodeURIComponent(id));
+    let p=await api('/api/procurement/inbox/attachments/'+encodeURIComponent(id));
+    if((p.recognition_version||0)<2){
+      toast('Распознаём исходное КП. Это может занять до нескольких минут.');
+      p=await launchJson('/api/procurement/inbox/attachments/'+encodeURIComponent(id)+'/recognize','POST',{});
+    }
     launchModal('Проверка входящего КП',`<p><a href="/api/procurement/inbox/attachments/${encodeURIComponent(id)}/original" target="_blank" rel="noopener">Открыть оригинал: ${esc(p.filename)}</a></p><p>Проверьте компанию по документу. Отправитель письма не подтверждает ИНН и реквизиты.</p><div id="inboxCommon"></div><div id="catalogImportPreview"></div><label><input id="inboxVerified" type="checkbox"> Реквизиты сверены с оригиналом, цены указаны в рублях</label>`,'Проверить строки',()=>{});
     showInboxPriceRows(p);
-    const common=['supplier_name','tax_id','email','phone','region','price_date','valid_until','vat','delivery'];
-    $('#inboxCommon').innerHTML='<details><summary>Заполнить общие реквизиты в пустых полях всех строк</summary>'+common.map(k=>`<label>${esc(catalogFieldLabels[k])}<input data-inbox-common="${k}"></label>`).join('')+'<button type="button" class="btn secondary" id="fillInboxCommon">Применить к пустым полям</button></details>';
-    $('#fillInboxCommon').onclick=()=>{
-      document.querySelectorAll('[data-inbox-common]').forEach(input=>{
-        if(!input.value.trim())return;
-        document.querySelectorAll('[data-price-field]').forEach(cell=>{
-          if(cell.dataset.priceField===input.dataset.inboxCommon&&!cell.value.trim()){
-            cell.value=input.value.trim();cell.dispatchEvent(new Event('input'));
-          }
-        });
-      });
-    };
+    catalogCommonFields($('#inboxCommon'));
     $('#modalSubmit').onclick=async()=>{
       if(!$('#inboxVerified').checked)return toast('Подтвердите реквизиты по оригиналу и цены в рублях',true);
       const button=$('#modalSubmit');button.disabled=true;
       try{
-        const rows=catalogPdfRows.map(r=>Object.fromEntries(Object.keys(catalogFieldLabels).map(k=>[k,String(r[k]||'')])));
+        const rows=catalogEditableRows();
         const checked=await launchJson('/api/procurement/inbox/attachments/'+encodeURIComponent(id)+'/review','POST',{rows,confirmed_source:true});
         if(checked.requires_correction){
-          toast(checked.errors.map(e=>`Строка ${e.row}: ${e.error}`).slice(0,5).join('; '),true);return;
+          catalogRowErrors(checked.errors);return;
         }
         showConfirmedCatalog(checked);
       }catch(e){toast(e.message,true)}finally{button.disabled=false}
@@ -179,13 +189,27 @@ async function openInboxAttachment(id){
   }catch(e){toast(e.message,true)}
 }
 
+function catalogCommonFields(target){
+  const common=['supplier_name','tax_id','email','phone','region','price_date','valid_until','vat','delivery'];
+  target.innerHTML='<details><summary>Заполнить общие реквизиты в пустых полях всех строк</summary>'+common.map(k=>`<label>${esc(catalogFieldLabels[k])}<input data-inbox-common="${k}" ${['price_date','valid_until'].includes(k)?'placeholder="ГГГГ-ММ-ДД"':''}></label>`).join('')+'<button type="button" class="btn secondary" id="fillInboxCommon">Применить к пустым полям</button></details>';
+  $('#fillInboxCommon').onclick=()=>{
+    document.querySelectorAll('[data-inbox-common]').forEach(input=>{
+      if(!input.value.trim())return;
+      document.querySelectorAll('[data-price-field]').forEach(cell=>{
+        if(cell.dataset.priceField===input.dataset.inboxCommon&&!cell.value.trim()){
+          cell.value=input.value.trim();cell.dispatchEvent(new Event('input'));
+        }
+      });
+    });
+  };
+}
 function showInboxPriceRows(p){
-  catalogPdfRows=p.rows.map(r=>({...Object.fromEntries(Object.keys(catalogFieldLabels).map(k=>[k,String(r[k]||'')])),review_warning:r.review_warning||''}));
+  catalogPdfRows=p.rows.map(r=>({...Object.fromEntries(Object.keys(catalogFieldLabels).map(k=>[k,String(r[k]??'')])),currency:r.currency||'RUB',review_warning:r.review_warning||''}));
   const main=['item_name','unit_price','unit','specification'];
   const remaining=Object.keys(catalogFieldLabels).filter(k=>!main.includes(k)&&k!=='currency');
   const field=(r,n,k)=>`<label style="display:flex;flex-direction:column;min-width:0">${esc(catalogFieldLabels[k])}<input style="box-sizing:border-box;width:100%;min-width:0" data-price-row="${n}" data-price-field="${k}" value="${esc(r[k])}" ${k==='unit_price'&&!r[k]?'aria-invalid="true"':''}></label>`;
   const draw=()=>{
-    $('#catalogImportPreview').innerHTML=`<p>Позиций: ${catalogPdfRows.length}. Цены — в рублях. Проверьте данные по оригиналу.</p>${(p.errors||[]).length?`<div role="alert">${p.errors.map(e=>`<p>${esc(e)}</p>`).join('')}</div>`:''}${catalogPdfRows.map((r,n)=>`<fieldset style="border:1px solid #dbe2e5;border-radius:12px;margin:12px 0;padding:12px;min-width:0"><legend>Позиция ${n+1}</legend><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px">${main.map(k=>field(r,n,k)).join('')}</div>${r.review_warning?`<p role="note">${esc(r.review_warning)}</p>`:''}${r.currency!=='RUB'?`<p role="alert">В исходнике другая или неизвестная валюта. Автоматическая конвертация не выполняется.</p>`:''}<details><summary>Поставщик и условия</summary><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-top:12px">${remaining.map(k=>field(r,n,k)).join('')}</div></details><button type="button" class="btn secondary small" data-price-remove="${n}">Убрать строку</button></fieldset>`).join('')}<button type="button" class="btn secondary" id="pdfPriceAdd">Добавить строку</button>`;
+    $('#catalogImportPreview').innerHTML=`<div id="catalogRowErrors" role="alert"></div><p>Позиций: ${catalogPdfRows.length}. Цены — в рублях. Проверьте данные по оригиналу.</p>${(p.errors||[]).length?`<div role="alert">${p.errors.map(e=>`<p>${esc(e)}</p>`).join('')}</div>`:''}${(p.review_lines||[]).length?`<details><summary>Все строки распознанного документа — проверьте полноту</summary><pre style="white-space:pre-wrap">${esc(p.review_lines.map(l=>`Страница ${l.page}, строка ${l.line}: ${l.text}`).join('\n'))}</pre></details>`:''}${catalogPdfRows.map((r,n)=>`<fieldset style="border:1px solid #dbe2e5;border-radius:12px;margin:12px 0;padding:12px;min-width:0"><legend>Позиция ${n+1}</legend><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px">${main.map(k=>field(r,n,k)).join('')}</div>${r.review_warning?`<p role="note">${esc(r.review_warning)}</p>`:''}${r.currency!=='RUB'?`<p role="alert">В исходнике другая или неизвестная валюта. Автоматическая конвертация не выполняется.</p>`:''}<details><summary>Поставщик и условия</summary><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-top:12px">${remaining.map(k=>field(r,n,k)).join('')}</div></details><button type="button" class="btn secondary small" data-price-remove="${n}">Убрать строку</button></fieldset>`).join('')}<button type="button" class="btn secondary" id="pdfPriceAdd">Добавить строку</button>`;
     document.querySelectorAll('[data-price-row]').forEach(e=>e.oninput=()=>{catalogPdfRows[Number(e.dataset.priceRow)][e.dataset.priceField]=e.value});
     document.querySelectorAll('[data-price-remove]').forEach(e=>e.onclick=()=>{catalogPdfRows.splice(Number(e.dataset.priceRemove),1);draw()});
     $('#pdfPriceAdd').onclick=()=>{catalogPdfRows.push({...Object.fromEntries(Object.keys(catalogFieldLabels).map(k=>[k,''])),currency:'RUB'});draw()};

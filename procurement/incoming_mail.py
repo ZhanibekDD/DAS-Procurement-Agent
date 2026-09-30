@@ -84,7 +84,7 @@ def extract_draft(path, filename):
     payload = FilePayload(path)
     safe_upload(payload, filename, {'.pdf', '.xlsx', '.csv'})
     if Path(filename).suffix.lower() == '.pdf':
-        from .imports import extract_document
+        from .price_ocr import extract_price_document as extract_document
         result = extract_document(payload, filename)
         # Reuse the same OCR/price interpretation without writing shared previews.
         catalog = object.__new__(Catalog)
@@ -121,6 +121,8 @@ def extract_draft(path, filename):
             row['currency'] = 'RUB'
             row['review_warning'] = (row.get('review_warning', '') + ' Валюта не указана: подтвердите, что цена в рублях.').strip()
     draft['requires_review'] = True
+    from .price_ocr import RECOGNITION_VERSION
+    draft['recognition_version'] = RECOGNITION_VERSION
     bounded_draft(draft)
     return draft
 
@@ -305,6 +307,29 @@ class Inbox:
         row = self.attachment(aid)
         self.path(row)
         return {'id': aid, 'filename': row['filename'], 'sha256': row['sha256'], **json.loads(row['draft_json'])}
+
+    def recognize(self, aid):
+        """Upgrade an unreviewed draft, not the immutable source or saved prices."""
+        from .price_ocr import RECOGNITION_VERSION
+        row=self.attachment(aid)
+        draft=json.loads(row['draft_json'])
+        path=self.path(row)
+        if draft.get('recognition_version',0)>=RECOGNITION_VERSION:return self.detail(aid)
+        if self.db.one('SELECT 1 FROM inbox_reviews WHERE attachment_id=?',(aid,)):
+            raise ConflictError('Это КП уже проверялось. Сохранённые строки не заменены распознаванием.')
+        draft=extract_draft(path,row['filename'])
+        encoded=bounded_draft(draft)
+        with self.db.connection() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            if conn.execute('SELECT 1 FROM inbox_reviews WHERE attachment_id=?',(aid,)).fetchone():
+                raise ConflictError('КП уже проверено другим сотрудником; распознавание не заменило проверенные строки')
+            # Concurrent requests may have completed the same bounded OCR.
+            current=conn.execute('SELECT draft_json FROM inbox_attachments WHERE id=?',(aid,)).fetchone()
+            if json.loads(current['draft_json']).get('recognition_version',0)<RECOGNITION_VERSION:
+                conn.execute('UPDATE inbox_attachments SET draft_json=? WHERE id=?',(encoded,aid))
+                self.db.audit('incoming_attachment_recognized','inbox_attachment',aid,
+                    details={'version':RECOGNITION_VERSION,'rows':len(draft['rows'])},conn=conn)
+        return self.detail(aid)
 
     def prepare(self, aid, rows, confirmed_source):
         if confirmed_source is not True:
