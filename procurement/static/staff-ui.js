@@ -386,7 +386,7 @@ renderPricebook = function() {
   fullRenderPricebook();
   const root = $('#pricebook');
   root.querySelector('.price-hero')?.remove();
-  const catalog = root.querySelector(':scope > section.panel');
+  const catalog = root.querySelector('#catalogQuery')?.closest('section.panel');
   catalog?.querySelector(':scope > p')?.remove();
   const upload = catalog?.querySelector('button[onclick*="openCatalogImport"]');
   const incoming = catalog?.querySelector('button[onclick*="openIncomingPrices"]');

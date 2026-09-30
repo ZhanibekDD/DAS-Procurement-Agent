@@ -383,6 +383,8 @@ class Database:
             conn.executescript(CATALOG_SCHEMA)
             from .price_memory import SCHEMA as MEMORY_SCHEMA
             conn.executescript(MEMORY_SCHEMA)
+            from .incoming_mail import SCHEMA as INBOX_SCHEMA
+            conn.executescript(INBOX_SCHEMA)
             self._migrate_columns(conn)
             for code, template in DEFAULT_TEMPLATES.items():
                 conn.execute(

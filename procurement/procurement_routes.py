@@ -57,6 +57,9 @@ def install(app,settings,service,launch,require_access,write_access,session_clai
         try:return fn(*args)
         except Exception as exc:raise domain_error(exc) from None
 
+    from .incoming_routes import install as install_incoming
+    install_incoming(app,service,launch,require_access,write_access,call)
+
     def role(request):
         principal=getattr(request.state,'das_principal',{}) or session_claims(request.cookies.get('procurement_session','')) or {}
         return principal.get('role','staff')

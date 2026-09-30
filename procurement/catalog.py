@@ -6,7 +6,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 
 from .db import utcnow
-from .identity import trusted_actor
+from .identity import trusted_actor, trusted_role
 from .models import SupplierCreate
 from .service import ConflictError
 from .table_ingest import contacts, valid_inn, read_table, mapped, suggested_mapping, safe_upload, validate_xlsx_expansion
@@ -160,6 +160,11 @@ class Catalog:
                 return json.loads(preview['result_json'])
             if preview['status']!='preview':
                 raise ConflictError('Предпросмотр уже обработан')
+            if data.get('inbox_attachment_id'):
+                current=conn.execute('SELECT preview_id FROM inbox_reviews WHERE attachment_id=? AND actor=?',
+                    (data['inbox_attachment_id'],trusted_actor())).fetchone()
+                if trusted_role()!='admin' or not current or current['preview_id']!=pid or data['errors']:
+                    raise ConflictError('Проверка входящего КП устарела или недоступна; откройте вложение заново')
             if not data['rows']:
                 raise ValueError('Нет корректных цен для импорта')
             doc=conn.execute('SELECT * FROM source_documents WHERE id=?',(data['document_id'],)).fetchone()
