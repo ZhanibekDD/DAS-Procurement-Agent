@@ -482,6 +482,16 @@ def _reviewable_pdf_price(value: str, currency: str) -> tuple[str, str]:
     return _pdf_price(value, currency), ''
 
 
+def _pdf_header_col(cells, aliases):
+    """Header labels begin with an alias; supplier/title substrings are not labels."""
+    for i, cell in enumerate(cells):
+        for tier in cell.splitlines():
+            label = ' '.join(tier.casefold().split())
+            if any(re.match(r'^' + re.escape(alias) + r'(?!\w)', label) for alias in aliases):
+                return i
+    return None
+
+
 def _price_table_header(table):
     """Join adjacent header tiers by column; never absorb a priced data row."""
     combined = []
@@ -489,30 +499,31 @@ def _price_table_header(table):
         cells = [str(c or '').strip() for c in (row or [])]
         if not cells:
             continue
-        # A merged report title is not a header tier. In particular, its
-        # "прайс" label must never turn an article column into a price column.
-        if not combined and (sum(bool(c) for c in cells) < 2
-                             or _col_index(cells, _NAME_COL_NAMES) is None):
+        # Captions can occupy several cells (including supplier names/dates).
+        # They are not column labels, unlike a legitimate price-only first tier.
+        if any(re.match(r'^(?:прайс[\s\-–—]*лист|price\s*list|прейскурант)(?!\w)', c, re.I)
+               or re.match(r'^(?:ООО|АО|ЗАО|ПАО|ИП)\s', c, re.I) for c in cells):
             continue
         if combined and len(cells) != len(combined):
             break
         if not combined:
             combined = [''] * len(cells)
         # A two-tier heading has empty/label cells, not a numeric price.
-        if ri and any(re.search(r'\d', c) for c in cells):
+        if any(re.search(r'\d', re.sub(r'\b[мm][23]\b', '', c, flags=re.I)) for c in cells):
             break
         # A complete explicit header takes precedence over preceding tiers.
         # Merge only genuinely split headings, retaining their column geometry.
-        row_nc, row_pc = _col_index(cells, _NAME_COL_NAMES), _col_index(cells, _PRICE_COL_NAMES)
+        row_nc, row_pc = _pdf_header_col(cells, _NAME_COL_NAMES), _pdf_header_col(cells, _PRICE_COL_NAMES)
         if row_nc is not None and row_pc is not None and row_nc != row_pc:
             combined = cells
         else:
-            combined = [' '.join(filter(None, (a, b))) for a, b in zip(combined, cells)]
-        nc, pc = _col_index(combined, _NAME_COL_NAMES), _col_index(combined, _PRICE_COL_NAMES)
+            combined = ['\n'.join(filter(None, (a, b))) for a, b in zip(combined, cells)]
+        nc, pc = _pdf_header_col(combined, _NAME_COL_NAMES), _pdf_header_col(combined, _PRICE_COL_NAMES)
         if nc is not None and pc is not None and nc != pc:
+            ancillary = ['' if i in (nc, pc) else label for i, label in enumerate(combined)]
             quantities = ['' if re.search(r'\b(?:масса|вес)\b|\b(?:м3|м³|кг|kg)\b', label, re.I) else label
-                          for label in combined]
-            return ri, (nc, pc, _col_index(quantities, _QTY_COL_NAMES), _col_index(combined, _UNIT_COL_NAMES))
+                          for label in ancillary]
+            return ri, (nc, pc, _pdf_header_col(quantities, _QTY_COL_NAMES), _pdf_header_col(ancillary, _UNIT_COL_NAMES))
     return None
 
 

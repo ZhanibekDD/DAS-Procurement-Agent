@@ -36,6 +36,26 @@ def test_complete_header_overrides_earlier_title_tier():
     rows=[['Прайс-лист','АО Завод','',''],['Артикул','Наименование','Цена, руб.','Ед.'],['529000','ФБС','8897','шт']]
     assert _price_table_header(rows)==(1,(1,2,None,3))
 
+@pytest.mark.parametrize('price_label',['Стоимость','Цена','Unit price','Цена с НДС'])
+@pytest.mark.parametrize('title',[None,['Прайс-лист на 2026 год','ООО Товарный дом','']])
+def test_price_only_first_tier_is_retained(price_label,title):
+    rows=[['','',price_label],['Артикул','Наименование','с НДС'],['529000','ФБС','8897']]
+    if title:rows.insert(0,title)
+    assert _price_table_header(rows)==(2 if title else 1,(1,2,None,None))
+
+@pytest.mark.parametrize('caption',[
+    ['Прайс-лист на 2026 год','ООО Товарный дом',''],
+    ['Price list 2026','Item Company',''],
+    ['ПРАЙС—ЛИСТ','Наименование компании',''],
+    ['Прейскурант','Товарный дом',''],
+])
+def test_multi_cell_caption_does_not_become_header(caption):
+    rows=[caption,['Артикул','Наименование','Цена с НДС, руб.'],['529000','ФБС','8897']]
+    assert _price_table_header(rows)==(1,(1,2,None,None))
+
+def test_supplier_alias_substring_does_not_form_a_header():
+    assert _price_table_header([['Прайс-лист','ООО Товарный дом',''],['Артикул','Каталог',''],['529000','ФБС','8897']]) is None
+
 @pytest.mark.parametrize('raw,expected',[('8,897.46 руб.','8897.46'),('1 093,12 руб.','1093.12'),('1.093,12 ₽','1093.12'),('1093.12','1093.12')])
 def test_explicit_pdf_prices(raw,expected):
     assert _pdf_price(raw,'RUB')==expected
