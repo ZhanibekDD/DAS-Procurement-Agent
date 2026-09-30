@@ -125,11 +125,14 @@ class Mailbox:
     def logout(self):pass
     def shutdown(self):pass
     def uid(self,command,ids,fields):
-        assert command=='FETCH';self.commands.append((ids,fields))
+        assert command in {'SEARCH','FETCH'};self.commands.append((ids,fields))
         if self.failed:raise OSError('sensitive-token-password-example')
+        if command=='SEARCH':
+            lo,hi=map(int,fields.removeprefix('UID ').split(':'))
+            return 'OK',[b' '.join(str(uid).encode() for uid in self.messages if lo<=uid<=hi)]
         if fields=='(UID RFC822.SIZE)':
-            lo,hi=map(int,ids.split(':'))
-            return 'OK',[f'{uid} (UID {uid} RFC822.SIZE {len(raw)})'.encode() for uid,raw in self.messages.items() if lo<=uid<=hi] or [None]
+            expected=set(map(int,ids.split(',')))
+            return 'OK',[f'{uid} (UID {uid} RFC822.SIZE {len(raw)})'.encode() for uid,raw in self.messages.items() if uid in expected] or [None]
         import re
         offset,count=map(int,re.search(r'<(\d+)\.(\d+)>',fields).groups())
         raw=self.messages[int(ids)][offset:offset+count]
@@ -147,7 +150,7 @@ def test_poll_bounded_incremental_no_flags_or_resends(workflow,tmp_path,mailbox_
     assert db.one('SELECT last_uid FROM inbox_state')['last_uid']==25
     assert poll(inbox,lambda:mb)=={'status':'ok','received':1,'caught_up':True}
     assert poll(inbox,lambda:mb)['received']==0
-    assert all('PEEK' in fields or fields=='(UID RFC822.SIZE)' for _,fields in mb.commands)
+    assert all('PEEK' in fields or fields=='(UID RFC822.SIZE)' or fields.startswith('UID ') for _,fields in mb.commands)
     assert len(db.all('SELECT * FROM inbox_messages'))==2 and not list(inbox.root.glob('.intake-*'))
 
 

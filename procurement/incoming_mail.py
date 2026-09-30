@@ -387,22 +387,35 @@ def numeric_response(client, name):
 
 
 def message_sizes(client, low, high):
-    typ, values = client.uid('FETCH', f'{low}:{high}', '(UID RFC822.SIZE)')
-    if typ != 'OK':
+    # Discover the expected set independently. An OK FETCH is not proof that
+    # every existing UID in the numeric window was returned (expunges/races or
+    # truncated responses). A mismatch retries the same cursor next minute.
+    typ, values = client.uid('SEARCH', None, f'UID {low}:{high}')
+    if (typ != 'OK' or not isinstance(values, list) or len(values) != 1
+            or not isinstance(values[0], bytes) or len(values[0]) > UID_BATCH * 11):
+        raise OSError('Не удалось подтвердить список писем')
+    ids = values[0].split()
+    if (len(ids) > UID_BATCH or any(not re.fullmatch(rb'[1-9][0-9]{0,9}', uid) for uid in ids)):
+        raise ValueError('Некорректный список UID')
+    expected = {int(uid) for uid in ids}
+    if len(expected) != len(ids) or any(not low <= uid <= high for uid in expected):
+        raise ValueError('Несовпадение диапазона UID')
+    if not expected:
+        return []
+    typ, values = client.uid('FETCH', ','.join(map(str, sorted(expected))), '(UID RFC822.SIZE)')
+    if typ != 'OK' or not isinstance(values, list) or len(values) != len(expected):
         raise OSError('Не удалось получить список писем')
     result = {}
     for value in values:
-        if value is None:
-            continue
         if not isinstance(value, bytes) or len(value) > 200:
             raise ValueError('Некорректный ответ почты')
         uid = re.search(rb'\bUID ([0-9]+)\b', value)
         size = re.search(rb'\bRFC822.SIZE ([0-9]+)\b', value)
-        if not uid or not size or int(uid[1]) in result or not low <= int(uid[1]) <= high:
+        if not uid or not size or int(uid[1]) in result or int(uid[1]) not in expected:
             raise ValueError('Некорректный список писем')
         result[int(uid[1])] = int(size[1])
-    if len(result) > UID_BATCH:
-        raise ValueError('Слишком много писем за проверку')
+    if set(result) != expected:
+        raise OSError('Получены не все письма; проверка будет повторена')
     return sorted(result.items())
 
 
