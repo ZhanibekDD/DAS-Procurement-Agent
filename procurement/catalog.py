@@ -224,6 +224,11 @@ class Catalog:
         return rows[:1000]
 
     def extracted_price_preview(self,doc,result):
+        from .imports import _explicit_currencies
+        evidence='\n'.join(getattr(result,'page_texts',[]) or [])+'\n'+'\n'.join(
+            line['text'] for line in getattr(result,'review_lines',[]) if line.get('confidence',0)>=.9)
+        currencies=_explicit_currencies(evidence)
+        if getattr(result,'currency',''):currencies.add(result.currency)
         rows=[]
         for n,item in enumerate(result.items,1):
             rows.append({'source_row':n,'item_name':item.item_name,'specification':item.brand,'category':'',
@@ -238,13 +243,14 @@ class Catalog:
             errors.append('Позиции и цены не распознаны. Проверьте исходный файл или добавьте строки вручную; прайс пока не импортирован.')
         return self.launch.save_preview('price_catalog_pdf',{'document_id':doc['id'],'rows':rows,
             'errors':errors,'requires_review':True,'source_filename':doc['filename'],
-            'review_lines':getattr(result,'review_lines',[])})
+            'review_lines':getattr(result,'review_lines',[]),'document_currencies':sorted(currencies)})
 
     def review_pdf(self,pid,rows,confirmed_rub=False):
         with self.db.connection() as conn:
             preview,data=self.launch.preview(conn,pid,'price_catalog_pdf')
             if preview['status']!='preview':raise ConflictError('Предпросмотр уже обработан')
-        if any(r.get('currency') not in ('','RUB') for r in data['rows']):
+        if (any(c!='RUB' for c in data.get('document_currencies',[]))
+                or any(r.get('currency') not in ('','RUB') for r in data['rows'])):
             raise ValueError('В исходнике указана другая валюта. Автоматической конвертации в рубли нет')
         if (not data['rows'] or any(not r.get('currency') for r in data['rows'])
                 or any(not r.get('currency') for r in rows)) and confirmed_rub is not True:

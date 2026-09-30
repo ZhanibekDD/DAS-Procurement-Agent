@@ -71,7 +71,7 @@ def scanned_items(lines, page, currency, vat):
                (TOTAL.match(c['text'].strip()) or (c is not heading and NAME.fullmatch(c['text'].strip())))]
         end=min(stops,default=float('inf'))
         names=[c for c in cells if header_bottom<c['bbox']['top']<end and
-               c['bbox']['left']<right and re.search('[А-Яа-яA-Za-z]',c['text']) and
+               heading['bbox']['left']-height<=c['bbox']['left']<right and re.search('[А-Яа-яA-Za-z]',c['text']) and
                not re.fullmatch(r'\d+(?:[.,]\d+)?\s*'+UNIT,c['text'].strip(),re.I)]
         for name in names:
             baseline=center(name,'y')

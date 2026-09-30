@@ -348,6 +348,10 @@ class Inbox:
         if any(row.get('currency') != 'RUB' for row in rows):
             raise ValueError('Поддерживаются цены в рублях; автоматической конвертации валют нет')
         attachment = self.attachment(aid)
+        source=json.loads(attachment['draft_json'])
+        if (any(c!='RUB' for c in source.get('document_currencies',[]))
+                or any(r.get('currency') not in ('','RUB') for r in source['rows'])):
+            raise ValueError('В исходнике указана другая валюта. Автоматической конвертации в рубли нет')
         applied = self.db.one('''SELECT 1 FROM inbox_reviews r JOIN launch_previews p ON p.id=r.preview_id
             WHERE r.attachment_id=? AND p.status='applied' ''', (aid,))
         if applied:

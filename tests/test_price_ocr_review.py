@@ -86,6 +86,14 @@ def test_missing_or_ambiguous_quantity_never_uses_neighboring_dimensions():
     assert (row.quantity,row.unit,row.unit_price)==('','','')
 
 
+@pytest.mark.parametrize('article',['ABC-001','sku42','АБВ-218'])
+def test_left_article_column_cannot_duplicate_product_rows(article):
+    lines=table()+[cell('Артикул',0,100,40),cell(article,0,180,40)]
+    rows=scanned_items(lines,1,'RUB',True)
+    assert [r.item_name for r in rows]==['ФБС 24.4.6','ФБС 12.4.6','Автоуслуги']
+    assert [r.unit_price for r in rows]==['1000.00','800.00','']
+
+
 def test_shipping_only_column_is_not_product_price():
     lines=[cell('Товар',70,100),cell('Количество',280,100),cell('Цена доставки',395,100),
            cell('ФБС 24.4.6',70,180),cell('218 шт',280,180),cell('1000',395,180)]
@@ -200,6 +208,22 @@ def test_pdf_currency_confirmation_is_strict_boolean(http_boundary):
         response=client.post('/api/procurement/catalog/unknown/review-pdf',headers=headers(user),
             json={'rows':[{'currency':'RUB'}],'confirmed_rub':value})
         assert response.status_code==422
+
+
+@pytest.mark.parametrize('currency,pages',[('USD',[]),('EUR',[]),('', ['Цена RUB / USD']),('', ['Цена EUR'])])
+def test_document_currency_evidence_survives_empty_tables(workflow,tmp_path,currency,pages):
+    from test_procurement_redesign import price_csv
+    db,service,launch=workflow
+    doc=service.register_source_document(filename='price.csv',content=price_csv(),document_type='price_list')
+    catalog=Catalog(service,launch)
+    preview=catalog.extracted_price_preview(doc,result(items=[],currency=currency,page_texts=pages))
+    assert set(preview['document_currencies'])-{'RUB'}
+    row={k:price_csv().decode().strip().splitlines()[1].split(';')[n] for n,k in enumerate(ALIASES)}
+    with pytest.raises(ValueError,match='другая валюта'):catalog.review_pdf(preview['preview_id'],[row],True)
+    inbox,_=ingest(workflow,tmp_path);attachment=inbox.db.one('SELECT * FROM inbox_attachments')
+    with db.connection() as conn:conn.execute('UPDATE inbox_attachments SET draft_json=? WHERE id=?',(json.dumps(preview),attachment['id']))
+    with admin(),pytest.raises(ValueError,match='другая валюта'):inbox.prepare(attachment['id'],[row],True)
+    assert not db.all('SELECT * FROM supplier_catalog_prices')
 
 
 def test_native_scan_preserves_transcript_without_mining_quantities_as_prices():
