@@ -4,6 +4,21 @@ const fs=require('node:fs');
 const vm=require('node:vm');
 const staff=fs.readFileSync('procurement/static/staff-ui.js','utf8');
 const flow=fs.readFileSync('procurement/static/procurement.js','utf8');
+const html=fs.readFileSync('procurement/static/index.html','utf8');
+const basisSource=html.match(/function setQuoteMoneyBasis[^\n]+/)?.[0];assert(basisSource);
+const moneySource=html.match(/function explicitMoneyBasis[^\n]+/)?.[0];assert(moneySource);
+for(const currency of ['RUB','USD','EUR','KZT']){
+ const nodes={'#qCurrency':{value:''},'#qCurrencyNotice':{textContent:''},'#qVat':{value:'false'}};
+ const context={state:{selectedLot:1},$:key=>nodes[key]};
+ const set=vm.runInNewContext(`${basisSource};setQuoteMoneyBasis`,context);
+ const money=vm.runInNewContext(`${moneySource};explicitMoneyBasis`,context);
+ assert.throws(()=>money('q'));
+ set({id:1,currency});assert.equal(nodes['#qCurrency'].value,currency);
+ assert.equal(money('q').currency,currency);assert.equal(money('q').vat_included,false);
+ const previous=nodes['#qCurrency'].value;
+ assert.throws(()=>set({id:2,currency:'RUB'}));assert.equal(nodes['#qCurrency'].value,previous);
+ assert(nodes['#qCurrencyNotice'].textContent.includes(currency==='RUB'?'рублях':currency));
+}
 for(const value of [
   "$('#quickFile').onchange=startQuickPurchase",
   "api('/api/procurement/quick-intake'",
