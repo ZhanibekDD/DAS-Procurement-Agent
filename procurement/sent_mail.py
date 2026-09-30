@@ -8,9 +8,17 @@ import imaplib
 import os
 import re
 import ssl
+import time
+from email.parser import BytesHeaderParser
 from pathlib import Path
 
 from .upload_io import CHUNK
+
+# A broken provider search index must not cause blind APPENDs or an unbounded
+# mailbox download. Only Message-ID headers are read, never bodies/attachments.
+MAX_SCAN_MESSAGES = 10000
+MAX_HEADER_BYTES = 8192
+SCAN_SECONDS = 120
 
 
 class ArchiveUncertain(Exception):
@@ -85,9 +93,71 @@ def find_message(client, folder, message_id):
     if typ != 'OK':
         raise ValueError('Папка Отправленные недоступна')
     typ, data = client.uid('SEARCH', None, 'HEADER', 'Message-ID', client._quote(message_id))
-    if typ != 'OK':
+    if typ == 'OK':
+        return _search_uids(data)
+    if typ not in {'NO', 'BAD'}:
         raise ValueError('Поиск копии письма не выполнен')
-    return (data[0] or b'').split()
+    # Some providers authenticate and FETCH correctly but reject HEADER SEARCH.
+    # An incomplete or changing scan is not proof of absence: fail closed.
+    return _scan_message_headers(client, message_id)
+
+
+def _search_uids(data):
+    if len(data) != 1 or (data[0] is not None and not isinstance(data[0], bytes)):
+        raise ValueError('Неполный результат поиска IMAP')
+    identifiers = (data[0] or b'').split()
+    if (any(not re.fullmatch(rb'[1-9][0-9]{0,9}', uid) or int(uid) > 2**32 - 1 for uid in identifiers)
+            or len(set(identifiers)) != len(identifiers)):
+        raise ValueError('Некорректный результат поиска IMAP')
+    return identifiers
+
+
+def _scan_message_headers(client, message_id):
+    deadline = time.monotonic() + SCAN_SECONDS
+
+    def all_uids():
+        if time.monotonic() >= deadline:
+            raise ValueError('Проверка копии письма превысила время ожидания')
+        typ, data = client.uid('SEARCH', None, 'ALL')
+        if typ != 'OK':
+            raise ValueError('Поиск копии письма не выполнен')
+        identifiers = _search_uids(data)
+        if len(identifiers) > MAX_SCAN_MESSAGES:
+            raise ValueError('Поиск IMAP недоступен; слишком много писем для безопасной проверки')
+        return identifiers
+
+    identifiers = all_uids()
+    found = []
+    for offset in range(0, len(identifiers), 32):
+        if time.monotonic() >= deadline:
+            raise ValueError('Проверка копии письма превысила время ожидания')
+        batch = identifiers[offset:offset + 32]
+        typ, data = client.uid('FETCH', b','.join(batch),
+                               f'(UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]<0.{MAX_HEADER_BYTES + 1}>)')
+        if typ != 'OK':
+            raise ValueError('Не удалось прочитать заголовки IMAP')
+        seen = set()
+        for part in data:
+            if not isinstance(part, tuple):
+                continue  # imaplib emits closing parentheses separately.
+            metadata, header = part
+            uid = re.search(rb'\bUID ([1-9][0-9]*)\b', metadata)
+            if (not uid or uid[1] not in batch or uid[1] in seen
+                    or not isinstance(header, bytes) or len(header) > MAX_HEADER_BYTES
+                    or (header != b'\r\n' and not header.endswith(b'\r\n\r\n'))):
+                raise ValueError('Неполные заголовки IMAP; копия не подтверждена')
+            seen.add(uid[1])
+            parsed = BytesHeaderParser().parsebytes(header)
+            values = parsed.get_all('Message-ID', [])
+            if parsed.defects or len(values) > 1:
+                raise ValueError('Неоднозначный Message-ID; копия не подтверждена')
+            if values and values[0].strip() == message_id:
+                found.append(uid[1])
+        if seen != set(batch):
+            raise ValueError('Неполные заголовки IMAP; копия не подтверждена')
+    if set(all_uids()) != set(identifiers):
+        raise ValueError('Папка изменилась во время проверки; повторите проверку копии')
+    return found
 
 
 def append_streamed(client, folder, path):

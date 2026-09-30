@@ -32,9 +32,10 @@ def imap_env(monkeypatch, server, tmp_path):
         monkeypatch.setattr('procurement.sent_mail.secret',lambda prefix:password.read_text())
 
 
-def test_recipient_sent_and_registry_match_message_id_and_exact_attachment(workflow,monkeypatch,tmp_path):
+@pytest.mark.parametrize('reject_header_search',[False,True])
+def test_recipient_sent_and_registry_match_message_id_and_exact_attachment(workflow,monkeypatch,tmp_path,reject_header_search):
     db,s,w = workflow;m,_ = prepare(workflow)
-    with CaptureSMTP() as smtp, CaptureIMAP() as imap:
+    with CaptureSMTP() as smtp, CaptureIMAP(reject_header_search=reject_header_search) as imap:
         smtp_env(monkeypatch,smtp);imap_env(monkeypatch,imap,tmp_path)
         r = w.send(m['id'],True)
         assert r['status']=='sent' and r['delivery']['sent_copy_status']=='saved' and r['warning'] is None
@@ -219,9 +220,10 @@ def test_imap_failure_warns_and_copy_retry_never_resends(workflow,monkeypatch,tm
         assert len(smtp.messages)==len(imap.messages)==1
 
 
-def test_imap_lost_ack_reconciles_without_duplicate_append(workflow,monkeypatch,tmp_path):
+@pytest.mark.parametrize('reject_header_search',[False,True])
+def test_imap_lost_ack_reconciles_without_duplicate_append(workflow,monkeypatch,tmp_path,reject_header_search):
     db,s,w=workflow;m,_=prepare(workflow)
-    with CaptureSMTP() as smtp, CaptureIMAP(drop_append_reply=True) as imap:
+    with CaptureSMTP() as smtp, CaptureIMAP(drop_append_reply=True,reject_header_search=reject_header_search) as imap:
         smtp_env(monkeypatch,smtp);imap_env(monkeypatch,imap,tmp_path)
         r=w.send(m['id'],True)
         assert r['delivery']['sent_copy_status']=='unknown'
