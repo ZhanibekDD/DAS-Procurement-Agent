@@ -8,6 +8,7 @@ const ctx={pages:{},state:{selectedLot:2,outbox:[{id:1,lot_id:3,body:'ПБ'},{id
 vm.createContext(ctx);vm.runInContext(source,ctx);
 assert.deepEqual(JSON.parse(JSON.stringify(ctx.filteredProcurementMessages(2))),[{id:2,lot_id:2,body:'ФБС'}]);
 assert.equal(ctx.procurementStage({status:'ordered'}),5);assert.equal(ctx.procurementStage({status:'rfq_sent'}),1);
+assert.equal(ctx.procurementStage({status:'rfq_sent',display_status:'rfq_unconfirmed'}),0);
 assert(!ctx.procurementDecisionControls({id:2,status:'ordered'},[{id:1,supplier_name:'Тест'}]).includes('onclick'));
 assert(ctx.procurementDecisionControls({id:2,status:'ordered'},[]).includes('Заказ уже зафиксирован'));
 assert(ctx.procurementDecisionControls({id:2,status:'comparison'},[{id:1,supplier_name:'Тест'}]).includes('chooseProcurement'));

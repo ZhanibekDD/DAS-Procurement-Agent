@@ -336,7 +336,8 @@ def test_legacy_receipt_is_honest_and_never_resent(workflow,monkeypatch):
         w.send(m['id'],True)
         with db.connection() as conn:conn.execute('DELETE FROM mail_receipts')
         r=w.send(m['id'],True)
-        assert r['duplicate'] and r['warning']==COPY_WARNING and r['delivery']['legacy']
+        assert r['duplicate'] and 'не подтверждён журналом SMTP' in r['warning'] and r['delivery']['legacy']
+        assert 'SMTP принял' not in r['warning'] and not r['accepted_by_smtp']
         assert 'rfc_message_id' not in r['delivery']
         with pytest.raises(ConflictError,match='Нет сохранённого оригинала'):copy_sent(w,m['id'],True)
         assert len(smtp.messages)==1

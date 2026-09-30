@@ -226,7 +226,8 @@ class Catalog:
                 'vat':'с НДС' if item.vat_included is True else 'без НДС' if item.vat_included is False else '',
                 'delivery':'','region':result.supplier_region,'minimum_batch':'','price_date':result.document_date or '',
                 'valid_until':result.valid_until or '','supplier_name':result.supplier_name,'tax_id':result.supplier_tax_id,
-                'email':result.supplier_email,'phone':result.supplier_phone})
+                'email':result.supplier_email,'phone':result.supplier_phone,
+                'review_warning':item.review_warning,'source_page':item.source_page})
         errors = list(result.errors)
         if not rows:
             errors.append('Позиции и цены не распознаны. Проверьте исходный файл или добавьте строки вручную; прайс пока не импортирован.')

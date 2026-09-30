@@ -110,11 +110,16 @@ def journal(db, mid):
         return None
     row = db.one('SELECT * FROM mail_receipts WHERE message_id=?', (mid,))
     if not row:
-        # Legacy SMTP acceptance is known, but exact reply/MIME was not retained.
+        # A legacy database status alone is not evidence of SMTP acceptance.
         return {**delivery, 'status':'unknown', 'legacy': True, 'sent_copy_status': 'unavailable',
                 'delivery_status': 'unconfirmed', 'retry_allowed': False,
-                'warning': COPY_WARNING if delivery['status'] == 'sent' else 'Исход старой отправки требует проверки',
+                'warning': 'Исход старой отправки не подтверждён журналом SMTP; повтор заблокирован во избежание дубликата.',
                 'events': []}
+    from .mail_evidence import smtp_accepted
+    recipient = db.one('SELECT recipient FROM outbox_messages WHERE id=?', (mid,))
+    unconfirmed = row['status'] == 'sent' and not smtp_accepted({**row, **(recipient or {})})
+    if unconfirmed:
+        row['status'] = 'unknown'
     row.pop('spool_path')  # private disk paths never exposed to the browser
     row.pop('message_id')
     expired = copy_lease_expired(row)
@@ -124,7 +129,8 @@ def journal(db, mid):
     row['retry_allowed'] = row['status'] == 'failed' or queued_lease_expired(row)
     row['copy_retry_allowed'] = row['status'] == 'sent' and (row['sent_copy_status'] in {'pending','failed','unknown'} or expired)
     row['copy_reconcile_only'] = row['sent_copy_status'] == 'unknown' or expired
-    row['warning'] = COPY_WARNING if row['status'] == 'sent' and row['sent_copy_status'] != 'saved' else None
+    row['warning'] = ('Отправка не подтверждена полным журналом SMTP; повтор заблокирован во избежание дубликата.'
+                      if unconfirmed else COPY_WARNING if row['status'] == 'sent' and row['sent_copy_status'] != 'saved' else None)
     row['events'] = []
     for item in db.all('SELECT created_at,actor,event,details_json FROM mail_events WHERE message_id=? ORDER BY id', (mid,)):
         details = json.loads(item.pop('details_json'))

@@ -331,6 +331,7 @@ class ExtractedItem:
     source_row: int | None
     source_cell: str
     source_text: str
+    review_warning: str = ''
 
 
 @dataclass
@@ -467,6 +468,15 @@ def _pdf_price(value: str, currency: str) -> str:
     return _decimal_price(value)
 
 
+def _reviewable_pdf_price(value: str, currency: str) -> tuple[str, str]:
+    # An explicitly negotiated price is not zero and not a parseable amount.
+    # Retain the row for review without weakening numeric financial validation.
+    label = ' '.join(value.casefold().split()).strip(' .')
+    if re.fullmatch(r'(?:договорная(?: цена)?|цена договорная|(?:цена |стоимость )?по (?:запросу|согласованию)|уточняйте(?: цену)?)', label):
+        return '', f'Цена «{value.strip()}» не указана числом. Уточните цену или исключите строку перед импортом.'
+    return _pdf_price(value, currency), ''
+
+
 def _price_table_header(table):
     """Join adjacent header tiers by column; never absorb a priced data row."""
     combined = []
@@ -484,7 +494,9 @@ def _price_table_header(table):
         combined = [' '.join(filter(None, (a, b))) for a, b in zip(combined, cells)]
         nc, pc = _col_index(combined, _NAME_COL_NAMES), _col_index(combined, _PRICE_COL_NAMES)
         if nc is not None and pc is not None and nc != pc:
-            return ri, (nc, pc, _col_index(combined, _QTY_COL_NAMES), _col_index(combined, _UNIT_COL_NAMES))
+            quantities = ['' if re.search(r'\b(?:масса|вес)\b|\b(?:м3|м³|кг|kg)\b', label, re.I) else label
+                          for label in combined]
+            return ri, (nc, pc, _col_index(quantities, _QTY_COL_NAMES), _col_index(combined, _UNIT_COL_NAMES))
     return None
 
 
@@ -538,7 +550,7 @@ def _extract_items_from_pdf_tables(
                         # priced row can inherit the already verified table header.
                         try:
                             assert len(first) == len(geometry) and first[nc]
-                            _pdf_price(str(first[pc] or ''), currency)
+                            _reviewable_pdf_price(str(first[pc] or ''), currency)
                         except (ValueError, AssertionError, IndexError):
                             continuation = None
                             continue
@@ -569,7 +581,7 @@ def _extract_items_from_pdf_tables(
                         if raw_name.isdigit():
                             continue
                         # Normalise price — remove thousands separators, convert comma to dot
-                        price_clean = _pdf_price(raw_price, currency)
+                        price_clean, review_warning = _reviewable_pdf_price(raw_price, currency)
                         raw_qty = ''
                         if qty_col is not None and qty_col < len(row):
                             raw_qty = str(row[qty_col] or '').strip()
@@ -596,6 +608,7 @@ def _extract_items_from_pdf_tables(
                             source_row=row_num,
                             source_cell='',
                             source_text=source_text,
+                            review_warning=review_warning,
                         ))
     except ImportError:
         pass  # pdfplumber not available — caller falls back to text method
@@ -697,6 +710,9 @@ def extract_from_pdf(content: bytes, filename: str) -> DocumentExtractResult:
     # drawings) → return 0 items; do NOT mine masses/quantities as fake prices.
     if not items and not _has_tables:
         items = _extract_items_from_pdf_text(pages, currency, vat_included)
+
+    errors.extend(f'Страница {item.source_page}, строка {item.source_row}: {item.review_warning}'
+                  for item in items if item.review_warning)
 
     return DocumentExtractResult(
         filename=filename,

@@ -42,6 +42,10 @@ assert.deepEqual(Array.from(context.staffLotCounts([
   {status:'awarded'}, {status:'ordered'}
 ]), row => [row.label, row.count]), [
   ['Черновики', 2], ['Запрос отправлен', 2],
-  ['Получены цены', 2], ['Поставщик выбран', 2]
+  ['Получены цены', 2], ['Поставщик выбран', 2], ['Проверить отправку', 0]
 ]);
+const uncertain=context.staffLotCounts([{status:'rfq_sent',display_status:'rfq_unconfirmed'}]);
+assert.equal(uncertain.find(x=>x.label==='Запрос отправлен').count,0);
+assert.equal(uncertain.find(x=>x.label==='Проверить отправку').count,1);
+assert.equal(context.humanStatus('rfq_unconfirmed'),'Отправка не подтверждена');
 console.log('staff UI: Russian statuses, server-confirmed send, safe activity and admin-only audit PASS');

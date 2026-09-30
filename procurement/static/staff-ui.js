@@ -7,6 +7,8 @@ Object.assign(mailStatus, {
 });
 const statusNames = {
   draft:'Черновик', rfq_draft:'Черновик', rfq_sent:'Запрос отправлен',
+  rfq_unconfirmed:'Отправка не подтверждена', rfq_partial:'Отправлено не всем',
+  rfq_sending:'Отправляется', rfq_queued:'В очереди', rfq_failed:'Не отправлено',
   queued:'Готов к отправке', approved:'Подтверждён', sending:'Отправляется',
   sent:'Отправлен', failed:'Не отправлено', unknown:'Результат отправки не подтверждён',
   quotes_received:'Получены цены', comparison:'Сравнение', awarded:'Поставщик выбран',
@@ -95,10 +97,11 @@ function staffLotCounts(lots) {
     ['Черновики', ['draft', 'rfq_draft']],
     ['Запрос отправлен', ['rfq_sent']],
     ['Получены цены', ['quotes_received', 'comparison']],
-    ['Поставщик выбран', ['awarded', 'ordered']]
+    ['Поставщик выбран', ['awarded', 'ordered']],
+    ['Проверить отправку', ['rfq_unconfirmed', 'rfq_partial', 'rfq_failed']]
   ];
   return stages.map(([label, statuses]) => ({
-    label, count: lots.filter(lot => statuses.includes(lot.status)).length
+    label, count: lots.filter(lot => statuses.includes(lot.display_status || lot.status)).length
   }));
 }
 
@@ -347,7 +350,7 @@ renderRfq = function() {
   const header = root.querySelector(':scope > section.panel');
   header?.querySelector('p')?.remove();
   if (launchState.config.sender) header?.insertAdjacentHTML('beforeend', `<p>Письма отправляются с <b>${esc(launchState.config.sender)}</b>. Копия сохраняется в «Отправленных» этого ящика, а не в личной почте сотрудника.</p>`);
-  if (lot) header?.insertAdjacentHTML('beforeend', `<small class="purchase-stage">Этап: ${esc(procurementStages[procurementStage(lot)])}</small>`);
+  if (lot) header?.insertAdjacentHTML('beforeend', `<small class="purchase-stage">Этап: ${esc(humanStatus(lot.display_status || lot.status))}</small>`);
   root.querySelectorAll('#procurementLot option').forEach(option => { option.textContent = option.textContent.replace(/^#\d+\s*·\s*/, ''); });
   const title = root.querySelector('h3');
   if (title?.textContent.startsWith('Позиции лота')) title.textContent = 'Позиции закупки';
