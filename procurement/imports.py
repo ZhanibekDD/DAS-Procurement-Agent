@@ -455,11 +455,16 @@ def _extract_pdf_text(content: bytes) -> tuple[list[str], list[str]]:
         return [], [f'PDF parse error: {exc}']
 
 
-def _pdf_price(value: str, currency: str) -> str:
-    """Parse an explicit price cell, not arbitrary numbers in a PDF row."""
+def _pdf_price_without_suffix(value: str, currency: str) -> str:
     value = value.strip()
     if currency == 'RUB':
         value = re.sub(r'\s*(?:руб\.?|₽|RUB)\s*$', '', value, flags=re.I)
+    return value
+
+
+def _pdf_price(value: str, currency: str) -> str:
+    """Parse an explicit price cell, not arbitrary numbers in a PDF row."""
+    value = _pdf_price_without_suffix(value, currency)
     value = re.sub(r'[\s\u00a0\u202f]', '', value)
     if re.fullmatch(r'\d{1,3}(?:,\d{3})+\.\d{2}', value):
         value = value.replace(',', '')
@@ -471,7 +476,7 @@ def _pdf_price(value: str, currency: str) -> str:
 def _reviewable_pdf_price(value: str, currency: str) -> tuple[str, str]:
     # An explicitly negotiated price is not zero and not a parseable amount.
     # Retain the row for review without weakening numeric financial validation.
-    label = ' '.join(value.casefold().split()).strip(' .')
+    label = ' '.join(_pdf_price_without_suffix(value, currency).casefold().split()).strip(' .')
     if re.fullmatch(r'(?:договорная(?: цена)?|цена договорная|(?:цена |стоимость )?по (?:запросу|согласованию)|уточняйте(?: цену)?)', label):
         return '', f'Цена «{value.strip()}» не указана числом. Уточните цену или исключите строку перед импортом.'
     return _pdf_price(value, currency), ''

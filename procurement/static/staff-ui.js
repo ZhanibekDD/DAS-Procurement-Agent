@@ -98,11 +98,16 @@ function staffLotCounts(lots) {
     ['Запрос отправлен', ['rfq_sent']],
     ['Получены цены', ['quotes_received', 'comparison']],
     ['Поставщик выбран', ['awarded', 'ordered']],
-    ['Проверить отправку', ['rfq_unconfirmed', 'rfq_partial', 'rfq_failed']]
+    ['Проверить отправку', ['rfq_unconfirmed', 'rfq_partial', 'rfq_failed']],
+    ['Отправляется', ['rfq_queued', 'rfq_sending']]
   ];
   return stages.map(([label, statuses]) => ({
     label, count: lots.filter(lot => statuses.includes(lot.display_status || lot.status)).length
   }));
+}
+
+function staffLotSummary(lots) {
+  return staffLotCounts(lots).map(stage => `<div class="mini-stat"><div><span>${esc(stage.label)}</span><b>${stage.count}</b></div></div>`).join('');
 }
 
 renderOverview = function() {
@@ -172,11 +177,7 @@ renderLots = function() {
   renderPendingQuickDrafts();
   const summary = root.querySelector('.lot-summary');
   if (summary) {
-    const stages = staffLotCounts(state.lots);
-    summary.querySelectorAll('.mini-stat').forEach((card, index) => {
-      card.querySelector('span').textContent = stages[index].label;
-      card.querySelector('b').textContent = stages[index].count;
-    });
+    summary.innerHTML = staffLotSummary(state.lots);
   }
   root.querySelectorAll(':scope > section.panel').forEach(panel => {
     if (panel.querySelector('h2')?.textContent === 'Закупочный процесс') panel.remove();

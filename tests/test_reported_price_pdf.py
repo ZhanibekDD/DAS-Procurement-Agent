@@ -21,7 +21,9 @@ def test_header_not_built_from_content():
     assert _price_table_header([['Номенклатура','Кол-во'],['Цена работ','527']]) is None
 
 @pytest.mark.parametrize('label',['Договорная','Договорная цена','по запросу','Стоимость по запросу','по согласованию'])
-def test_negotiated_price_retains_row_for_review_without_inventing_price(monkeypatch,label):
+@pytest.mark.parametrize('suffix',['',' руб.',' ₽',' RUB'])
+def test_negotiated_price_retains_row_for_review_without_inventing_price(monkeypatch,label,suffix):
+    label += suffix
     from types import SimpleNamespace
     from procurement.imports import _extract_items_from_pdf_tables
     import pdfplumber
@@ -42,6 +44,12 @@ def test_negotiated_price_retains_row_for_review_without_inventing_price(monkeyp
     assert [i.source_page for i in items]==[1,1,2,2]
     assert [bool(i.review_warning) for i in items]==[False,True,True,False]
     assert label in items[1].source_text and 'Уточните цену' in items[1].review_warning
+
+@pytest.mark.parametrize('label',['Договорная USD','по запросу EUR','Договорная руб. USD'])
+def test_negotiated_price_does_not_erase_foreign_currency(label):
+    from procurement.imports import _reviewable_pdf_price
+    with pytest.raises(ValueError):_reviewable_pdf_price(label,'RUB')
+
 
 def test_review_does_not_silently_import_empty_negotiated_price(workflow):
     from procurement.catalog import Catalog
