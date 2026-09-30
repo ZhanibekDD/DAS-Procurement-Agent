@@ -83,7 +83,7 @@ def test_provider_scan_size_and_time_limits_fail_closed(monkeypatch):
     mailbox = Mailbox()
     monkeypatch.setattr(sent_mail, 'MAX_SCAN_MESSAGES', 2)
     with pytest.raises(ValueError):sent_mail.find_message(mailbox, b'Sent', MID)
-    assert not mailbox.fetches
+    assert mailbox.searches == 0 and not mailbox.fetches
     monkeypatch.setattr(sent_mail, 'SCAN_SECONDS', 0)
     with pytest.raises(ValueError):sent_mail.find_message(Mailbox(), b'Sent', MID)
 

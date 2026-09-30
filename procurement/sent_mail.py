@@ -118,6 +118,8 @@ def _search_uids(data):
 
 def _scan_message_headers(client, message_id, selected_count):
     """A wall-clock watchdog also interrupts trickling socket reads."""
+    if selected_count > MAX_SCAN_MESSAGES:
+        raise ValueError('Поиск IMAP недоступен; слишком много писем для безопасной проверки')
     if SCAN_SECONDS <= 0:
         raise ValueError('Проверка копии письма превысила время ожидания')
     deadline = time.monotonic() + SCAN_SECONDS
