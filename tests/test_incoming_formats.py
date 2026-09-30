@@ -1,3 +1,4 @@
+import errno
 import io
 import json
 import subprocess
@@ -181,6 +182,35 @@ def test_temporary_dns_is_identified_before_login(monkeypatch):
     monkeypatch.setenv('PROCUREMENT_IMAP_TLS','ssl')
     def temporary_dns(*args,**kwargs):raise socket.gaierror(socket.EAI_AGAIN,'PASSWORD private DNS')
     monkeypatch.setattr('procurement.sent_mail.imaplib.IMAP4_SSL',temporary_dns)
+    with pytest.raises(PreAuthTransportError) as caught:connect_imap()
+    assert 'PASSWORD' not in str(caught.value)
+
+
+@pytest.mark.parametrize('failure',[TimeoutError('PASSWORD timeout'),
+                                     OSError(errno.ENETUNREACH,'PASSWORD route')])
+def test_starttls_transport_failure_is_prelogin_and_safe(monkeypatch,failure):
+    import imaplib
+    from procurement.sent_mail import PreAuthTransportError,connect_imap
+    class Client(imaplib.IMAP4):
+        logins=0
+        def __init__(self,*_args,**_kw):pass
+        def starttls(self,**_):raise failure
+        def login(self,*_):self.logins+=1
+        def shutdown(self):pass
+    monkeypatch.setenv('PROCUREMENT_IMAP_HOST','mail.example.org')
+    monkeypatch.setenv('PROCUREMENT_IMAP_TLS','starttls')
+    monkeypatch.setattr('procurement.sent_mail.imaplib.IMAP4',Client)
+    with pytest.raises(PreAuthTransportError) as caught:connect_imap()
+    assert Client.logins==0 and 'PASSWORD' not in str(caught.value)
+
+
+@pytest.mark.parametrize('code',[errno.ENETUNREACH,errno.EHOSTUNREACH])
+def test_prelogin_network_unreachable_is_retryable(monkeypatch,code):
+    from procurement.sent_mail import PreAuthTransportError,connect_imap
+    monkeypatch.setenv('PROCUREMENT_IMAP_HOST','mail.example.org')
+    monkeypatch.setenv('PROCUREMENT_IMAP_TLS','ssl')
+    def unreachable(*_args,**_kw):raise OSError(code,'PASSWORD route')
+    monkeypatch.setattr('procurement.sent_mail.imaplib.IMAP4_SSL',unreachable)
     with pytest.raises(PreAuthTransportError) as caught:connect_imap()
     assert 'PASSWORD' not in str(caught.value)
 

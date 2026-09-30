@@ -4,6 +4,7 @@ SMTP acceptance is not delivery. Failed/uncertain APPEND never triggers SMTP.
 No credentials or server exception strings are logged/returned.
 """
 import hashlib
+import errno
 import imaplib
 import os
 import re
@@ -67,14 +68,32 @@ def connect_imap():
         raise PreAuthTransportError() from None
     except (TimeoutError, ConnectionError, imaplib.IMAP4.abort, ssl.SSLEOFError):
         raise PreAuthTransportError() from None
+    except OSError as exc:
+        if exc.errno not in (errno.ENETUNREACH, errno.EHOSTUNREACH,
+                             errno.ETIMEDOUT, errno.ECONNRESET,
+                             errno.ECONNABORTED, errno.EPIPE):
+            raise
+        raise PreAuthTransportError() from None
     try:
         if mode == 'starttls':
-            client.starttls(ssl_context=ssl.create_default_context())
+            try:
+                client.starttls(ssl_context=ssl.create_default_context())
+            except (TimeoutError, ConnectionError, imaplib.IMAP4.abort, ssl.SSLEOFError):
+                raise PreAuthTransportError() from None
+            except OSError as exc:
+                if exc.errno not in (errno.ENETUNREACH, errno.EHOSTUNREACH,
+                                     errno.ETIMEDOUT, errno.ECONNRESET,
+                                     errno.ECONNABORTED, errno.EPIPE):
+                    raise
+                raise PreAuthTransportError() from None
         prefix = 'PROCUREMENT_IMAP' if os.getenv('PROCUREMENT_IMAP_PASSWORD_FILE') else 'PROCUREMENT_SMTP'
         client.login(os.getenv('PROCUREMENT_IMAP_USER') or os.environ['PROCUREMENT_SMTP_USER'], secret(prefix))
         return client
     except Exception:
-        client.shutdown()
+        try:
+            client.shutdown()
+        except Exception:
+            pass
         raise
 
 
