@@ -32,9 +32,10 @@ def imap_env(monkeypatch, server, tmp_path):
         monkeypatch.setattr('procurement.sent_mail.secret',lambda prefix:password.read_text())
 
 
-def test_recipient_sent_and_registry_match_message_id_and_exact_attachment(workflow,monkeypatch,tmp_path):
+@pytest.mark.parametrize('reject_header_search',[False,True])
+def test_recipient_sent_and_registry_match_message_id_and_exact_attachment(workflow,monkeypatch,tmp_path,reject_header_search):
     db,s,w = workflow;m,_ = prepare(workflow)
-    with CaptureSMTP() as smtp, CaptureIMAP() as imap:
+    with CaptureSMTP() as smtp, CaptureIMAP(reject_header_search=reject_header_search) as imap:
         smtp_env(monkeypatch,smtp);imap_env(monkeypatch,imap,tmp_path)
         r = w.send(m['id'],True)
         assert r['status']=='sent' and r['delivery']['sent_copy_status']=='saved' and r['warning'] is None
@@ -219,9 +220,10 @@ def test_imap_failure_warns_and_copy_retry_never_resends(workflow,monkeypatch,tm
         assert len(smtp.messages)==len(imap.messages)==1
 
 
-def test_imap_lost_ack_reconciles_without_duplicate_append(workflow,monkeypatch,tmp_path):
+@pytest.mark.parametrize('reject_header_search',[False,True])
+def test_imap_lost_ack_reconciles_without_duplicate_append(workflow,monkeypatch,tmp_path,reject_header_search):
     db,s,w=workflow;m,_=prepare(workflow)
-    with CaptureSMTP() as smtp, CaptureIMAP(drop_append_reply=True) as imap:
+    with CaptureSMTP() as smtp, CaptureIMAP(drop_append_reply=True,reject_header_search=reject_header_search) as imap:
         smtp_env(monkeypatch,smtp);imap_env(monkeypatch,imap,tmp_path)
         r=w.send(m['id'],True)
         assert r['delivery']['sent_copy_status']=='unknown'
@@ -314,6 +316,30 @@ def test_smtp_protocol_receipt_never_exposes_auth_reply_or_secret_echo():
     encoded=base64.b64encode(password.encode()).decode()
     code,reply=smtp_failure_receipt(smtplib.SMTPDataError(451,f'rejected {password} {encoded}\x00'.encode()),'staff',password)
     assert code==451 and password not in reply and encoded not in reply and '\x00' not in reply
+
+
+@pytest.mark.parametrize('trusted_certificate',[False,True])
+def test_smtp_ssl_requires_verified_certificate_and_hostname(workflow,monkeypatch,trusted_certificate):
+    import ssl
+    db,s,w=workflow;m,_=prepare(workflow)
+    contexts=[]
+    with CaptureSMTP() as smtp:
+        smtp_env(monkeypatch,smtp);monkeypatch.setenv('PROCUREMENT_SMTP_TLS','ssl')
+        def verified_transport(host,port,*,timeout,context):
+            contexts.append(context)
+            assert context.verify_mode==ssl.CERT_REQUIRED and context.check_hostname
+            if not trusted_certificate:
+                raise ssl.SSLCertVerificationError('untrusted certificate')
+            # Only the test fixture uses plaintext loopback, after validating
+            # the context supplied to the production SMTP_SSL constructor.
+            return smtplib.SMTP(host,port,timeout=timeout)
+        monkeypatch.setattr(smtplib,'SMTP_SSL',verified_transport)
+        if trusted_certificate:
+            assert w.send(m['id'],True)['status']=='sent' and len(smtp.messages)==1
+        else:
+            with pytest.raises(ConflictError):w.send(m['id'],True)
+            assert journal(db,m['id'])['status']=='failed' and not smtp.messages
+        assert len(contexts)==1
 
 
 def test_copy_lease_migration_preserves_existing_receipt(workflow,monkeypatch):

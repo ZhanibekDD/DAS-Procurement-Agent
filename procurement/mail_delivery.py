@@ -239,7 +239,8 @@ def send(workflow, mid, confirmed):
         if mode not in {'ssl','starttls','none'}:
             raise ValueError('Недопустимый SMTP TLS режим')
         smtp_type = smtplib.SMTP_SSL if mode == 'ssl' else smtplib.SMTP
-        smtp = smtp_type(host,port,timeout=30)
+        tls_options = {'context': ssl.create_default_context()} if mode == 'ssl' else {}
+        smtp = smtp_type(host,port,timeout=30,**tls_options)
         if mode == 'starttls':
             smtp.starttls(context=ssl.create_default_context())
         user = os.getenv('PROCUREMENT_SMTP_USER','')
