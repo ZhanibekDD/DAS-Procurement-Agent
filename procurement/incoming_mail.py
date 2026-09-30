@@ -84,7 +84,7 @@ def extract_draft(path, filename):
     payload = FilePayload(path)
     safe_upload(payload, filename, {'.pdf', '.xlsx', '.csv'})
     if Path(filename).suffix.lower() == '.pdf':
-        from .imports import extract_document
+        from .price_ocr import extract_price_document as extract_document
         result = extract_document(payload, filename)
         # Reuse the same OCR/price interpretation without writing shared previews.
         catalog = object.__new__(Catalog)
@@ -121,6 +121,8 @@ def extract_draft(path, filename):
             row['currency'] = 'RUB'
             row['review_warning'] = (row.get('review_warning', '') + ' Валюта не указана: подтвердите, что цена в рублях.').strip()
     draft['requires_review'] = True
+    from .price_ocr import RECOGNITION_VERSION
+    draft['recognition_version'] = RECOGNITION_VERSION
     bounded_draft(draft)
     return draft
 
@@ -304,7 +306,57 @@ class Inbox:
     def detail(self, aid):
         row = self.attachment(aid)
         self.path(row)
-        return {'id': aid, 'filename': row['filename'], 'sha256': row['sha256'], **json.loads(row['draft_json'])}
+        reviews=self.db.all('''SELECT r.actor,p.status,p.data_json FROM inbox_reviews r
+            JOIN launch_previews p ON p.id=r.preview_id WHERE r.attachment_id=?''',(aid,))
+        draft=json.loads(row['draft_json'])
+        own=next((r for r in reviews if r['actor']==trusted_actor() and r['status']=='preview'),None)
+        if own:
+            draft['rows']=json.loads(own['data_json'])['rows']
+        return {**draft,'id': aid, 'filename': row['filename'], 'sha256': row['sha256'],
+                'reviewed':bool(reviews),'applied':any(r['status']=='applied' for r in reviews)}
+
+    def recognize(self, aid):
+        """Upgrade an unreviewed draft, not the immutable source or saved prices."""
+        from .price_ocr import RECOGNITION_VERSION
+        row=self.attachment(aid)
+        draft=json.loads(row['draft_json'])
+        path=self.path(row)
+        if draft.get('recognition_version',0)>=RECOGNITION_VERSION:return self.detail(aid)
+        if self.db.one('SELECT 1 FROM inbox_reviews WHERE attachment_id=?',(aid,)):
+            raise ConflictError('Это КП уже проверялось. Сохранённые строки не заменены распознаванием.')
+        draft=extract_draft(path,row['filename'])
+        encoded=bounded_draft(draft)
+        with self.db.connection() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            if conn.execute('SELECT 1 FROM inbox_reviews WHERE attachment_id=?',(aid,)).fetchone():
+                raise ConflictError('КП уже проверено другим сотрудником; распознавание не заменило проверенные строки')
+            # Concurrent requests may have completed the same bounded OCR.
+            current=conn.execute('SELECT draft_json FROM inbox_attachments WHERE id=?',(aid,)).fetchone()
+            if json.loads(current['draft_json']).get('recognition_version',0)<RECOGNITION_VERSION:
+                conn.execute('UPDATE inbox_attachments SET draft_json=? WHERE id=?',(encoded,aid))
+                self.db.audit('incoming_attachment_recognized','inbox_attachment',aid,
+                    details={'version':RECOGNITION_VERSION,'rows':len(draft['rows'])},conn=conn)
+        return self.detail(aid)
+
+    def validate_currency(self,aid):
+        """Legacy reviewed rows stay immutable; refresh only source evidence."""
+        attachment=self.attachment(aid)
+        source=json.loads(attachment['draft_json'])
+        if Path(attachment['filename']).suffix.lower()=='.pdf' and 'document_currencies' not in source:
+            fresh=extract_draft(self.path(attachment),attachment['filename'])
+            if 'document_currencies' not in fresh:
+                raise ValueError('Не удалось проверить валюту исходного КП. Исходник доступен; цены не сохранены')
+            with self.db.connection() as conn:
+                conn.execute('BEGIN IMMEDIATE')
+                current=conn.execute('SELECT draft_json FROM inbox_attachments WHERE id=?',(aid,)).fetchone()
+                source=json.loads(current['draft_json'])
+                source['document_currencies']=fresh['document_currencies']
+                conn.execute('UPDATE inbox_attachments SET draft_json=? WHERE id=?',(bounded_draft(source),aid))
+                self.db.audit('incoming_currency_evidence_checked','inbox_attachment',aid,
+                    details={'source_sha256':attachment['sha256'],'reviewed_rows_changed':False},conn=conn)
+        if (any(c!='RUB' for c in source.get('document_currencies',[]))
+                or any(r.get('currency') not in ('','RUB') for r in source['rows'])):
+            raise ValueError('В исходнике указана другая валюта. Автоматической конвертации в рубли нет')
 
     def prepare(self, aid, rows, confirmed_source):
         if confirmed_source is not True:
@@ -316,6 +368,7 @@ class Inbox:
         if any(row.get('currency') != 'RUB' for row in rows):
             raise ValueError('Поддерживаются цены в рублях; автоматической конвертации валют нет')
         attachment = self.attachment(aid)
+        self.validate_currency(aid)
         applied = self.db.one('''SELECT 1 FROM inbox_reviews r JOIN launch_previews p ON p.id=r.preview_id
             WHERE r.attachment_id=? AND p.status='applied' ''', (aid,))
         if applied:

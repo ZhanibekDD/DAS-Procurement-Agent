@@ -351,6 +351,11 @@ class DocumentExtractResult:
     vat_included: bool
     items: list[ExtractedItem] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # Only the human-reviewed catalog path may opt into OCR. Existing invoice
+    # importers must never silently treat OCR output as verified financial data.
+    scan_context: list[str] = field(default_factory=list)
+    review_lines: list[dict] = field(default_factory=list)
+    page_texts: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -766,6 +771,8 @@ def extract_from_pdf(content: bytes, filename: str) -> DocumentExtractResult:
         vat_included=vat_included,
         items=items,
         errors=errors,
+        scan_context=pages if any(not page.strip() for page in pages) else [],
+        page_texts=pages,
     )
 
 

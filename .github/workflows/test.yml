@@ -35,5 +35,5 @@ jobs:
       - name: Check staff workflow and audit presentation
         run: node --check procurement/static/staff-ui.js && node tests/ui_staff.cjs && node tests/ui_quick_purchase.cjs
       - name: Check private incoming mail review
-        run: node tests/ui_incoming_mail.cjs
+        run: node tests/ui_incoming_mail.cjs && node tests/ui_catalog_review.cjs
 

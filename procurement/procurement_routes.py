@@ -42,6 +42,7 @@ class Budget(StrictModel):
 
 class ReviewedPriceRows(StrictModel):
     rows:list[dict[str,str]]=Field(min_length=1,max_length=500)
+    confirmed_rub:bool=Field(default=False,strict=True)
 
 class ReadAlerts(StrictModel):
     event_ids:list[str]=Field(min_length=1,max_length=100)
@@ -305,7 +306,7 @@ def install(app,settings,service,launch,require_access,write_access,session_clai
         async with staged_upload(file) as content:
             suffix=Path(file.filename or '').suffix.lower()
             if suffix=='.pdf':
-                from .imports import extract_document
+                from .price_ocr import extract_price_document as extract_document
                 result=await run_in_threadpool(call,extract_document,content,file.filename)
                 doc=await run_in_threadpool(call,lambda:service.register_source_document(filename=file.filename,content=content,document_type='price_list',_price_import=True))
                 return await run_in_threadpool(call,catalog.extracted_price_preview,doc,result)
@@ -320,7 +321,7 @@ def install(app,settings,service,launch,require_access,write_access,session_clai
     def review_pdf(pid:str,data:ReviewedPriceRows):
         if any(set(r)-set(ALIASES) or any(len(v)>8000 for v in r.values()) for r in data.rows):
             raise HTTPException(422,'Некорректные поля прайса')
-        return call(catalog.review_pdf,pid,data.rows)
+        return call(catalog.review_pdf,pid,data.rows,data.confirmed_rub)
 
     @app.post('/api/procurement/catalog/incoming-mail',dependencies=[Depends(write_access)])
     async def incoming(file:UploadFile=File(...)):
@@ -328,7 +329,7 @@ def install(app,settings,service,launch,require_access,write_access,session_clai
         from email.parser import BytesParser
         from .upload_io import open_payload,payload_sha256
         from .table_ingest import safe_upload
-        from .imports import extract_document
+        from .price_ocr import extract_price_document as extract_document
         async with staged_upload(file) as content:
             if Path(file.filename or '').suffix.lower()!='.eml' or len(content)>20*1024*1024:
                 raise HTTPException(422,'Ожидается исходное входящее письмо EML не больше 20 МБ')

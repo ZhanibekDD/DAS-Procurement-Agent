@@ -28,6 +28,10 @@ def install(app, service, launch, require_access, write_access, call):
     def detail(aid: str):
         return call(inbox.detail, aid)
 
+    @app.post('/api/procurement/inbox/attachments/{aid}/recognize', dependencies=[Depends(administrator), Depends(write_access)])
+    def recognize(aid: str):
+        return call(inbox.recognize, aid)
+
     @app.post('/api/procurement/inbox/attachments/{aid}/review', dependencies=[Depends(administrator), Depends(write_access)])
     def review(aid: str, data: Review):
         return call(inbox.prepare, aid, data.rows, data.confirmed_source)
