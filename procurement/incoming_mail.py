@@ -28,7 +28,7 @@ from pathlib import Path
 from .catalog import ALIASES, Catalog
 from .db import utcnow
 from .identity import authenticated_actor, trusted_actor
-from .sent_mail import connect_imap
+from .sent_mail import PreAuthTransportError, connect_imap
 from .service import ConflictError, NotFoundError
 from .table_ingest import mapped, read_table, safe_upload, suggested_mapping
 from .upload_io import FilePayload, payload_sha256
@@ -557,11 +557,13 @@ def poll(inbox, connect=connect_imap):
         with inbox.db.connection() as conn:
             conn.execute("INSERT INTO inbox_state VALUES (?,0,0,0,?,?) ON CONFLICT(account) DO UPDATE SET checked_at=excluded.checked_at,error=excluded.error",
                 (account, utcnow(), 'Не удалось проверить почту. Полученные письма сохранены; следующая попытка через минуту.'))
-        transport = (isinstance(exc, (TimeoutError, ConnectionError, imaplib.IMAP4.abort, ssl.SSLEOFError))
+        transport = (isinstance(exc, PreAuthTransportError) or client is not None and (
+                     isinstance(exc, (TimeoutError, ConnectionError, imaplib.IMAP4.abort, ssl.SSLEOFError))
                      or isinstance(exc, OSError) and exc.errno in (
                          errno.ETIMEDOUT, errno.ECONNRESET, errno.ECONNABORTED,
-                         errno.EPIPE, errno.ENETUNREACH, errno.EHOSTUNREACH))
-        return {'status': 'error', 'received': 0, 'retryable': transport}
+                         errno.EPIPE, errno.ENETUNREACH, errno.EHOSTUNREACH)))
+        return {'status': 'error', 'received': 0, 'retryable': transport,
+                'error_type': type(exc).__name__}
     finally:
         if staging is not None:
             staging.cleanup()
