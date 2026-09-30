@@ -370,6 +370,7 @@ class LaunchWorkflow:
                 cluster = project['cluster']
             else:
                 cluster = resolve_cluster(lot.region,lot.cluster or project['cluster'])
+            self.service.validate_new_lot_policy(lot.currency, cluster, project['cluster'])
             if lot.section_id and not conn.execute('SELECT 1 FROM project_sections WHERE id=? AND project_id=?',(lot.section_id,lot.project_id)).fetchone():
                 raise ValueError('Раздел принадлежит другому проекту')
             self._documents(conn, lot.project_id, lot.attachment_document_ids)

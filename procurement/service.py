@@ -158,13 +158,17 @@ class ProcurementService:
             result.append(row)
         return result
 
+    @staticmethod
+    def validate_new_lot_policy(currency, cluster, project_cluster):
+        if cluster and project_cluster and cluster != project_cluster:
+            raise ValueError('Регион закупки не соответствует региону объекта. Выберите верный объект или исправьте регион.')
+        if currency != 'RUB':
+            raise ValueError('Новые закупки ведутся только в рублях (RUB)')
+
     def create_lot(self, data: LotCreate) -> dict[str, Any]:
         project = self.get_project(data.project_id)
         cluster = resolve_cluster(data.region, data.cluster or infer_cluster(data.region) or project["cluster"])
-        if cluster and project['cluster'] and cluster != project['cluster']:
-            raise ValueError('Регион закупки не соответствует региону объекта. Выберите верный объект или исправьте регион.')
-        if data.currency != 'RUB':
-            raise ValueError('Новые закупки ведутся только в рублях (RUB)')
+        self.validate_new_lot_policy(data.currency, cluster, project['cluster'])
         if data.section_id is not None:
             section = self.db.one(
                 "SELECT id FROM project_sections WHERE id = ? AND project_id = ?",
@@ -1452,6 +1456,7 @@ class ProcurementService:
         suggestion = self.get_procurement_suggestion(suggestion_id)
         if suggestion["status"] != "needs_review":
             raise ConflictError("only suggestions awaiting review can be approved")
+        self.validate_new_lot_policy(data.currency, suggestion['project_cluster'], suggestion['project_cluster'])
         with self.db.connection() as conn:
             claimed = conn.execute(
                 "UPDATE procurement_suggestions SET status='approving' WHERE id=? AND status='needs_review'",
