@@ -43,6 +43,7 @@ class Mailbox:
             if self.fault == 'changed' and self.searches == 2:ids.append(b'999')
             if self.fault == 'invalid_uid':ids = [b'1:*']
             if self.fault == 'repeated_uid':ids = [b'1', b'1']
+            if self.fault == 'incomplete_all':ids = ids[1:]
             return 'OK', [b' '.join(ids)]
         assert command == 'FETCH'
         self.fetches.append(args)
@@ -73,7 +74,7 @@ def test_provider_scan_preserves_absence_and_duplicate_detection(headers, expect
 
 
 @pytest.mark.parametrize('fault', ['all_failed', 'invalid_uid', 'repeated_uid', 'fetch_failed',
-    'changed', 'oversized', 'truncated', 'two_headers', 'missing_uid', 'duplicate_fetch'])
+    'changed', 'oversized', 'truncated', 'two_headers', 'missing_uid', 'duplicate_fetch', 'incomplete_all'])
 def test_provider_incomplete_scan_never_claims_absence(fault):
     with pytest.raises(ValueError):sent_mail.find_message(Mailbox(fault=fault), b'Sent', MID)
 
@@ -138,9 +139,10 @@ def test_success_or_transport_failure_never_triggers_mailbox_scan(fault):
 
 
 @pytest.mark.parametrize('reconcile', [False, True])
-def test_incomplete_scan_never_appends_even_during_reconciliation(tmp_path, monkeypatch, reconcile):
+@pytest.mark.parametrize('fault', ['missing_uid', 'incomplete_all'])
+def test_incomplete_scan_never_appends_even_during_reconciliation(tmp_path, monkeypatch, reconcile, fault):
     path = tmp_path/'mail.eml';path.write_bytes(b'original immutable message')
-    mailbox = Mailbox(fault='missing_uid')
+    mailbox = Mailbox(fault=fault)
     mailbox.logout = lambda:None
     monkeypatch.setattr(sent_mail, 'connect_imap', lambda:mailbox)
     monkeypatch.setattr(sent_mail, 'sent_folder', lambda c:b'Sent')

@@ -91,7 +91,7 @@ def sent_folder(client):
 def find_message(client, folder, message_id):
     if not re.fullmatch(r'<[a-f0-9]{32}@[A-Za-z0-9.-]+>', message_id):
         raise ValueError('Некорректный Message-ID')
-    typ, _ = client.select(folder, readonly=True)
+    typ, selected = client.select(folder, readonly=True)
     if typ != 'OK':
         raise ValueError('Папка Отправленные недоступна')
     typ, data = client.uid('SEARCH', None, 'HEADER', 'Message-ID', client._quote(message_id))
@@ -101,7 +101,9 @@ def find_message(client, folder, message_id):
         raise ValueError('Поиск копии письма не выполнен')
     # Some providers authenticate and FETCH correctly but reject HEADER SEARCH.
     # An incomplete or changing scan is not proof of absence: fail closed.
-    return _scan_message_headers(client, message_id)
+    if len(selected) != 1 or not isinstance(selected[0], bytes) or not re.fullmatch(rb'[0-9]+', selected[0]):
+        raise ValueError('Количество писем IMAP не подтверждено')
+    return _scan_message_headers(client, message_id, int(selected[0]))
 
 
 def _search_uids(data):
@@ -114,7 +116,7 @@ def _search_uids(data):
     return identifiers
 
 
-def _scan_message_headers(client, message_id):
+def _scan_message_headers(client, message_id, selected_count):
     """A wall-clock watchdog also interrupts trickling socket reads."""
     if SCAN_SECONDS <= 0:
         raise ValueError('Проверка копии письма превысила время ожидания')
@@ -137,7 +139,7 @@ def _scan_message_headers(client, message_id):
     transport.settimeout(min(previous_timeout, SCAN_SECONDS) if previous_timeout else SCAN_SECONDS)
     watchdog.start()
     try:
-        result = _read_message_headers(client, message_id, deadline)
+        result = _read_message_headers(client, message_id, deadline, selected_count)
         if expired.is_set() or time.monotonic() >= deadline:
             raise ValueError('Проверка копии письма превысила время ожидания')
         return result
@@ -148,7 +150,7 @@ def _scan_message_headers(client, message_id):
             transport.settimeout(previous_timeout)
 
 
-def _read_message_headers(client, message_id, deadline):
+def _read_message_headers(client, message_id, deadline, selected_count):
 
     def all_uids():
         if time.monotonic() >= deadline:
@@ -157,6 +159,8 @@ def _read_message_headers(client, message_id, deadline):
         if typ != 'OK':
             raise ValueError('Поиск копии письма не выполнен')
         identifiers = _search_uids(data)
+        if len(identifiers) != selected_count:
+            raise ValueError('Поиск IMAP вернул не все письма; копия не подтверждена')
         if len(identifiers) > MAX_SCAN_MESSAGES:
             raise ValueError('Поиск IMAP недоступен; слишком много писем для безопасной проверки')
         return identifiers
