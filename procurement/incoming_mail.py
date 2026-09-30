@@ -306,7 +306,14 @@ class Inbox:
     def detail(self, aid):
         row = self.attachment(aid)
         self.path(row)
-        return {'id': aid, 'filename': row['filename'], 'sha256': row['sha256'], **json.loads(row['draft_json'])}
+        reviews=self.db.all('''SELECT r.actor,p.status,p.data_json FROM inbox_reviews r
+            JOIN launch_previews p ON p.id=r.preview_id WHERE r.attachment_id=?''',(aid,))
+        draft=json.loads(row['draft_json'])
+        own=next((r for r in reviews if r['actor']==trusted_actor() and r['status']=='preview'),None)
+        if own:
+            draft['rows']=json.loads(own['data_json'])['rows']
+        return {**draft,'id': aid, 'filename': row['filename'], 'sha256': row['sha256'],
+                'reviewed':bool(reviews),'applied':any(r['status']=='applied' for r in reviews)}
 
     def recognize(self, aid):
         """Upgrade an unreviewed draft, not the immutable source or saved prices."""

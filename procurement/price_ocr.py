@@ -50,6 +50,12 @@ def scanned_items(lines, page, currency, vat):
             continue  # Unsupported layout remains in the full transcript.
         header_bottom=max(c['bbox']['top']+c['bbox']['height'] for c in [heading,quantity,*prices])
         right=(center(heading,'x')+center(quantity,'x'))/2
+        # The printed quantity heading owns this column, not every numeric
+        # cell between the description and price (which may include weight).
+        qbox=quantity['bbox']
+        quantity_left=qbox['left']-height
+        quantity_right=min(qbox['left']+qbox['width']+height,
+                           min(center(p,'x') for p in prices)-height)
         # Build price headings from vertical fragments inside each known column.
         specs=[]
         for price in prices:
@@ -72,12 +78,16 @@ def scanned_items(lines, page, currency, vat):
             aligned=[c for c in cells if c is not name and abs(center(c,'y')-baseline)<=height*.65]
             quantities_found=[]
             for c in aligned:
-                if not right<center(c,'x')<min(center(p,'x') for p in prices)-height:
+                if not quantity_left<=center(c,'x')<=quantity_right:
                     continue
                 m=re.fullmatch(r'(\d+(?:[.,]\d+)?)\s*('+UNIT+r')',c['text'].strip(),re.I)
                 if m:quantities_found.append((c,m[1],unit(m[2])))
             quantities_found.sort(key=lambda entry:entry[0]['bbox']['left'])
-            qty=quantities_found[0] if quantities_found and quantities_found[0][0]['confidence']>=.9 else None
+            # A merged quantity heading can contain piece and volume columns.
+            # Preserve their printed order, but duplicate units are ambiguous.
+            qty=quantities_found[0] if (quantities_found and quantity['confidence']>=.9
+                and quantities_found[0][0]['confidence']>=.9
+                and len({q[2] for q in quantities_found})==len(quantities_found)) else None
             selected=[spec for spec in specs if qty and spec[1]==qty[2] and not spec[2]]
             if not selected and len(specs)==1 and not specs[0][1] and not specs[0][2]:selected=specs
             amount='';warnings=['Скан: сверьте наименование, цену и единицу по оригиналу.']
@@ -104,14 +114,15 @@ def document_date(text):
     text=text.replace('«','').replace('»','').replace('"','')
     # A validity deadline is not the issue date. Never read the first arbitrary
     # date in the footer, filename or bank details as the price date.
-    label=re.search(r'(?:(?:Сч[её]т|Исх\.|КП|Предложение)[^\n]{0,85}?\bот\s+|Дата(?:\s+(?:прайса|документа))?\s*[: ]\s*)([^\n]{5,60})',text,re.I)
+    label=re.search(r'(?:(?:Сч[её]т|Исх\.|КП|Предложение)[^\n]{0,85}?\bот\s+|\bДата(?:\s+(?:прайса|документа))?\s*:\s*)(\d{1,2}(?:[. /-]|\s)[^\n]{3,50})',text,re.I)
     if not label:return None
     value=label[1]
-    m=re.search(r'\b(\d{1,2})\s+('+'|'.join(months)+r')\s+(20\d{2})(?!\d)',value,re.I)
+    m=re.match(r'(\d{1,2})\s+('+'|'.join(months)+r')\s+(20\d{2})(?!\d)',value,re.I)
     if m:
         try:return date(int(m[3]),months.index(m[2].lower())+1,int(m[1])).isoformat()
         except ValueError:return None
-    return extract_date(value)
+    numeric=re.match(r'\d{1,2}[./-]\d{1,2}[./-](?:20\d{2}|\d{2})(?!\d)',value)
+    return extract_date(numeric[0]) if numeric else None
 
 
 def seller_fields(text):

@@ -42,6 +42,7 @@ class Budget(StrictModel):
 
 class ReviewedPriceRows(StrictModel):
     rows:list[dict[str,str]]=Field(min_length=1,max_length=500)
+    confirmed_rub:bool=Field(default=False,strict=True)
 
 class ReadAlerts(StrictModel):
     event_ids:list[str]=Field(min_length=1,max_length=100)
@@ -320,7 +321,7 @@ def install(app,settings,service,launch,require_access,write_access,session_clai
     def review_pdf(pid:str,data:ReviewedPriceRows):
         if any(set(r)-set(ALIASES) or any(len(v)>8000 for v in r.values()) for r in data.rows):
             raise HTTPException(422,'Некорректные поля прайса')
-        return call(catalog.review_pdf,pid,data.rows)
+        return call(catalog.review_pdf,pid,data.rows,data.confirmed_rub)
 
     @app.post('/api/procurement/catalog/incoming-mail',dependencies=[Depends(write_access)])
     async def incoming(file:UploadFile=File(...)):

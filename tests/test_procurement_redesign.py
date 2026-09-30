@@ -201,7 +201,8 @@ def test_pdf_catalog_requires_human_review_reuses_strict_validator(workflow):
     cat=Catalog(s,w);p=cat.extracted_price_preview(doc,extracted)
     assert p['requires_review'] and not db.all('SELECT * FROM supplier_catalog_prices')
     row={k:price_csv().decode().strip().splitlines()[1].split(';')[n] for n,k in enumerate(ALIASES)}
-    checked=cat.review_pdf(p['preview_id'],[row]);assert not checked['errors']
+    with pytest.raises(ValueError,match='Подтвердите'):cat.review_pdf(p['preview_id'],[row])
+    checked=cat.review_pdf(p['preview_id'],[row],confirmed_rub=True);assert not checked['errors']
     assert cat.apply_prices(checked['preview_id'],True)['added']==1
     assert cat.prices()[0]['source_document_id']==doc['id']
 

@@ -69,6 +69,23 @@ def test_low_confidence_unit_or_heading_cannot_select_a_price(text):
     assert rows[0].unit_price==''
 
 
+@pytest.mark.parametrize('text',['12 кг','9 м','5 шт'])
+def test_numeric_dimension_outside_quantity_column_is_not_a_quantity(text):
+    lines=table()+[cell(text,210,180,35)]
+    row=scanned_items(lines,1,'RUB',True)[0]
+    assert (row.quantity,row.unit,row.unit_price)==('218','шт','1000.00')
+
+
+def test_missing_or_ambiguous_quantity_never_uses_neighboring_dimensions():
+    lines=[c for c in table() if c['text'] not in ('218 шт','118,374 м3')]
+    lines.append(cell('12 кг',210,180,35))
+    row=scanned_items(lines,1,'RUB',True)[0]
+    assert (row.quantity,row.unit,row.unit_price)==('','','')
+    lines=table()+[cell('12 шт',340,180,35)]
+    row=scanned_items(lines,1,'RUB',True)[0]
+    assert (row.quantity,row.unit,row.unit_price)==('','','')
+
+
 def test_shipping_only_column_is_not_product_price():
     lines=[cell('Товар',70,100),cell('Количество',280,100),cell('Цена доставки',395,100),
            cell('ФБС 24.4.6',70,180),cell('218 шт',280,180),cell('1000',395,180)]
@@ -85,6 +102,20 @@ def test_issuer_is_not_bank_buyer_or_sender_and_date_is_printed():
     assert document_date('31 февраля 2026') is None
     assert document_date('Исх. №85 от «24» февраля 2026г.\nСрок действия: до 15.03.2026')=='2026-02-24'
     assert document_date('Срок действия: до 15.03.2026') is None
+
+
+@pytest.mark.parametrize('label',['Дата окончания','Дата поставки','Дата действия','Дата окончания действия','Дата доставки','Дата отгрузки'])
+def test_non_issue_dates_are_not_price_dates(label):
+    assert document_date(label+': 15.03.2026') is None
+    assert document_date(label+': 15 марта 2026') is None
+    assert document_date(label+': 15.03.2026\nДата документа: 24.02.2026')=='2026-02-24'
+
+
+@pytest.mark.parametrize('label',['Дата','Дата прайса','Дата документа'])
+def test_issue_date_requires_immediate_date_after_exact_label(label):
+    assert document_date(label+': 24.02.2026')=='2026-02-24'
+    assert document_date(label+': не указана, действует до 15.03.2026') is None
+    assert document_date(label+': 31 февраля 2026, уточнение 01.03.2026') is None
 
 
 def test_ocr_only_in_review_path_and_all_lines_remain(monkeypatch,tmp_path):
@@ -123,7 +154,14 @@ def test_reviewed_mail_never_replaced(workflow,tmp_path):
     inbox,_=ingest(workflow,tmp_path);row=inbox.db.one('SELECT * FROM inbox_attachments');aid=row['id']
     draft=json.loads(row['draft_json']);draft.pop('recognition_version',None)
     with inbox.db.connection() as conn:conn.execute('UPDATE inbox_attachments SET draft_json=? WHERE id=?',(json.dumps(draft),aid))
-    with admin():inbox.prepare(aid,rows_of(inbox,aid),True)
+    with admin():
+        rows=rows_of(inbox,aid);rows[0]['unit_price']='1777.12'
+        checked=inbox.prepare(aid,rows,True)
+        detail=inbox.detail(aid)
+        assert detail['reviewed'] and not detail['applied']
+        assert detail['rows'][0]['unit_price']=='1777.12'
+        Catalog(workflow[1],workflow[2]).apply_prices(checked['preview_id'],True)
+        assert inbox.detail(aid)['applied']
     with pytest.raises(Exception,match='уже проверялось'):inbox.recognize(aid)
 
 
@@ -137,6 +175,33 @@ def test_recognition_endpoint_requires_admin_and_csrf(http_boundary):
     assert client.post(url,json={}).status_code==403
 
 
+@pytest.mark.parametrize('currency',['','USD','EUR'])
+def test_pdf_currency_cannot_be_silently_relabelled_by_client(workflow,currency):
+    from test_procurement_redesign import price_csv
+    db,service,launch=workflow
+    doc=service.register_source_document(filename='price.csv',content=price_csv(),document_type='price_list')
+    catalog=Catalog(service,launch)
+    row={k:price_csv().decode().strip().splitlines()[1].split(';')[n] for n,k in enumerate(ALIASES)}
+    pid=launch.save_preview('price_catalog_pdf',{'document_id':doc['id'],'rows':[{**row,'currency':currency}]})['preview_id']
+    assert row['currency']=='RUB'
+    with pytest.raises(ValueError):catalog.review_pdf(pid,[row])
+    if currency:
+        with pytest.raises(ValueError):catalog.review_pdf(pid,[row],True)
+    else:
+        checked=catalog.review_pdf(pid,[{**row,'currency':''}],True)
+        assert not checked['errors'] and checked['rows'][0]['currency']=='RUB'
+    assert not db.all('SELECT * FROM supplier_catalog_prices')
+
+
+def test_pdf_currency_confirmation_is_strict_boolean(http_boundary):
+    client,authority,settings,db=http_boundary
+    user=login(client,authority)
+    for value in ('true',1,None):
+        response=client.post('/api/procurement/catalog/unknown/review-pdf',headers=headers(user),
+            json={'rows':[{'currency':'RUB'}],'confirmed_rub':value})
+        assert response.status_code==422
+
+
 def test_native_scan_preserves_transcript_without_mining_quantities_as_prices():
     import shutil
     from pathlib import Path
@@ -144,8 +209,15 @@ def test_native_scan_preserves_transcript_without_mining_quantities_as_prices():
     if not shutil.which('tesseract') or not shutil.which('pdftoppm'):
         pytest.skip('Native Russian OCR is required; mandatory in Linux CI')
     path=Path(__file__).parent/'fixtures/russian_scan.pdf'
+    import hashlib
+    before=hashlib.sha256(path.read_bytes()).hexdigest()
     r=extract_price_document(FilePayload(path),'scan.pdf')
-    assert r.review_lines and any('ФБС' in line['text'] for line in r.review_lines)
+    # OCR may render Cyrillic brand letters with visually identical Latin
+    # glyphs. Require the complete source facts, not one typography choice.
+    text='\n'.join(line['text'] for line in r.review_lines)
+    assert 'Спецификация' in text and '24.4.6' in text and '179' in text
+    assert '001230040500' in text and 'количество уточнить' in text
+    assert hashlib.sha256(path.read_bytes()).hexdigest()==before
     assert not r.items  # a specification with quantities is not a price list
     assert any('не распознана' in e for e in r.errors)
 

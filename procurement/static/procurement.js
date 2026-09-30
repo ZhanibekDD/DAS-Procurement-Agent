@@ -117,13 +117,16 @@ function catalogRowErrors(errors){
   toast(errors.map(e=>`Строка ${e.row}: ${e.error}`).slice(0,5).join('; '),true);
 }
 function showPdfPricePreview(p){
-  showInboxPriceRows({...p,filename:p.source_filename});
+  showInboxPriceRows({...p,filename:p.source_filename,confirm_rub:true});
   if($('#catalogMapping'))catalogCommonFields($('#catalogMapping'));
   $('#modalSubmit').textContent='Проверить строки';
   $('#modalSubmit').onclick=async()=>{
     const button=$('#modalSubmit');button.disabled=true;
     try{
-      const checked=await launchJson(`/api/procurement/catalog/${p.preview_id}/review-pdf`,'POST',{rows:catalogEditableRows()});
+      const confirmed_rub=$('#catalogRubConfirmed')?.checked===true;
+      const rows=catalogEditableRows();
+      if(rows.some(r=>!r.currency)&&!confirmed_rub){catalogRowErrors([{row:1,error:'Подтвердите по оригиналу, что цены указаны в рублях'}]);return;}
+      const checked=await launchJson(`/api/procurement/catalog/${p.preview_id}/review-pdf`,'POST',{rows,confirmed_rub});
       if(checked.errors?.length){catalogRowErrors(checked.errors);return;}
       showConfirmedCatalog(checked);
     }catch(e){toast(e.message,true)}finally{button.disabled=false}
@@ -167,18 +170,24 @@ async function loadIncomingPrices(before=null){
 async function openInboxAttachment(id){
   try{
     let p=await api('/api/procurement/inbox/attachments/'+encodeURIComponent(id));
-    if((p.recognition_version||0)<2){
+    let recognitionError='';
+    if((p.recognition_version||0)<2&&!p.reviewed){
       toast('Распознаём исходное КП. Это может занять до нескольких минут.');
-      p=await launchJson('/api/procurement/inbox/attachments/'+encodeURIComponent(id)+'/recognize','POST',{});
+      try{p=await launchJson('/api/procurement/inbox/attachments/'+encodeURIComponent(id)+'/recognize','POST',{});}
+      catch(e){recognitionError='Повторное распознавание не выполнено: '+e.message;
+        try{p=await api('/api/procurement/inbox/attachments/'+encodeURIComponent(id));}catch{}
+      }
     }
+    if(p.applied){launchModal('Исходное КП',`<p>Цены из этого КП уже сохранены. Повторный импорт не выполняется.</p><a href="/api/procurement/inbox/attachments/${encodeURIComponent(id)}/original" target="_blank" rel="noopener">Открыть оригинал: ${esc(p.filename)}</a>`,'Закрыть',()=>$('#modal').close());return;}
     launchModal('Проверка входящего КП',`<p><a href="/api/procurement/inbox/attachments/${encodeURIComponent(id)}/original" target="_blank" rel="noopener">Открыть оригинал: ${esc(p.filename)}</a></p><p>Проверьте компанию по документу. Отправитель письма не подтверждает ИНН и реквизиты.</p><div id="inboxCommon"></div><div id="catalogImportPreview"></div><label><input id="inboxVerified" type="checkbox"> Реквизиты сверены с оригиналом, цены указаны в рублях</label>`,'Проверить строки',()=>{});
     showInboxPriceRows(p);
+    if(recognitionError)$('#catalogRowErrors').textContent=recognitionError;
     catalogCommonFields($('#inboxCommon'));
     $('#modalSubmit').onclick=async()=>{
       if(!$('#inboxVerified').checked)return toast('Подтвердите реквизиты по оригиналу и цены в рублях',true);
       const button=$('#modalSubmit');button.disabled=true;
       try{
-        const rows=catalogEditableRows();
+        const rows=catalogEditableRows().map(r=>({...r,currency:r.currency||'RUB'}));
         const checked=await launchJson('/api/procurement/inbox/attachments/'+encodeURIComponent(id)+'/review','POST',{rows,confirmed_source:true});
         if(checked.requires_correction){
           catalogRowErrors(checked.errors);return;
@@ -204,12 +213,13 @@ function catalogCommonFields(target){
   };
 }
 function showInboxPriceRows(p){
-  catalogPdfRows=p.rows.map(r=>({...Object.fromEntries(Object.keys(catalogFieldLabels).map(k=>[k,String(r[k]??'')])),currency:r.currency||'RUB',review_warning:r.review_warning||''}));
+  catalogPdfRows=p.rows.map(r=>({...Object.fromEntries(Object.keys(catalogFieldLabels).map(k=>[k,String(r[k]??'')])),review_warning:r.review_warning||''}));
   const main=['item_name','unit_price','unit','specification'];
   const remaining=Object.keys(catalogFieldLabels).filter(k=>!main.includes(k)&&k!=='currency');
   const field=(r,n,k)=>`<label style="display:flex;flex-direction:column;min-width:0">${esc(catalogFieldLabels[k])}<input style="box-sizing:border-box;width:100%;min-width:0" data-price-row="${n}" data-price-field="${k}" value="${esc(r[k])}" ${k==='unit_price'&&!r[k]?'aria-invalid="true"':''}></label>`;
   const draw=()=>{
     $('#catalogImportPreview').innerHTML=`<div id="catalogRowErrors" role="alert"></div><p>Позиций: ${catalogPdfRows.length}. Цены — в рублях. Проверьте данные по оригиналу.</p>${(p.errors||[]).length?`<div role="alert">${p.errors.map(e=>`<p>${esc(e)}</p>`).join('')}</div>`:''}${(p.review_lines||[]).length?`<details><summary>Все строки распознанного документа — проверьте полноту</summary><pre style="white-space:pre-wrap">${esc(p.review_lines.map(l=>`Страница ${l.page}, строка ${l.line}: ${l.text}`).join('\n'))}</pre></details>`:''}${catalogPdfRows.map((r,n)=>`<fieldset style="border:1px solid #dbe2e5;border-radius:12px;margin:12px 0;padding:12px;min-width:0"><legend>Позиция ${n+1}</legend><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px">${main.map(k=>field(r,n,k)).join('')}</div>${r.review_warning?`<p role="note">${esc(r.review_warning)}</p>`:''}${r.currency!=='RUB'?`<p role="alert">В исходнике другая или неизвестная валюта. Автоматическая конвертация не выполняется.</p>`:''}<details><summary>Поставщик и условия</summary><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-top:12px">${remaining.map(k=>field(r,n,k)).join('')}</div></details><button type="button" class="btn secondary small" data-price-remove="${n}">Убрать строку</button></fieldset>`).join('')}<button type="button" class="btn secondary" id="pdfPriceAdd">Добавить строку</button>`;
+    if(p.confirm_rub)$('#catalogImportPreview').insertAdjacentHTML('beforeend','<label><input id="catalogRubConfirmed" type="checkbox"> Подтверждаю по оригиналу: цены указаны в рублях, пересчёт валют не требуется</label>');
     document.querySelectorAll('[data-price-row]').forEach(e=>e.oninput=()=>{catalogPdfRows[Number(e.dataset.priceRow)][e.dataset.priceField]=e.value});
     document.querySelectorAll('[data-price-remove]').forEach(e=>e.onclick=()=>{catalogPdfRows.splice(Number(e.dataset.priceRemove),1);draw()});
     $('#pdfPriceAdd').onclick=()=>{catalogPdfRows.push({...Object.fromEntries(Object.keys(catalogFieldLabels).map(k=>[k,''])),currency:'RUB'});draw()};

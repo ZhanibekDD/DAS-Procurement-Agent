@@ -240,10 +240,18 @@ class Catalog:
             'errors':errors,'requires_review':True,'source_filename':doc['filename'],
             'review_lines':getattr(result,'review_lines',[])})
 
-    def review_pdf(self,pid,rows):
+    def review_pdf(self,pid,rows,confirmed_rub=False):
         with self.db.connection() as conn:
             preview,data=self.launch.preview(conn,pid,'price_catalog_pdf')
             if preview['status']!='preview':raise ConflictError('Предпросмотр уже обработан')
+        if any(r.get('currency') not in ('','RUB') for r in data['rows']):
+            raise ValueError('В исходнике указана другая валюта. Автоматической конвертации в рубли нет')
+        if (not data['rows'] or any(not r.get('currency') for r in data['rows'])
+                or any(not r.get('currency') for r in rows)) and confirmed_rub is not True:
+            raise ValueError('Валюта не определена. Подтвердите по оригиналу, что цены указаны в рублях')
+        if any(r.get('currency') not in ('','RUB') for r in rows):
+            raise ValueError('Поддерживаются только цены в рублях; конвертация не выполняется')
+        rows=[{**r,'currency':r.get('currency') or 'RUB'} for r in rows]
         headers=list(ALIASES)
         # Reuse the same strict validation/dedup/import, not another permissive PDF path.
         table={'headers':headers,'sheet':'PDF','rows':[{'row':n,'cells':[r.get(k,'') for k in headers]} for n,r in enumerate(rows,1)]}
