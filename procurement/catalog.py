@@ -154,6 +154,12 @@ class Catalog:
         if confirmed is not True:
             raise ValueError('Подтвердите проверку строк прайса')
         with self.db.connection() as conn:
+            preview,data=self.launch.preview(conn,pid,'price_catalog')
+        if preview['status']=='preview' and data.get('inbox_attachment_id'):
+            if trusted_role()!='admin':raise ConflictError('Проверка входящего КП недоступна')
+            from .incoming_mail import Inbox
+            Inbox(self.service,self.launch).validate_currency(data['inbox_attachment_id'])
+        with self.db.connection() as conn:
             conn.execute('BEGIN IMMEDIATE')
             preview,data=self.launch.preview(conn,pid,'price_catalog')
             if preview['status']=='applied':

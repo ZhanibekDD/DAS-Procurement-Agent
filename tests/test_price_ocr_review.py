@@ -94,6 +94,16 @@ def test_left_article_column_cannot_duplicate_product_rows(article):
     assert [r.unit_price for r in rows]==['1000.00','800.00','']
 
 
+@pytest.mark.parametrize('left_header',['№','Артикул','Код товара'])
+def test_centered_name_heading_does_not_hide_left_aligned_products(left_header):
+    lines=table()+[cell(left_header,0,100,45),cell('SKU-01',0,180,45)]
+    heading=next(c for c in lines if c['text']=='Товар (работы, услуги)')
+    heading['bbox'].update(left=130,width=120)
+    rows=scanned_items(lines,1,'RUB',True)
+    assert [r.item_name for r in rows]==['ФБС 24.4.6','ФБС 12.4.6','Автоуслуги']
+    assert [r.unit_price for r in rows]==['1000.00','800.00','']
+
+
 def test_shipping_only_column_is_not_product_price():
     lines=[cell('Товар',70,100),cell('Количество',280,100),cell('Цена доставки',395,100),
            cell('ФБС 24.4.6',70,180),cell('218 шт',280,180),cell('1000',395,180)]
@@ -226,6 +236,24 @@ def test_document_currency_evidence_survives_empty_tables(workflow,tmp_path,curr
     assert not db.all('SELECT * FROM supplier_catalog_prices')
 
 
+@pytest.mark.parametrize('action',['prepare','apply'])
+@pytest.mark.parametrize('currency',['USD','EUR'])
+def test_legacy_pending_pdf_rechecks_evidence_without_changing_reviewed_rows(workflow,tmp_path,monkeypatch,action,currency):
+    inbox,_=ingest(workflow,tmp_path);attachment=inbox.db.one('SELECT * FROM inbox_attachments');aid=attachment['id']
+    with admin():checked=inbox.prepare(aid,rows_of(inbox,aid),True)
+    draft=json.loads(attachment['draft_json']);draft.pop('document_currencies',None);draft.pop('recognition_version',None);draft['rows']=[]
+    with inbox.db.connection() as conn:conn.execute('UPDATE inbox_attachments SET filename=?,draft_json=? WHERE id=?',('legacy.pdf',json.dumps(draft),aid))
+    monkeypatch.setattr(inbox.__class__,'path',lambda self,a:tmp_path/'unused.pdf')
+    monkeypatch.setattr('procurement.incoming_mail.extract_draft',lambda *args:{'rows':[],'document_currencies':[currency]})
+    before=inbox.db.one('SELECT data_json FROM launch_previews WHERE id=?',(checked['preview_id'],))['data_json']
+    with admin(),pytest.raises(ValueError,match='другая валюта'):
+        if action=='prepare':inbox.prepare(aid,[{k:r[k] for k in ALIASES} for r in checked['rows']],True)
+        else:Catalog(workflow[1],workflow[2]).apply_prices(checked['preview_id'],True)
+    assert inbox.db.one('SELECT data_json FROM launch_previews WHERE id=?',(checked['preview_id'],))['data_json']==before
+    assert json.loads(inbox.attachment(aid)['draft_json'])['rows']==[]
+    assert not inbox.db.all('SELECT * FROM supplier_catalog_prices')
+
+
 def test_native_scan_preserves_transcript_without_mining_quantities_as_prices():
     import shutil
     from pathlib import Path
@@ -248,10 +276,10 @@ def test_native_scan_preserves_transcript_without_mining_quantities_as_prices():
 
 def test_ocr_deadline_and_page_limit_fail_closed(monkeypatch,tmp_path):
     from procurement.upload_io import FilePayload
-    monkeypatch.setattr('procurement.imports.extract_document',lambda *args:result(scan_context=['']*13))
+    partial=scanned_items(table(),1,'RUB',True)
+    monkeypatch.setattr('procurement.imports.extract_document',lambda *args:result(scan_context=['typed']+['']*12,items=partial))
     with patch('procurement.document_analysis.extract_pdf_page_review',side_effect=AssertionError('OCR beyond page limit')):
-        r=extract_price_document(b'pdf','scan.pdf')
-        assert not r.items and '12 страниц' in r.errors[0]
+        with pytest.raises(ValueError,match='12 страниц'):extract_price_document(b'pdf','scan.pdf')
     monkeypatch.setattr('procurement.imports.extract_document',lambda *args:result(scan_context=['','']))
     path=tmp_path/'scan.pdf';path.write_bytes(b'%PDF-test')
     monkeypatch.setattr('procurement.price_ocr.time.monotonic',iter([0,0,151]).__next__)

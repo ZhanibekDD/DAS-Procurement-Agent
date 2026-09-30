@@ -338,6 +338,26 @@ class Inbox:
                     details={'version':RECOGNITION_VERSION,'rows':len(draft['rows'])},conn=conn)
         return self.detail(aid)
 
+    def validate_currency(self,aid):
+        """Legacy reviewed rows stay immutable; refresh only source evidence."""
+        attachment=self.attachment(aid)
+        source=json.loads(attachment['draft_json'])
+        if Path(attachment['filename']).suffix.lower()=='.pdf' and 'document_currencies' not in source:
+            fresh=extract_draft(self.path(attachment),attachment['filename'])
+            if 'document_currencies' not in fresh:
+                raise ValueError('Не удалось проверить валюту исходного КП. Исходник доступен; цены не сохранены')
+            with self.db.connection() as conn:
+                conn.execute('BEGIN IMMEDIATE')
+                current=conn.execute('SELECT draft_json FROM inbox_attachments WHERE id=?',(aid,)).fetchone()
+                source=json.loads(current['draft_json'])
+                source['document_currencies']=fresh['document_currencies']
+                conn.execute('UPDATE inbox_attachments SET draft_json=? WHERE id=?',(bounded_draft(source),aid))
+                self.db.audit('incoming_currency_evidence_checked','inbox_attachment',aid,
+                    details={'source_sha256':attachment['sha256'],'reviewed_rows_changed':False},conn=conn)
+        if (any(c!='RUB' for c in source.get('document_currencies',[]))
+                or any(r.get('currency') not in ('','RUB') for r in source['rows'])):
+            raise ValueError('В исходнике указана другая валюта. Автоматической конвертации в рубли нет')
+
     def prepare(self, aid, rows, confirmed_source):
         if confirmed_source is not True:
             raise ValueError('Подтвердите реквизиты поставщика по оригиналу; отправитель письма не является подтверждением')
@@ -348,10 +368,7 @@ class Inbox:
         if any(row.get('currency') != 'RUB' for row in rows):
             raise ValueError('Поддерживаются цены в рублях; автоматической конвертации валют нет')
         attachment = self.attachment(aid)
-        source=json.loads(attachment['draft_json'])
-        if (any(c!='RUB' for c in source.get('document_currencies',[]))
-                or any(r.get('currency') not in ('','RUB') for r in source['rows'])):
-            raise ValueError('В исходнике указана другая валюта. Автоматической конвертации в рубли нет')
+        self.validate_currency(aid)
         applied = self.db.one('''SELECT 1 FROM inbox_reviews r JOIN launch_previews p ON p.id=r.preview_id
             WHERE r.attachment_id=? AND p.status='applied' ''', (aid,))
         if applied:

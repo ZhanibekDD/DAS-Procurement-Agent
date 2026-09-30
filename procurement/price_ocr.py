@@ -70,8 +70,15 @@ def scanned_items(lines, page, currency, vat):
         stops=[c['bbox']['top'] for c in cells if c['bbox']['top']>header_bottom and
                (TOTAL.match(c['text'].strip()) or (c is not heading and NAME.fullmatch(c['text'].strip())))]
         end=min(stops,default=float('inf'))
+        # Headings can be centered over a wide column while values are
+        # left-aligned. Its text edge is not the column edge. The preceding
+        # printed header (number/article) bounds the name column instead.
+        left_headers=[c for c in cells if abs(center(c,'y')-top)<height
+                      and c['bbox']['left']+c['bbox']['width']<=heading['bbox']['left']]
+        name_left=max((c['bbox']['left']+c['bbox']['width'] for c in left_headers),
+                      default=heading['bbox']['left']-height)
         names=[c for c in cells if header_bottom<c['bbox']['top']<end and
-               heading['bbox']['left']-height<=c['bbox']['left']<right and re.search('[А-Яа-яA-Za-z]',c['text']) and
+               name_left<=c['bbox']['left']<right and re.search('[А-Яа-яA-Za-z]',c['text']) and
                not re.fullmatch(r'\d+(?:[.,]\d+)?\s*'+UNIT,c['text'].strip(),re.I)]
         for name in names:
             baseline=center(name,'y')
@@ -153,8 +160,7 @@ def extract_price_document(content, filename):
         return replace(result,document_date=document_date(text),
                        supplier_region=result.supplier_region or infer_region(header))
     if len(result.scan_context)>MAX_PAGES:
-        result.errors=['Сканированный прайс содержит более 12 страниц. Разделите его на части для проверки.']
-        return result
+        raise ValueError('Сканированный прайс содержит более 12 страниц. Разделите его на части для проверки.')
     from .document_analysis import extract_pdf_page_review
     # EML imports may supply bytes. Native tools only receive a private file.
     with tempfile.TemporaryDirectory(prefix='price-ocr-') as folder:
