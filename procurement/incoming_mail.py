@@ -33,6 +33,8 @@ from .upload_io import FilePayload, payload_sha256
 MAX_MAIL = 20 * 1024 * 1024
 MAX_PARTS = 20
 MAX_ROWS = 2000
+MAX_CELL = 8000
+MAX_DRAFT_BYTES = 2 * 1024 * 1024
 MAX_PRIVATE_BYTES = 1024 * 1024 * 1024
 UID_BATCH = 25
 NETWORK_SECONDS = 120
@@ -90,6 +92,11 @@ def extract_draft(path, filename):
         draft = catalog.extracted_price_preview({'id': 0, 'filename': filename}, result)
     else:
         table = read_table(payload, filename)
+        # CSV readers can return long strings even when row counts are small.
+        # Validate all columns, including unmapped ones, before building a draft.
+        for value in [*table['headers'], *(cell for row in table['rows'] for cell in row['cells'])]:
+            if isinstance(value, str) and len(value) > MAX_CELL:
+                raise ValueError('Ячейка прайса превышает 8000 символов')
         if len(table['sheets']) != 1:
             return {'rows': [], 'errors': ['В книге несколько листов. Загрузите оригинал через импорт прайса и выберите нужный лист.']}
         mapping = suggested_mapping(table['headers'], ALIASES)
@@ -114,7 +121,23 @@ def extract_draft(path, filename):
             row['currency'] = 'RUB'
             row['review_warning'] = (row.get('review_warning', '') + ' Валюта не указана: подтвердите, что цена в рублях.').strip()
     draft['requires_review'] = True
+    bounded_draft(draft)
     return draft
+
+
+def bounded_draft(draft):
+    def check(value):
+        if isinstance(value, str) and len(value) > MAX_CELL:
+            raise ValueError('Значение прайса превышает 8000 символов')
+        if isinstance(value, dict):
+            for child in value.values():check(child)
+        elif isinstance(value, list):
+            for child in value:check(child)
+    check(draft)
+    encoded = json.dumps(draft, ensure_ascii=False)
+    if len(encoded.encode('utf-8')) > MAX_DRAFT_BYTES:
+        raise ValueError('Предпросмотр прайса превышает 2 МБ')
+    return encoded
 
 
 class Inbox:
@@ -123,8 +146,8 @@ class Inbox:
         self.root = Path(self.db.path).resolve().parent / 'incoming-private'
 
     def storage_budget(self, additional=0):
-        used = 0
-        for n, path in enumerate(self.root.iterdir()):
+        used = self.db.one('SELECT COALESCE(SUM(length(CAST(draft_json AS BLOB))),0) AS size FROM inbox_attachments')['size']
+        for n, path in enumerate(self.root.rglob('*')):
             if n >= 10000 or path.is_symlink():
                 raise RuntimeError('inbox_storage_limit')
             if path.is_file():
@@ -170,22 +193,29 @@ class Inbox:
         if len(attachments) > MAX_PARTS:
             self._store_message(mid, account, validity, uid, digest, 'error', error='В письме больше 20 вложений; требуется ручной импорт')
             return mid
-        saved, warnings = [], []
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='.attachments-', dir=self.root) as stage:
+            return self._save_attachments(mid, account, validity, uid, digest, mail, attachments, Path(stage))
+
+    def _save_attachments(self, mid, account, validity, uid, digest, mail, attachments, stage):
+        saved, warnings, published = [], [], []
+        draft_bytes = 0
         for number, part in enumerate(attachments, 1):
             filename = part.get_filename()
             if Path(filename).suffix.lower() not in {'.pdf', '.xlsx', '.csv'}:
                 warnings.append('Неподдерживаемое вложение пропущено; доступны PDF, XLSX и CSV.')
                 continue
-            aid = uuid.uuid4().hex
+            # Stable destinations recover a crash between file publication and
+            # DB commit without writing new orphan files on each retry.
+            aid = hashlib.sha256(json.dumps([account, validity, uid, number]).encode()).hexdigest()[:32]
             payload = part.get_payload(decode=True)
             try:
                 safe_upload(payload or b'', filename, {'.pdf', '.xlsx', '.csv'})
             except (ValueError, TypeError):
                 warnings.append('Опасное имя или повреждённое вложение заблокировано.')
                 continue
-            attachment_path = self.root / (aid + Path(filename).suffix.lower())
-            self.storage_budget(len(payload))
+            attachment_path = stage / (aid + Path(filename).suffix.lower())
+            self.storage_budget(len(payload) + draft_bytes)
             with attachment_path.open('xb') as output:
                 os.chmod(attachment_path, 0o600)
                 output.write(payload)
@@ -193,17 +223,44 @@ class Inbox:
                 os.fsync(output.fileno())
             try:
                 draft = extract_draft(attachment_path, filename)
+                encoded = bounded_draft(draft)
                 error = ''
             except Exception:
                 # Parser exceptions can contain arbitrary private mail text.
-                draft, error = {'rows': [], 'errors': [RECOGNITION_ERROR]}, RECOGNITION_ERROR
-            saved.append((aid, mid, number, filename, hashlib.sha256(payload).hexdigest(), len(payload), json.dumps(draft, ensure_ascii=False), error))
-        with self.db.connection() as conn:
-            conn.execute('BEGIN IMMEDIATE')
-            self._store_message(mid, account, validity, uid, digest, 'review' if saved else 'no_prices',
-                error=' '.join(sorted(set(warnings))), mail=mail, conn=conn)
-            conn.executemany('INSERT INTO inbox_attachments VALUES (?,?,?,?,?,?,?,?)', saved)
-            self.db.audit('incoming_mail_received', 'inbox_message', mid, details={'attachments': len(saved), 'requires_review': True}, conn=conn)
+                encoded, error = bounded_draft({'rows': [], 'errors': [RECOGNITION_ERROR]}), RECOGNITION_ERROR
+            draft_bytes += len(encoded.encode('utf-8'))
+            self.storage_budget(draft_bytes)
+            saved.append((aid, mid, number, filename, hashlib.sha256(payload).hexdigest(), len(payload), encoded, error))
+        try:
+            with self.db.connection() as conn:
+                conn.execute('BEGIN IMMEDIATE')
+                self._store_message(mid, account, validity, uid, digest, 'review' if saved else 'no_prices',
+                    error=' '.join(sorted(set(warnings))), mail=mail, conn=conn)
+                conn.executemany('INSERT INTO inbox_attachments VALUES (?,?,?,?,?,?,?,?)', saved)
+                for aid, _, _, filename, sha, *_ in saved:
+                    name = aid + Path(filename).suffix.lower()
+                    final = self.root / name
+                    try:
+                        os.link(stage / name, final)  # exclusive, no overwritten originals
+                        published.append((aid, final))
+                    except FileExistsError:
+                        if final.is_symlink() or payload_sha256(FilePayload(final)) != sha:
+                            raise ConflictError('Конфликт неизменяемого исходника')
+                if hasattr(os, 'O_DIRECTORY'):
+                    fd = os.open(self.root, os.O_DIRECTORY)
+                    try:os.fsync(fd)
+                    finally:os.close(fd)
+                self.db.audit('incoming_mail_received', 'inbox_message', mid, details={'attachments': len(saved), 'requires_review': True}, conn=conn)
+        except BaseException:
+            for aid, final in published:
+                # If commit outcome is uncertain / DB unavailable, keep bytes;
+                # stable paths allow later reconciliation without duplication.
+                try:
+                    if not self.db.one('SELECT 1 FROM inbox_attachments WHERE id=?', (aid,)):
+                        final.unlink()
+                except Exception:
+                    pass
+            raise
         return mid
 
     def _store_message(self, mid, account, validity, uid, digest, status, error='', duplicate_of=None, mail=None, conn=None):
@@ -271,6 +328,14 @@ class Inbox:
             conn.execute('INSERT OR REPLACE INTO inbox_reviews VALUES (?,?,?)', (aid, trusted_actor(), preview['preview_id']))
             self.db.audit('incoming_supplier_verified', 'inbox_attachment', aid, details={'preview_id': preview['preview_id'], 'rows': len(rows)}, conn=conn)
         return preview
+
+    def clean_abandoned_staging(self):
+        """Called only under the worker flock. Never targets committed UUID files."""
+        if not self.root.exists():return
+        for path in self.root.iterdir():
+            if path.name.startswith(('.intake-', '.attachments-')) and path.is_dir() and not path.is_symlink():
+                if path.resolve().parent != self.root.resolve():raise RuntimeError('Unsafe staging path')
+                shutil.rmtree(path)
 
 
 @contextmanager
@@ -439,6 +504,7 @@ def main():
         except BlockingIOError:
             print('{"status":"already_running"}', flush=True)
             return
+        inbox.clean_abandoned_staging()
         stop = threading.Event()
         signal.signal(signal.SIGTERM, lambda *_: stop.set())
         while not stop.is_set():
