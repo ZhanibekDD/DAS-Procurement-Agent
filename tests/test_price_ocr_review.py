@@ -176,6 +176,17 @@ def test_large_historical_pdf_review_keeps_unknown_region_and_never_marks_curren
     checked=catalog.review_pdf(repeat['preview_id'],[altered],True)
     with pytest.raises(ConflictError,match='Идентификатор ранее импортированного поставщика не совпадает'):
         catalog.apply_prices(checked['preview_id'],True)
+    other=service.create_supplier(SupplierCreate(name='Другой подтверждённый поставщик',
+        email='other-owned@example.test',tax_id='7707083893',region='Москва'))
+    with db.connection() as conn:
+        conn.execute("UPDATE suppliers SET region='Не указан',cluster='' WHERE id=?",(sid,))
+    conflicting=dict(regional,tax_id=other['tax_id'])
+    repeat=launch.save_preview('price_catalog_pdf',{'document_id':next_doc['id'],
+        'rows':[conflicting],'errors':[],'document_currencies':['RUB']})
+    checked=catalog.review_pdf(repeat['preview_id'],[conflicting],True)
+    with pytest.raises(ConflictError,match='уже принадлежит другому поставщику'):
+        catalog.apply_prices(checked['preview_id'],True)
+    assert db.one('SELECT region FROM suppliers WHERE id=?',(sid,))['region']=='Не указан'
 
 
 def test_owned_price_source_promotes_only_placeholder_supplier_region(workflow):
@@ -206,7 +217,6 @@ def test_owned_price_source_promotes_only_placeholder_supplier_region(workflow):
     assert catalog.apply_prices(checked['preview_id'],True)['skipped']==1
     repaired=db.one('SELECT region,cluster FROM suppliers WHERE id=?',(supplier['id'],))
     assert repaired['region']=='Воронежская область' and repaired['cluster']
-
 
 @pytest.mark.parametrize('label',['Дата окончания','Дата поставки','Дата действия','Дата окончания действия','Дата доставки','Дата отгрузки'])
 def test_non_issue_dates_are_not_price_dates(label):

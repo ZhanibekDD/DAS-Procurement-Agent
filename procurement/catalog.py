@@ -225,6 +225,14 @@ class Catalog:
                                 if not same:
                                     raise ConflictError('Идентификатор ранее импортированного поставщика не совпадает')
                                 matches.append(key)
+                        for other in conn.execute('SELECT id,tax_id,email,phone FROM suppliers WHERE id<>?',
+                                                  (prior['id'],)):
+                            for key in ('tax_id','email','phone'):
+                                claimed=values[key]
+                                recorded=other[key]
+                                if claimed and recorded and (re.sub(r'\D','',claimed)==re.sub(r'\D','',recorded)
+                                        if key=='phone' else claimed.casefold()==recorded.casefold()):
+                                    raise ConflictError('Идентификатор прайса уже принадлежит другому поставщику')
                         # Similar names alone never authorize an ACL/routing change.
                         if matches:self._promote_supplier_region(conn,prior['id'],values['region'])
                     report['skipped']+=1;continue
