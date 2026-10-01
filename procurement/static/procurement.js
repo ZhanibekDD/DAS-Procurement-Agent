@@ -114,12 +114,12 @@ function catalogEditableRows(){return catalogPdfRows.map(r=>Object.fromEntries(O
 function catalogRowErrors(errors){
   const target=$('#catalogRowErrors');
   if(target)target.innerHTML='<p><b>Прайс пока не сохранён. Исправьте указанные строки:</b></p>'+errors.map(e=>`<p>Строка ${Number(e.row)}: ${esc(e.error)}</p>`).join('');
-  target?.scrollIntoView({block:'nearest'});
+  target?.scrollIntoView?.({block:'nearest'});
   toast(errors.map(e=>`Строка ${e.row}: ${e.error}`).slice(0,5).join('; '),true);
 }
 function catalogRequestError(message){
   const target=$('#catalogRowErrors');
-  if(target){target.textContent='Прайс пока не сохранён: '+message;target.scrollIntoView({block:'nearest'});}
+  if(target){target.textContent='Прайс пока не сохранён: '+message;target.scrollIntoView?.({block:'nearest'});}
   toast(message,true);
 }
 function showPdfPricePreview(p){
