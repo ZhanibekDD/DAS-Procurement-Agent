@@ -222,7 +222,7 @@ class Catalog:
                 r['current']=False
                 continue
             r['current']=key not in seen and bool(r['active']) and bool(r['region']) and bool(r['price_date']) and (not r['valid_until'] or r['valid_until']>=date.today().isoformat())
-            if r['current']:seen.add(key)
+            seen.add(key)
             if r['current'] and comparable_basis(r):current[key]=r
         groups={}
         for key,r in current.items():
