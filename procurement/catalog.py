@@ -143,6 +143,10 @@ class Catalog:
             if not supplier['active'] or (values['tax_id'] and supplier['tax_id'] and values['tax_id']!=supplier['tax_id']):
                 raise ConflictError('Удалённый поставщик или конфликт ИНН; восстановите/проверьте вручную')
             updates={k:values[k] for k in ('tax_id','email','phone') if values[k] and not supplier[k]}
+            if values['region'] and supplier['region']=='Не указан':
+                from .region_routing import resolve_cluster
+                updates['region']=values['region']
+                updates['cluster']=resolve_cluster(values['region'])
             if updates:
                 conn.execute('UPDATE suppliers SET '+','.join(k+'=?' for k in updates)+' WHERE id=?',(*updates.values(),supplier['id']))
                 self.db.audit('updated_from_price','supplier',supplier['id'],details={'fields':list(updates)},conn=conn)

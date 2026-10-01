@@ -115,6 +115,7 @@ def test_quick_intake_prebody_identity_and_two_upload_slots(http_boundary):
 
     assert upload_request({'type':'http','method':'POST','path':'/api/procurement/quick-intake'})
     assert not upload_request({'type':'http','method':'GET','path':'/api/procurement/quick-intake'})
+    assert price_review_request({'type':'http','method':'POST','path':'/api/procurement/catalog/preview-id/review-pdf'})
 
     async def run():
         # The identity boundary must reject an anonymous production upload before
@@ -129,6 +130,10 @@ def test_quick_intake_prebody_identity_and_two_upload_slots(http_boundary):
             async def forbidden_next(_):
                 raise AssertionError('unauthenticated request reached FastAPI')
             response=await application.das_identity_boundary(request,forbidden_next)
+            assert response.status_code==403
+            review=Request({'type':'http','method':'POST','path':'/api/procurement/catalog/preview-id/review-pdf',
+                'headers':[],'query_string':b''},receive=unread_body)
+            response=await application.das_identity_boundary(review,forbidden_next)
             assert response.status_code==403
         finally:application.settings=settings
 
@@ -202,6 +207,22 @@ def test_price_review_json_is_bounded_before_parse_and_replayed_intact():
         blocked=[]
         await UploadBodyLimit(app)(scope,chunked_receive,blocked_send)
         assert blocked[0]['status']==413
+    asyncio.run(run())
+
+
+def test_stalled_price_review_releases_upload_slot(monkeypatch):
+    import procurement.upload_io as upload_io
+    original_timeout=asyncio.timeout
+    monkeypatch.setattr(upload_io.asyncio,'timeout',lambda _:original_timeout(0.01))
+    async def run():
+        scope={'type':'http','method':'POST','path':'/api/procurement/catalog/preview-id/review-pdf','headers':[]}
+        gate=UploadBodyLimit(lambda *_:pytest.fail('Incomplete body must not reach parser'))
+        async def stalled():await asyncio.Event().wait()
+        sent=[]
+        async def send(message):sent.append(message)
+        await gate(scope,stalled,send)
+        assert sent[0]['status']==408
+        assert gate.slots._value==2
     asyncio.run(run())
 
 

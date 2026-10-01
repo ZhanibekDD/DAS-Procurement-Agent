@@ -148,6 +148,19 @@ def test_large_historical_pdf_review_keeps_unknown_region_and_never_marks_curren
     assert db.one('SELECT region FROM suppliers WHERE email=?',('prices@example.test',))['region']=='Не указан'
     assert all(not row['current'] for row in catalog.prices('ФБС TEST-'))
 
+    # Later independently reviewed regional evidence must make this exact
+    # supplier routable without changing the earlier unknown-region prices.
+    next_doc=service.register_source_document(filename='regional-price.pdf',content=b'%PDF-regional',document_type='price_list')
+    regional=dict(rows[0],item_name='ФБС TEST-REGION',region='Воронежская область',source_row=1)
+    next_preview=launch.save_preview('price_catalog_pdf',{'document_id':next_doc['id'],'rows':[regional],
+        'errors':[],'document_currencies':['RUB']})
+    checked=catalog.review_pdf(next_preview['preview_id'],[regional],True)
+    assert catalog.apply_prices(checked['preview_id'],True)['added']==1
+    supplier=db.one('SELECT region,cluster FROM suppliers WHERE email=?',('prices@example.test',))
+    assert supplier['region']=='Воронежская область' and supplier['cluster']
+    assert all(not row['current'] for row in catalog.prices('ФБС TEST-0'))
+    assert any(row['current'] for row in catalog.prices('ФБС TEST-REGION'))
+
 
 @pytest.mark.parametrize('label',['Дата окончания','Дата поставки','Дата действия','Дата окончания действия','Дата доставки','Дата отгрузки'])
 def test_non_issue_dates_are_not_price_dates(label):

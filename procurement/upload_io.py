@@ -134,15 +134,19 @@ class UploadBodyLimit:
             return await JSONResponse({'detail':'Проверка прайса занята; повторите позже'},429)(scope,receive,send)
         try:
             messages=[];total=0
-            while True:
-                message=await receive()
-                if message['type']=='http.disconnect':return
-                if message['type']!='http.request':continue
-                total+=len(message.get('body',b''))
-                if total>MAX_PRICE_REVIEW_BODY:
-                    return await JSONResponse({'detail':error},413)(scope,receive,send)
-                messages.append(message)
-                if not message.get('more_body',False):break
+            try:
+                async with asyncio.timeout(30):
+                    while True:
+                        message=await receive()
+                        if message['type']=='http.disconnect':return
+                        if message['type']!='http.request':continue
+                        total+=len(message.get('body',b''))
+                        if total>MAX_PRICE_REVIEW_BODY:
+                            return await JSONResponse({'detail':error},413)(scope,receive,send)
+                        messages.append(message)
+                        if not message.get('more_body',False):break
+            except TimeoutError:
+                return await JSONResponse({'detail':'Время передачи прайса истекло; повторите загрузку'},408)(scope,receive,send)
             pending=iter(messages)
             async def replay_receive():
                 try:return next(pending)
