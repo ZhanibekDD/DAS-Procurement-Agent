@@ -208,7 +208,25 @@ class Catalog:
                 if previous:
                     if any(previous[k]!=values[k] for k in fields):
                         raise ConflictError('Строка этого исходника уже импортирована с другими данными; загрузите новую версию прайса')
-                    if owner:self._promote_supplier_region(conn,owner['id'],values['region'])
+                    if owner:
+                        self._promote_supplier_region(conn,owner['id'],values['region'])
+                    else:
+                        prior=conn.execute('SELECT * FROM suppliers WHERE id=?',
+                            (previous['supplier_id'],)).fetchone()
+                        if not prior or normalize(values['supplier_name'])!=normalize(prior['name']):
+                            raise ConflictError('Поставщик ранее импортированной строки изменился; нужна ручная проверка')
+                        matches=[]
+                        for key in ('tax_id','email','phone'):
+                            claimed=values[key]
+                            recorded=prior[key]
+                            if claimed and recorded:
+                                same=(re.sub(r'\D','',claimed)==re.sub(r'\D','',recorded)
+                                      if key=='phone' else claimed.casefold()==recorded.casefold())
+                                if not same:
+                                    raise ConflictError('Идентификатор ранее импортированного поставщика не совпадает')
+                                matches.append(key)
+                        # Similar names alone never authorize an ACL/routing change.
+                        if matches:self._promote_supplier_region(conn,prior['id'],values['region'])
                     report['skipped']+=1;continue
                 if owner:self._promote_supplier_region(conn,owner['id'],values['region'])
                 sid=owner['id'] if owner else self._supplier(conn,values)

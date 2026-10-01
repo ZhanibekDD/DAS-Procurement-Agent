@@ -7,6 +7,7 @@ from procurement.price_ocr import scanned_items, document_date, seller_fields, e
 from procurement.imports import DocumentExtractResult
 from procurement.catalog import Catalog, ALIASES
 from procurement.models import SupplierCreate
+from procurement.service import ConflictError
 from procurement.incoming_mail import Inbox
 from test_incoming_mail import ingest, rows_of, admin
 from test_launch_workflow import workflow
@@ -161,6 +162,20 @@ def test_large_historical_pdf_review_keeps_unknown_region_and_never_marks_curren
     assert supplier['region']=='Воронежская область' and supplier['cluster']
     assert all(not row['current'] for row in catalog.prices('ФБС TEST-0'))
     assert any(row['current'] for row in catalog.prices('ФБС TEST-REGION'))
+    sid=db.one('SELECT id FROM suppliers WHERE email=?',('prices@example.test',))['id']
+    with db.connection() as conn:
+        conn.execute("UPDATE suppliers SET region='Не указан',cluster='' WHERE id=?",(sid,))
+    repeat=launch.save_preview('price_catalog_pdf',{'document_id':next_doc['id'],
+        'rows':[regional],'errors':[],'document_currencies':['RUB']})
+    checked=catalog.review_pdf(repeat['preview_id'],[regional],True)
+    assert catalog.apply_prices(checked['preview_id'],True)['skipped']==1
+    assert db.one('SELECT region FROM suppliers WHERE id=?',(sid,))['region']=='Воронежская область'
+    altered=dict(regional,email='different@example.test')
+    repeat=launch.save_preview('price_catalog_pdf',{'document_id':next_doc['id'],
+        'rows':[altered],'errors':[],'document_currencies':['RUB']})
+    checked=catalog.review_pdf(repeat['preview_id'],[altered],True)
+    with pytest.raises(ConflictError,match='Идентификатор ранее импортированного поставщика не совпадает'):
+        catalog.apply_prices(checked['preview_id'],True)
 
 
 def test_owned_price_source_promotes_only_placeholder_supplier_region(workflow):
