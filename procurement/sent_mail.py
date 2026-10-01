@@ -4,6 +4,7 @@ SMTP acceptance is not delivery. Failed/uncertain APPEND never triggers SMTP.
 No credentials or server exception strings are logged/returned.
 """
 import hashlib
+import errno
 import imaplib
 import os
 import re
@@ -25,6 +26,10 @@ SCAN_SECONDS = 120
 
 class ArchiveUncertain(Exception):
     """An APPEND may have been accepted. Only SEARCH is safe afterwards."""
+
+
+class PreAuthTransportError(ConnectionError):
+    """The IMAP socket failed before any LOGIN could have been submitted."""
 
 
 def file_digest(path):
@@ -50,20 +55,45 @@ def connect_imap():
     port = int(os.getenv('PROCUREMENT_IMAP_PORT', '993' if mode == 'ssl' else '143'))
     if mode == 'none' and host not in {'localhost', '127.0.0.1', '::1'}:
         raise ValueError('IMAP без TLS запрещён')
-    if mode == 'ssl':
-        client = imaplib.IMAP4_SSL(host, port, ssl_context=ssl.create_default_context(), timeout=30)
-    elif mode in {'none', 'starttls'}:
-        client = imaplib.IMAP4(host, port, timeout=30)
-    else:
-        raise ValueError('Неверный IMAP TLS режим')
+    try:
+        if mode == 'ssl':
+            client = imaplib.IMAP4_SSL(host, port, ssl_context=ssl.create_default_context(), timeout=30)
+        elif mode in {'none', 'starttls'}:
+            client = imaplib.IMAP4(host, port, timeout=30)
+        else:
+            raise ValueError('Неверный IMAP TLS режим')
+    except socket.gaierror as exc:
+        if exc.errno != socket.EAI_AGAIN:
+            raise
+        raise PreAuthTransportError() from None
+    except (TimeoutError, ConnectionError, imaplib.IMAP4.abort, ssl.SSLEOFError):
+        raise PreAuthTransportError() from None
+    except OSError as exc:
+        if exc.errno not in (errno.ENETUNREACH, errno.EHOSTUNREACH,
+                             errno.ETIMEDOUT, errno.ECONNRESET,
+                             errno.ECONNABORTED, errno.EPIPE):
+            raise
+        raise PreAuthTransportError() from None
     try:
         if mode == 'starttls':
-            client.starttls(ssl_context=ssl.create_default_context())
+            try:
+                client.starttls(ssl_context=ssl.create_default_context())
+            except (TimeoutError, ConnectionError, imaplib.IMAP4.abort, ssl.SSLEOFError):
+                raise PreAuthTransportError() from None
+            except OSError as exc:
+                if exc.errno not in (errno.ENETUNREACH, errno.EHOSTUNREACH,
+                                     errno.ETIMEDOUT, errno.ECONNRESET,
+                                     errno.ECONNABORTED, errno.EPIPE):
+                    raise
+                raise PreAuthTransportError() from None
         prefix = 'PROCUREMENT_IMAP' if os.getenv('PROCUREMENT_IMAP_PASSWORD_FILE') else 'PROCUREMENT_SMTP'
         client.login(os.getenv('PROCUREMENT_IMAP_USER') or os.environ['PROCUREMENT_SMTP_USER'], secret(prefix))
         return client
     except Exception:
-        client.shutdown()
+        try:
+            client.shutdown()
+        except Exception:
+            pass
         raise
 
 

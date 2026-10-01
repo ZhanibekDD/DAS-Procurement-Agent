@@ -7,12 +7,15 @@ the shared document registry until an authenticated administrator reviews them.
 from __future__ import annotations
 
 import hashlib
+import errno
+import imaplib
 import json
 import os
 import re
 import signal
 import shutil
 import socket
+import ssl
 import threading
 import tempfile
 import time
@@ -25,7 +28,7 @@ from pathlib import Path
 from .catalog import ALIASES, Catalog
 from .db import utcnow
 from .identity import authenticated_actor, trusted_actor
-from .sent_mail import connect_imap
+from .sent_mail import PreAuthTransportError, connect_imap
 from .service import ConflictError, NotFoundError
 from .table_ingest import mapped, read_table, safe_upload, suggested_mapping
 from .upload_io import FilePayload, payload_sha256
@@ -549,12 +552,18 @@ def poll(inbox, connect=connect_imap):
             conn.execute('INSERT OR REPLACE INTO inbox_state VALUES (?,?,?,?,?,?)',
                          (account, validity, max(last, high), next_uid, utcnow(), ''))
         return {'status': 'ok', 'received': len(fetched), 'caught_up': high >= next_uid - 1}
-    except Exception:
+    except Exception as exc:
         # No exception strings, mailbox headers, authentication or response dumps.
         with inbox.db.connection() as conn:
             conn.execute("INSERT INTO inbox_state VALUES (?,0,0,0,?,?) ON CONFLICT(account) DO UPDATE SET checked_at=excluded.checked_at,error=excluded.error",
                 (account, utcnow(), 'Не удалось проверить почту. Полученные письма сохранены; следующая попытка через минуту.'))
-        return {'status': 'error', 'received': 0}
+        transport = (isinstance(exc, PreAuthTransportError) or client is not None and (
+                     isinstance(exc, (TimeoutError, ConnectionError, imaplib.IMAP4.abort, ssl.SSLEOFError))
+                     or isinstance(exc, OSError) and exc.errno in (
+                         errno.ETIMEDOUT, errno.ECONNRESET, errno.ECONNABORTED,
+                         errno.EPIPE, errno.ENETUNREACH, errno.EHOSTUNREACH)))
+        return {'status': 'error', 'received': 0, 'retryable': transport,
+                'error_type': type(exc).__name__}
     finally:
         if staging is not None:
             staging.cleanup()
@@ -563,6 +572,14 @@ def poll(inbox, connect=connect_imap):
                 client.shutdown()
             except Exception:
                 pass
+
+
+def poll_bounded(inbox, connect=connect_imap, pause=time.sleep):
+    """Retry one transport failure only; never retry auth, parsing or quota errors."""
+    result=poll(inbox,connect)
+    if result.get('retryable') and not pause(3):
+        result=poll(inbox,connect)
+    return result
 
 
 def main():
@@ -591,7 +608,7 @@ def main():
         stop = threading.Event()
         signal.signal(signal.SIGTERM, lambda *_: stop.set())
         while not stop.is_set():
-            result = poll(inbox)
+            result = poll_bounded(inbox,pause=stop.wait)
             print(json.dumps(result), flush=True)
             if args.once:
                 return

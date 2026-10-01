@@ -1,3 +1,4 @@
+import errno
 import io
 import json
 import subprocess
@@ -10,7 +11,7 @@ from unittest.mock import patch
 import pytest
 from openpyxl import Workbook
 
-from procurement.incoming_mail import Inbox, extract_draft, download, poll, network_deadline
+from procurement.incoming_mail import Inbox, extract_draft, download, poll, poll_bounded, network_deadline
 from procurement.catalog import Catalog, ALIASES
 from procurement.identity import authenticated_actor
 from test_launch_workflow import workflow, FIXTURES
@@ -116,6 +117,102 @@ def test_auth_outage_one_attempt_then_later_recovery(workflow,mailbox_env,error)
     assert poll(inbox,offline)['status']=='error' and len(attempts)==1
     assert 'SENSITIVE' not in json.dumps(inbox.listing())
     assert poll(inbox,lambda:Mailbox({1:message()}))['status']=='ok'
+
+
+def test_transport_failure_has_one_bounded_retry_and_no_duplicate(workflow,mailbox_env):
+    from procurement.sent_mail import PreAuthTransportError
+    db,s,w=workflow;inbox=Inbox(s,w);attempts=[]
+    def connect():
+        attempts.append(1)
+        if len(attempts)==1:raise PreAuthTransportError()
+        return Mailbox({1:message()})
+    result=poll_bounded(inbox,connect,pause=lambda _:None)
+    assert len(attempts)==2, result
+    assert result['status']=='ok' and result['received']==1
+    assert db.one('SELECT error,last_uid FROM inbox_state')['error']==''
+    assert len(db.all('SELECT id FROM inbox_messages'))==1
+    assert 'PASSWORD' not in json.dumps(result)+json.dumps(inbox.listing())
+
+
+def test_auth_failure_does_not_retry_and_transport_outage_stays_degraded(workflow,mailbox_env):
+    import imaplib
+    from procurement.sent_mail import PreAuthTransportError
+    db,s,w=workflow;inbox=Inbox(s,w);attempts=[]
+    def denied():attempts.append(1);raise imaplib.IMAP4.error('PASSWORD invalid')
+    result=poll_bounded(inbox,denied,pause=lambda _:pytest.fail('Auth retry'))
+    assert result['status']=='error' and result['retryable'] is False and len(attempts)==1
+    attempts.clear()
+    def outage():attempts.append(1);raise PreAuthTransportError()
+    result=poll_bounded(inbox,outage,pause=lambda _:None)
+    assert result['status']=='error' and result['retryable'] is True and len(attempts)==2
+    assert db.one('SELECT error FROM inbox_state')['error']
+    assert 'PASSWORD' not in json.dumps(result)+json.dumps(inbox.listing())
+
+
+@pytest.mark.parametrize('failure',[TimeoutError,ConnectionResetError])
+def test_indeterminate_login_transport_is_not_retried(workflow,mailbox_env,failure):
+    db,s,w=workflow;inbox=Inbox(s,w);attempts=[]
+    def indeterminate_login():
+        attempts.append(1)
+        raise failure('LOGIN may have reached provider; PASSWORD redacted')
+    result=poll_bounded(inbox,indeterminate_login,pause=lambda _:pytest.fail('Login retry'))
+    assert result['status']=='error' and result['retryable'] is False and len(attempts)==1
+    assert 'PASSWORD' not in json.dumps(result)+json.dumps(inbox.listing())
+
+
+def test_authenticated_transport_failure_retries_once(workflow,mailbox_env):
+    db,s,w=workflow;inbox=Inbox(s,w);attempts=[]
+    def connect():
+        attempts.append(1)
+        mailbox=Mailbox({1:message()})
+        if len(attempts)==1:
+            mailbox.select=lambda *_,**__:(_ for _ in ()).throw(ConnectionResetError('PASSWORD transport'))
+        return mailbox
+    result=poll_bounded(inbox,connect,pause=lambda _:None)
+    assert len(attempts)==2, result
+    assert result['status']=='ok' and result['received']==1
+    assert len(db.all('SELECT id FROM inbox_messages'))==1
+    assert 'PASSWORD' not in json.dumps(result)+json.dumps(inbox.listing())
+
+
+def test_temporary_dns_is_identified_before_login(monkeypatch):
+    import socket
+    from procurement.sent_mail import PreAuthTransportError, connect_imap
+    monkeypatch.setenv('PROCUREMENT_IMAP_HOST','mail.example.org')
+    monkeypatch.setenv('PROCUREMENT_IMAP_TLS','ssl')
+    def temporary_dns(*args,**kwargs):raise socket.gaierror(socket.EAI_AGAIN,'PASSWORD private DNS')
+    monkeypatch.setattr('procurement.sent_mail.imaplib.IMAP4_SSL',temporary_dns)
+    with pytest.raises(PreAuthTransportError) as caught:connect_imap()
+    assert 'PASSWORD' not in str(caught.value)
+
+
+@pytest.mark.parametrize('failure',[TimeoutError('PASSWORD timeout'),
+                                     OSError(errno.ENETUNREACH,'PASSWORD route')])
+def test_starttls_transport_failure_is_prelogin_and_safe(monkeypatch,failure):
+    import imaplib
+    from procurement.sent_mail import PreAuthTransportError,connect_imap
+    class Client(imaplib.IMAP4):
+        logins=0
+        def __init__(self,*_args,**_kw):pass
+        def starttls(self,**_):raise failure
+        def login(self,*_):self.logins+=1
+        def shutdown(self):pass
+    monkeypatch.setenv('PROCUREMENT_IMAP_HOST','mail.example.org')
+    monkeypatch.setenv('PROCUREMENT_IMAP_TLS','starttls')
+    monkeypatch.setattr('procurement.sent_mail.imaplib.IMAP4',Client)
+    with pytest.raises(PreAuthTransportError) as caught:connect_imap()
+    assert Client.logins==0 and 'PASSWORD' not in str(caught.value)
+
+
+@pytest.mark.parametrize('code',[errno.ENETUNREACH,errno.EHOSTUNREACH])
+def test_prelogin_network_unreachable_is_retryable(monkeypatch,code):
+    from procurement.sent_mail import PreAuthTransportError,connect_imap
+    monkeypatch.setenv('PROCUREMENT_IMAP_HOST','mail.example.org')
+    monkeypatch.setenv('PROCUREMENT_IMAP_TLS','ssl')
+    def unreachable(*_args,**_kw):raise OSError(code,'PASSWORD route')
+    monkeypatch.setattr('procurement.sent_mail.imaplib.IMAP4_SSL',unreachable)
+    with pytest.raises(PreAuthTransportError) as caught:connect_imap()
+    assert 'PASSWORD' not in str(caught.value)
 
 
 def test_raw_mail_html_never_rendered_and_many_parts_fail_closed(workflow,tmp_path):
