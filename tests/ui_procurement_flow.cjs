@@ -12,7 +12,7 @@ assert.equal(ctx.procurementStage({status:'rfq_sent',display_status:'rfq_unconfi
 assert(!ctx.procurementDecisionControls({id:2,status:'ordered'},[{id:1,supplier_name:'Тест'}]).includes('onclick'));
 assert(ctx.procurementDecisionControls({id:2,status:'ordered'},[]).includes('Заказ уже зафиксирован'));
 assert(ctx.procurementDecisionControls({id:2,status:'comparison'},[{id:1,supplier_name:'Тест'}]).includes('chooseProcurement'));
-for(const s of ['snapshot_sha256:p.snapshot_sha256','preview_sha256:p.preview_sha256','p.items.some(i=>i.lot_id!==lid)','epoch!==purchasing.epoch','lid!==state.selectedLot',"fd.set('expected_sha256',preview.sha256)",'data-price-remove','Подтверждаю корректные строки'])assert(source.includes(s),s);
+for(const s of ['snapshot_sha256:p.snapshot_sha256','preview_sha256:p.preview_sha256','p.items.some(i=>i.lot_id!==lid)','epoch!==purchasing.epoch','lid!==state.selectedLot',"fd.set('expected_sha256',preview.sha256)",'data-price-remove','Подтверждаю сохранение'])assert(source.includes(s),s);
 assert(!source.includes('showPdfPricePreview({...${JSON.stringify'));
 const index=fs.readFileSync('procurement/static/index.html','utf8');
 assert(!index.includes('data-view="rfq"'));assert(index.includes('data-view="lots"'));assert(index.includes('/assets/procurement.js'));

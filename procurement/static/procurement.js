@@ -114,7 +114,13 @@ function catalogEditableRows(){return catalogPdfRows.map(r=>Object.fromEntries(O
 function catalogRowErrors(errors){
   const target=$('#catalogRowErrors');
   if(target)target.innerHTML='<p><b>Прайс пока не сохранён. Исправьте указанные строки:</b></p>'+errors.map(e=>`<p>Строка ${Number(e.row)}: ${esc(e.error)}</p>`).join('');
+  target?.scrollIntoView?.({block:'nearest'});
   toast(errors.map(e=>`Строка ${e.row}: ${e.error}`).slice(0,5).join('; '),true);
+}
+function catalogRequestError(message){
+  const target=$('#catalogRowErrors');
+  if(target){target.textContent='Прайс пока не сохранён: '+message;target.scrollIntoView?.({block:'nearest'});}
+  toast(message,true);
 }
 function showPdfPricePreview(p){
   showInboxPriceRows({...p,filename:p.source_filename,confirm_rub:true});
@@ -127,12 +133,20 @@ function showPdfPricePreview(p){
       const rows=catalogEditableRows();
       if(rows.some(r=>!r.currency)&&!confirmed_rub){catalogRowErrors([{row:1,error:'Подтвердите по оригиналу, что цены указаны в рублях'}]);return;}
       const checked=await launchJson(`/api/procurement/catalog/${p.preview_id}/review-pdf`,'POST',{rows,confirmed_rub});
-      if(checked.errors?.length){catalogRowErrors(checked.errors);return;}
+      if(!checked.rows?.length){catalogRowErrors(checked.errors||[{row:1,error:'Нет подтверждённых цен'}]);return;}
       showConfirmedCatalog(checked);
-    }catch(e){toast(e.message,true)}finally{button.disabled=false}
+    }catch(e){catalogRequestError(e.message)}finally{button.disabled=false}
   };
 }
-function showConfirmedCatalog(p){$('#catalogImportPreview').innerHTML=`<p>Корректных строк ${p.rows.length}; ошибок ${p.errors.length}</p>${p.errors.map(e=>`<p>Строка ${e.row}: ${esc(e.error)}</p>`).join('')}<details><summary>Проверенные строки</summary>${p.rows.map(r=>`<p>${esc(JSON.stringify(r))}</p>`).join('')}</details><label><input id="catalogConfirmed" type="checkbox"> Подтверждаю корректные строки; строки с указанными ошибками пропустить</label>`;$('#modalSubmit').textContent='Импортировать';$('#modalSubmit').onclick=async()=>{if(!$('#catalogConfirmed').checked)return toast('Подтвердите строки',true);try{const r=await launchJson(`/api/procurement/catalog/${p.preview_id}/apply`,'POST',{confirmed:true});$('#modal').close();await loadAll();showView('pricebook');toast(`Добавлено ${r.added}, пропущено ${r.skipped}; ошибок ${r.errors.length}`)}catch(e){toast(e.message,true)}}}
+function showConfirmedCatalog(p){
+  $('#catalogImportPreview').innerHTML=`<div id="catalogRowErrors" role="alert"></div><p>К сохранению: ${p.rows.length} строк с подтверждённой ценой. ${p.errors.length?`${p.errors.length} строк без проверенной цены или реквизитов не попадут в историю.`:'Ошибок нет.'}</p>${p.errors.length?`<details><summary>Строки, которые не будут сохранены (${p.errors.length})</summary>${p.errors.map(e=>`<p>Строка ${Number(e.row)}: ${esc(e.error)}</p>`).join('')}</details>`:''}<details><summary>Проверенные строки (${p.rows.length})</summary>${p.rows.map(r=>`<p>${esc(JSON.stringify(r))}</p>`).join('')}</details><label><input id="catalogConfirmed" type="checkbox"> Подтверждаю сохранение ${p.rows.length} строк; ${p.errors.length} строк с ошибками пропустить</label>`;
+  $('#modalSubmit').textContent='Сохранить проверенные цены';
+  $('#modalSubmit').onclick=async()=>{
+    if(!$('#catalogConfirmed').checked)return catalogRequestError('Подтвердите, какие строки будут сохранены и какие останутся без цены');
+    try{const r=await launchJson(`/api/procurement/catalog/${p.preview_id}/apply`,'POST',{confirmed:true});$('#modal').close();await loadAll();showView('pricebook');toast(`Добавлено ${r.added}, повторов ${r.skipped}; не сохранено строк с ошибками ${r.errors.length}`)}
+    catch(e){catalogRequestError(e.message)}
+  };
+}
 function openIncomingPrices(){launchModal('Прайсы из входящей почты',`<p>Сохраните исходное входящее письмо как EML и загрузите сюда. Вложения XLSX/CSV/PDF разбираются отдельно; отправитель письма не считается подтверждённым поставщиком.</p><input id="incomingPriceMail" type="file" accept=".eml"><div id="incomingPriceChoices"></div><div id="catalogImportPreview"></div>`,'Предпросмотр',async()=>{const file=$('#incomingPriceMail').files[0];if(!file)return toast('Выберите EML',true);try{const fd=new FormData();fd.append('file',file);const result=await api('/api/procurement/catalog/incoming-mail',{method:'POST',body:fd});$('#incomingPriceChoices').innerHTML=result.previews.map((p,n)=>`<button type="button" id="incomingPrice${n}" class="btn secondary">Вложение ${n+1}</button>`).join('');result.previews.forEach((p,n)=>{$('#incomingPrice'+n).onclick=()=>p.requires_review?showPdfPricePreview(p):showConfirmedCatalog(p)});toast('Вложения извлечены; выберите и проверьте каждое')}catch(e){toast(e.message,true)}})}
 const catalogWithMail=renderPricebook;
 renderPricebook=function(){catalogWithMail();$('#pricebook .panel').insertAdjacentHTML('beforeend','<button class="btn secondary" onclick="openIncomingPrices()">Из входящего письма EML</button>')};
@@ -193,7 +207,7 @@ async function openInboxAttachment(id){
           catalogRowErrors(checked.errors);return;
         }
         showConfirmedCatalog(checked);
-      }catch(e){toast(e.message,true)}finally{button.disabled=false}
+      }catch(e){catalogRequestError(e.message)}finally{button.disabled=false}
     };
   }catch(e){toast(e.message,true)}
 }

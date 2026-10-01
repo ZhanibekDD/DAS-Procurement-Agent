@@ -93,7 +93,7 @@ class Catalog:
     def __init__(self,service,launch):
         self.service,self.launch,self.db=service,launch,service.db
 
-    def price_preview(self,doc,table,mapping=None,document_currencies=None):
+    def price_preview(self,doc,table,mapping=None,document_currencies=None,allow_unknown_region=False):
         chosen=mapping if mapping is not None else suggested_mapping(table['headers'],ALIASES)
         rows=[];errors=[]
         for source in table['rows']:
@@ -116,15 +116,27 @@ class Catalog:
                 for field in ('price_date','valid_until'):
                     if values[field]:
                         date.fromisoformat(values[field])
-                if not values['price_date'] or not values['region']:
+                if not values['price_date'] or (not values['region'] and not allow_unknown_region):
                     raise ValueError('Нужны дата прайса и регион')
-                SupplierCreate(name=values['supplier_name'],tax_id=values['tax_id'],email=values['email'],phone=values['phone'],region=values['region'],categories=[values['category']] if values['category'] else [])
+                # A PDF may state prices without an offer region. Preserve that
+                # absence; the row stays historical and cannot join a regional median.
+                SupplierCreate(name=values['supplier_name'],tax_id=values['tax_id'],email=values['email'],phone=values['phone'],region=values['region'] or 'Не указан',categories=[values['category']] if values['category'] else [])
                 rows.append({'source_row':source['row'],**values})
             except (ValueError,TypeError) as exc:
                 errors.append({'row':source['row'],'error':str(exc)})
         evidence={} if document_currencies is None else {'document_currencies':document_currencies}
         return self.launch.save_preview('price_catalog',{'document_id':doc['id'],'rows':rows,'errors':errors,
              'headers':table['headers'],'mapping':chosen,'sheet':table['sheet'],**evidence})
+
+    def _promote_supplier_region(self,conn,supplier_id,region):
+        if not region:return
+        supplier=conn.execute('SELECT region FROM suppliers WHERE id=?',(supplier_id,)).fetchone()
+        if supplier and supplier['region']=='Не указан':
+            from .region_routing import resolve_cluster
+            conn.execute('UPDATE suppliers SET region=?,cluster=? WHERE id=?',
+                (region,resolve_cluster(region),supplier_id))
+            self.db.audit('updated_from_price','supplier',supplier_id,
+                details={'fields':['region','cluster']},conn=conn)
 
     def _supplier(self,conn,values):
         # Conflicting exact identifiers are not reconciled by fuzzy name.
@@ -141,12 +153,13 @@ class Catalog:
             if not supplier['active'] or (values['tax_id'] and supplier['tax_id'] and values['tax_id']!=supplier['tax_id']):
                 raise ConflictError('Удалённый поставщик или конфликт ИНН; восстановите/проверьте вручную')
             updates={k:values[k] for k in ('tax_id','email','phone') if values[k] and not supplier[k]}
+            self._promote_supplier_region(conn,supplier['id'],values['region'])
             if updates:
                 conn.execute('UPDATE suppliers SET '+','.join(k+'=?' for k in updates)+' WHERE id=?',(*updates.values(),supplier['id']))
                 self.db.audit('updated_from_price','supplier',supplier['id'],details={'fields':list(updates)},conn=conn)
             return supplier['id']
         from .launch_workflow import supplier_values
-        data=SupplierCreate(name=values['supplier_name'],tax_id=values['tax_id'],email=values['email'],phone=values['phone'],region=values['region'],categories=[values['category']] if values['category'] else [])
+        data=SupplierCreate(name=values['supplier_name'],tax_id=values['tax_id'],email=values['email'],phone=values['phone'],region=values['region'] or 'Не указан',categories=[values['category']] if values['category'] else [])
         fields=supplier_values(data)
         sid=conn.execute('INSERT INTO suppliers('+','.join(fields)+',source,created_at) VALUES ('+','.join('?' for _ in range(len(fields)+2))+')',(*fields.values(),'price_catalog',utcnow())).lastrowid
         self.db.audit('created_from_price','supplier',sid,conn=conn)
@@ -195,7 +208,35 @@ class Catalog:
                 if previous:
                     if any(previous[k]!=values[k] for k in fields):
                         raise ConflictError('Строка этого исходника уже импортирована с другими данными; загрузите новую версию прайса')
+                    if owner:
+                        self._promote_supplier_region(conn,owner['id'],values['region'])
+                    else:
+                        prior=conn.execute('SELECT * FROM suppliers WHERE id=?',
+                            (previous['supplier_id'],)).fetchone()
+                        if not prior or normalize(values['supplier_name'])!=normalize(prior['name']):
+                            raise ConflictError('Поставщик ранее импортированной строки изменился; нужна ручная проверка')
+                        matches=[]
+                        for key in ('tax_id','email','phone'):
+                            claimed=values[key]
+                            recorded=prior[key]
+                            if claimed and recorded:
+                                same=(re.sub(r'\D','',claimed)==re.sub(r'\D','',recorded)
+                                      if key=='phone' else claimed.casefold()==recorded.casefold())
+                                if not same:
+                                    raise ConflictError('Идентификатор ранее импортированного поставщика не совпадает')
+                                matches.append(key)
+                        for other in conn.execute('SELECT id,tax_id,email,phone FROM suppliers WHERE id<>?',
+                                                  (prior['id'],)):
+                            for key in ('tax_id','email','phone'):
+                                claimed=values[key]
+                                recorded=other[key]
+                                if claimed and recorded and (re.sub(r'\D','',claimed)==re.sub(r'\D','',recorded)
+                                        if key=='phone' else claimed.casefold()==recorded.casefold()):
+                                    raise ConflictError('Идентификатор прайса уже принадлежит другому поставщику')
+                        # Similar names alone never authorize an ACL/routing change.
+                        if matches:self._promote_supplier_region(conn,prior['id'],values['region'])
                     report['skipped']+=1;continue
+                if owner:self._promote_supplier_region(conn,owner['id'],values['region'])
                 sid=owner['id'] if owner else self._supplier(conn,values)
                 conn.execute('INSERT INTO supplier_catalog_prices(supplier_id,source_document_id,source_sheet,source_row,'+','.join(fields)+',created_at) VALUES ('+','.join('?' for _ in range(len(fields)+5))+')',
                     (sid,data['document_id'],data['sheet'],values['source_row'],*(values[k] for k in fields),utcnow()))
@@ -219,7 +260,7 @@ class Catalog:
             if r['price_date']>date.today().isoformat():
                 r['current']=False
                 continue
-            r['current']=key not in seen and bool(r['active']) and (not r['valid_until'] or r['valid_until']>=date.today().isoformat())
+            r['current']=key not in seen and bool(r['active']) and bool(r['region']) and bool(r['price_date']) and (not r['valid_until'] or r['valid_until']>=date.today().isoformat())
             seen.add(key)
             if r['current'] and comparable_basis(r):current[key]=r
         groups={}
@@ -293,7 +334,7 @@ class Catalog:
         headers=list(ALIASES)
         # Reuse the same strict validation/dedup/import, not another permissive PDF path.
         table={'headers':headers,'sheet':'PDF','rows':[{'row':n,'cells':[r.get(k,'') for k in headers]} for n,r in enumerate(rows,1)]}
-        return self.price_preview({'id':data['document_id']},table,{k:n for n,k in enumerate(headers)},document_currencies=currencies)
+        return self.price_preview({'id':data['document_id']},table,{k:n for n,k in enumerate(headers)},document_currencies=currencies,allow_unknown_region=True)
 
     def import_workbook(self,doc,rows,confirmed):
         if confirmed is not True:

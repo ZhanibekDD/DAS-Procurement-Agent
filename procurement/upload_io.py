@@ -11,6 +11,7 @@ from pathlib import Path
 MAX_FILE = 100 * 1024 * 1024
 MAX_BATCH = MAX_FILE
 MAX_BODY = MAX_BATCH + 1024 * 1024  # bounded multipart framing, not file allowance
+MAX_PRICE_REVIEW_BODY = 2 * 1024 * 1024
 CHUNK = 1024 * 1024
 TOO_LARGE = 'Файл больше 100 МБ'
 PACK_TOO_LARGE = 'Пакет файлов больше 100 МБ; загружайте по одному'
@@ -77,13 +78,20 @@ def upload_request(scope):
              or bool(re.fullmatch(r'/api/procurement/projects/\d+/workbook',scope.get('path','')))))
 
 
+def price_review_request(scope):
+    return (scope.get('type')=='http' and scope.get('method')=='POST' and
+            bool(re.fullmatch(r'/api/procurement/catalog/[^/]+/review-pdf',scope.get('path',''))))
+
+
 class UploadBodyLimit:
-    """Bound multipart disk use before parsing, including chunked requests."""
+    """Bound upload and price-review bodies before parsing, including chunks."""
     def __init__(self,app):
         self.app=app
         self.slots=asyncio.BoundedSemaphore(2)
 
     async def __call__(self,scope,receive,send):
+        if price_review_request(scope):
+            return await self._price_review(scope,receive,send)
         if not upload_request(scope):return await self.app(scope,receive,send)
         from starlette.formparsers import MultiPartException
         from starlette.responses import JSONResponse
@@ -112,4 +120,39 @@ class UploadBodyLimit:
                 message={**message,'status':413}
             await send(message)
         try:return await self.app(scope,bounded_receive,bounded_send)
+        finally:self.slots.release()
+
+    async def _price_review(self,scope,receive,send):
+        from starlette.responses import JSONResponse
+        error='Проверка прайса превышает 2 МБ; разделите файл или сократите поля'
+        length=dict(scope.get('headers',[])).get(b'content-length',b'0')
+        try:too_large=int(length)>MAX_PRICE_REVIEW_BODY
+        except ValueError:too_large=True
+        if too_large:return await JSONResponse({'detail':error},413)(scope,receive,send)
+        try:await asyncio.wait_for(self.slots.acquire(),timeout=0.05)
+        except TimeoutError:
+            return await JSONResponse({'detail':'Проверка прайса занята; повторите позже'},429)(scope,receive,send)
+        try:
+            body=bytearray()
+            try:
+                async with asyncio.timeout(30):
+                    while True:
+                        message=await receive()
+                        if message['type']=='http.disconnect':return
+                        if message['type']!='http.request':continue
+                        chunk=message.get('body',b'')
+                        if len(body)+len(chunk)>MAX_PRICE_REVIEW_BODY:
+                            return await JSONResponse({'detail':error},413)(scope,receive,send)
+                        body.extend(chunk)
+                        if not message.get('more_body',False):break
+            except TimeoutError:
+                return await JSONResponse({'detail':'Время передачи прайса истекло; повторите загрузку'},408)(scope,receive,send)
+            pending=True
+            async def replay_receive():
+                nonlocal pending
+                if pending:
+                    pending=False
+                    return {'type':'http.request','body':bytes(body),'more_body':False}
+                return await receive()
+            return await self.app(scope,replay_receive,send)
         finally:self.slots.release()

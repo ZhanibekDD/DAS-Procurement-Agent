@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from procurement.upload_io import (FilePayload,MAX_FILE,MAX_BODY,CHUNK,TOO_LARGE,
-    UploadTooLarge,staged_upload,payload_sha256,UploadBodyLimit,PACK_TOO_LARGE,upload_request)
+from procurement.upload_io import (FilePayload,MAX_FILE,MAX_BODY,MAX_PRICE_REVIEW_BODY,CHUNK,TOO_LARGE,
+    UploadTooLarge,staged_upload,payload_sha256,UploadBodyLimit,PACK_TOO_LARGE,upload_request,price_review_request)
 from procurement.table_ingest import read_table
 from procurement.imports import parse_supplier_table
 from procurement.stream_mail import send_streamed
@@ -115,6 +115,7 @@ def test_quick_intake_prebody_identity_and_two_upload_slots(http_boundary):
 
     assert upload_request({'type':'http','method':'POST','path':'/api/procurement/quick-intake'})
     assert not upload_request({'type':'http','method':'GET','path':'/api/procurement/quick-intake'})
+    assert price_review_request({'type':'http','method':'POST','path':'/api/procurement/catalog/preview-id/review-pdf'})
 
     async def run():
         # The identity boundary must reject an anonymous production upload before
@@ -129,6 +130,10 @@ def test_quick_intake_prebody_identity_and_two_upload_slots(http_boundary):
             async def forbidden_next(_):
                 raise AssertionError('unauthenticated request reached FastAPI')
             response=await application.das_identity_boundary(request,forbidden_next)
+            assert response.status_code==403
+            review=Request({'type':'http','method':'POST','path':'/api/procurement/catalog/preview-id/review-pdf',
+                'headers':[],'query_string':b''},receive=unread_body)
+            response=await application.das_identity_boundary(review,forbidden_next)
             assert response.status_code==403
         finally:application.settings=settings
 
@@ -167,6 +172,66 @@ def test_aggregate_request_error_explains_batch_limit():
         scope={'type':'http','method':'POST','path':'/api/imports/batch','headers':[(b'content-length',str(MAX_BODY+1).encode())]}
         await UploadBodyLimit(app)(scope,receive,send)
         assert sent[0]['status']==413 and PACK_TOO_LARGE.encode() in sent[1]['body']
+    asyncio.run(run())
+
+
+def test_price_review_json_is_bounded_before_parse_and_replayed_intact():
+    async def run():
+        path='/api/procurement/catalog/preview-id/review-pdf'
+        scope={'type':'http','method':'POST','path':path,'headers':[]}
+        assert price_review_request(scope) and not upload_request(scope)
+        async def app(scope,receive,send):
+            body=b''
+            while True:
+                message=await receive();body+=message.get('body',b'')
+                if not message.get('more_body'):break
+            assert body==b'{"rows":[]}';await send({'type':'http.response.start','status':200,'headers':[]})
+            await send({'type':'http.response.body','body':b'ok'})
+        emitted=[]
+        async def send(message):emitted.append(message)
+        chunks=iter([{'type':'http.request','body':b'{"rows":','more_body':True},
+                     {'type':'http.request','body':b'[]}','more_body':False}])
+        async def receive():return next(chunks)
+        await UploadBodyLimit(app)(scope,receive,send)
+        assert emitted[0]['status']==200
+
+        # Zero-byte ASGI messages do not accumulate per-message dictionary
+        # overhead while a slow authenticated client remains connected.
+        fragments=iter([{'type':'http.request','body':b'','more_body':True} for _ in range(10000)]
+            +[{'type':'http.request','body':b'{"rows":[]}','more_body':False}])
+        async def fragmented_receive():return next(fragments)
+        emitted.clear()
+        await UploadBodyLimit(app)(scope,fragmented_receive,send)
+        assert emitted[0]['status']==200
+
+        blocked=[]
+        async def blocked_send(message):blocked.append(message)
+        async def must_not_read():pytest.fail('Oversized review must be rejected before parse')
+        await UploadBodyLimit(app)({**scope,'headers':[(b'content-length',str(MAX_PRICE_REVIEW_BODY+1).encode())]},
+            must_not_read,blocked_send)
+        assert blocked[0]['status']==413 and b'2' in blocked[1]['body']
+
+        chunks=iter([{'type':'http.request','body':b'x'*CHUNK,'more_body':True} for _ in range(3)])
+        async def chunked_receive():return next(chunks)
+        blocked=[]
+        await UploadBodyLimit(app)(scope,chunked_receive,blocked_send)
+        assert blocked[0]['status']==413
+    asyncio.run(run())
+
+
+def test_stalled_price_review_releases_upload_slot(monkeypatch):
+    import procurement.upload_io as upload_io
+    original_timeout=asyncio.timeout
+    monkeypatch.setattr(upload_io.asyncio,'timeout',lambda _:original_timeout(0.01))
+    async def run():
+        scope={'type':'http','method':'POST','path':'/api/procurement/catalog/preview-id/review-pdf','headers':[]}
+        gate=UploadBodyLimit(lambda *_:pytest.fail('Incomplete body must not reach parser'))
+        async def stalled():await asyncio.Event().wait()
+        sent=[]
+        async def send(message):sent.append(message)
+        await gate(scope,stalled,send)
+        assert sent[0]['status']==408
+        assert gate.slots._value==2
     asyncio.run(run())
 
 

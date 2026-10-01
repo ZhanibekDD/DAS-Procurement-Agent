@@ -57,7 +57,7 @@ from .models import (
 )
 from .launch_workflow import LaunchWorkflow
 from .table_ingest import MAX_FILE, read_table
-from .upload_io import staged_upload, UploadBodyLimit, upload_request, UploadTooLarge, MAX_BATCH
+from .upload_io import staged_upload, UploadBodyLimit, upload_request, price_review_request, UploadTooLarge, MAX_BATCH
 from .passwords import verify_password
 from .service import ConflictError, NotFoundError, ProcurementService
 from .identity import authenticated_actor, authenticated_role, trusted_actor, trusted_role
@@ -134,7 +134,7 @@ async def das_identity_boundary(request: Request, call_next):
         actor = claims['sub'] if claims else None
         if not actor and settings.api_key and hmac.compare_digest(request.headers.get('x-api-key',''),settings.api_key):
             actor = 'service-api'
-        if upload_request(request.scope) and not actor and (settings.environment=='production' or settings.api_key or settings.local_auth_configured):
+        if (upload_request(request.scope) or price_review_request(request.scope)) and not actor and (settings.environment=='production' or settings.api_key or settings.local_auth_configured):
             return JSONResponse({'detail':'access denied'},status_code=403)
         context = authenticated_actor.set(actor)
         role_context=authenticated_role.set(claims.get('role','staff') if claims else 'staff')

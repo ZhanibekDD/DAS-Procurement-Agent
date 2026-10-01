@@ -41,7 +41,7 @@ class Budget(StrictModel):
 
 
 class ReviewedPriceRows(StrictModel):
-    rows:list[dict[str,str]]=Field(min_length=1,max_length=500)
+    rows:list[dict[str,str]]=Field(min_length=1,max_length=2000)
     confirmed_rub:bool=Field(default=False,strict=True)
 
 class ReadAlerts(StrictModel):
