@@ -128,6 +128,16 @@ class Catalog:
         return self.launch.save_preview('price_catalog',{'document_id':doc['id'],'rows':rows,'errors':errors,
              'headers':table['headers'],'mapping':chosen,'sheet':table['sheet'],**evidence})
 
+    def _promote_supplier_region(self,conn,supplier_id,region):
+        if not region:return
+        supplier=conn.execute('SELECT region FROM suppliers WHERE id=?',(supplier_id,)).fetchone()
+        if supplier and supplier['region']=='Не указан':
+            from .region_routing import resolve_cluster
+            conn.execute('UPDATE suppliers SET region=?,cluster=? WHERE id=?',
+                (region,resolve_cluster(region),supplier_id))
+            self.db.audit('updated_from_price','supplier',supplier_id,
+                details={'fields':['region','cluster']},conn=conn)
+
     def _supplier(self,conn,values):
         # Conflicting exact identifiers are not reconciled by fuzzy name.
         candidates=[]
@@ -143,10 +153,7 @@ class Catalog:
             if not supplier['active'] or (values['tax_id'] and supplier['tax_id'] and values['tax_id']!=supplier['tax_id']):
                 raise ConflictError('Удалённый поставщик или конфликт ИНН; восстановите/проверьте вручную')
             updates={k:values[k] for k in ('tax_id','email','phone') if values[k] and not supplier[k]}
-            if values['region'] and supplier['region']=='Не указан':
-                from .region_routing import resolve_cluster
-                updates['region']=values['region']
-                updates['cluster']=resolve_cluster(values['region'])
+            self._promote_supplier_region(conn,supplier['id'],values['region'])
             if updates:
                 conn.execute('UPDATE suppliers SET '+','.join(k+'=?' for k in updates)+' WHERE id=?',(*updates.values(),supplier['id']))
                 self.db.audit('updated_from_price','supplier',supplier['id'],details={'fields':list(updates)},conn=conn)
@@ -202,6 +209,7 @@ class Catalog:
                     if any(previous[k]!=values[k] for k in fields):
                         raise ConflictError('Строка этого исходника уже импортирована с другими данными; загрузите новую версию прайса')
                     report['skipped']+=1;continue
+                if owner:self._promote_supplier_region(conn,owner['id'],values['region'])
                 sid=owner['id'] if owner else self._supplier(conn,values)
                 conn.execute('INSERT INTO supplier_catalog_prices(supplier_id,source_document_id,source_sheet,source_row,'+','.join(fields)+',created_at) VALUES ('+','.join('?' for _ in range(len(fields)+5))+')',
                     (sid,data['document_id'],data['sheet'],values['source_row'],*(values[k] for k in fields),utcnow()))

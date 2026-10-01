@@ -6,6 +6,7 @@ import pytest
 from procurement.price_ocr import scanned_items, document_date, seller_fields, extract_price_document
 from procurement.imports import DocumentExtractResult
 from procurement.catalog import Catalog, ALIASES
+from procurement.models import SupplierCreate
 from procurement.incoming_mail import Inbox
 from test_incoming_mail import ingest, rows_of, admin
 from test_launch_workflow import workflow
@@ -160,6 +161,26 @@ def test_large_historical_pdf_review_keeps_unknown_region_and_never_marks_curren
     assert supplier['region']=='Воронежская область' and supplier['cluster']
     assert all(not row['current'] for row in catalog.prices('ФБС TEST-0'))
     assert any(row['current'] for row in catalog.prices('ФБС TEST-REGION'))
+
+
+def test_owned_price_source_promotes_only_placeholder_supplier_region(workflow):
+    db,service,launch=workflow
+    supplier=service.create_supplier(SupplierCreate(name='АО Испытательный завод',
+        email='prices-owned@example.test',region='Не указан'))
+    doc=service.register_source_document(filename='owned-regional.pdf',content=b'%PDF-owned',
+        document_type='price_list',supplier_id=supplier['id'])
+    row={key:'' for key in ALIASES}
+    row.update(item_name='ФБС OWNED-REGION',unit='шт',unit_price='100',currency='RUB',
+        vat='с НДС',price_date='2026-08-01',region='Воронежская область',
+        supplier_name='АО Испытательный завод',email='prices-owned@example.test')
+    catalog=Catalog(service,launch)
+    preview=launch.save_preview('price_catalog_pdf',{'document_id':doc['id'],'rows':[row],
+        'errors':[],'document_currencies':['RUB']})
+    checked=catalog.review_pdf(preview['preview_id'],[row],True)
+    assert catalog.apply_prices(checked['preview_id'],True)['added']==1
+    updated=db.one('SELECT region,cluster FROM suppliers WHERE id=?',(supplier['id'],))
+    assert updated['region']=='Воронежская область' and updated['cluster']
+    assert any(price['current'] for price in catalog.prices('ФБС OWNED-REGION'))
 
 
 @pytest.mark.parametrize('label',['Дата окончания','Дата поставки','Дата действия','Дата окончания действия','Дата доставки','Дата отгрузки'])
