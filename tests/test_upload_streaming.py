@@ -195,6 +195,15 @@ def test_price_review_json_is_bounded_before_parse_and_replayed_intact():
         await UploadBodyLimit(app)(scope,receive,send)
         assert emitted[0]['status']==200
 
+        # Zero-byte ASGI messages do not accumulate per-message dictionary
+        # overhead while a slow authenticated client remains connected.
+        fragments=iter([{'type':'http.request','body':b'','more_body':True} for _ in range(10000)]
+            +[{'type':'http.request','body':b'{"rows":[]}','more_body':False}])
+        async def fragmented_receive():return next(fragments)
+        emitted.clear()
+        await UploadBodyLimit(app)(scope,fragmented_receive,send)
+        assert emitted[0]['status']==200
+
         blocked=[]
         async def blocked_send(message):blocked.append(message)
         async def must_not_read():pytest.fail('Oversized review must be rejected before parse')

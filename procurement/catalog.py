@@ -208,6 +208,7 @@ class Catalog:
                 if previous:
                     if any(previous[k]!=values[k] for k in fields):
                         raise ConflictError('Строка этого исходника уже импортирована с другими данными; загрузите новую версию прайса')
+                    if owner:self._promote_supplier_region(conn,owner['id'],values['region'])
                     report['skipped']+=1;continue
                 if owner:self._promote_supplier_region(conn,owner['id'],values['region'])
                 sid=owner['id'] if owner else self._supplier(conn,values)

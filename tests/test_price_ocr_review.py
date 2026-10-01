@@ -181,6 +181,16 @@ def test_owned_price_source_promotes_only_placeholder_supplier_region(workflow):
     updated=db.one('SELECT region,cluster FROM suppliers WHERE id=?',(supplier['id'],))
     assert updated['region']=='Воронежская область' and updated['cluster']
     assert any(price['current'] for price in catalog.prices('ФБС OWNED-REGION'))
+    # A repeat of the same source must repair the legacy placeholder even when
+    # all price rows are already present and therefore skipped.
+    with db.connection() as conn:
+        conn.execute("UPDATE suppliers SET region='Не указан',cluster='' WHERE id=?",(supplier['id'],))
+    repeat=launch.save_preview('price_catalog_pdf',{'document_id':doc['id'],'rows':[row],
+        'errors':[],'document_currencies':['RUB']})
+    checked=catalog.review_pdf(repeat['preview_id'],[row],True)
+    assert catalog.apply_prices(checked['preview_id'],True)['skipped']==1
+    repaired=db.one('SELECT region,cluster FROM suppliers WHERE id=?',(supplier['id'],))
+    assert repaired['region']=='Воронежская область' and repaired['cluster']
 
 
 @pytest.mark.parametrize('label',['Дата окончания','Дата поставки','Дата действия','Дата окончания действия','Дата доставки','Дата отгрузки'])
