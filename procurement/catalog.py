@@ -93,7 +93,7 @@ class Catalog:
     def __init__(self,service,launch):
         self.service,self.launch,self.db=service,launch,service.db
 
-    def price_preview(self,doc,table,mapping=None,document_currencies=None):
+    def price_preview(self,doc,table,mapping=None,document_currencies=None,allow_unknown_region=False):
         chosen=mapping if mapping is not None else suggested_mapping(table['headers'],ALIASES)
         rows=[];errors=[]
         for source in table['rows']:
@@ -116,9 +116,11 @@ class Catalog:
                 for field in ('price_date','valid_until'):
                     if values[field]:
                         date.fromisoformat(values[field])
-                if not values['price_date'] or not values['region']:
+                if not values['price_date'] or (not values['region'] and not allow_unknown_region):
                     raise ValueError('Нужны дата прайса и регион')
-                SupplierCreate(name=values['supplier_name'],tax_id=values['tax_id'],email=values['email'],phone=values['phone'],region=values['region'],categories=[values['category']] if values['category'] else [])
+                # A PDF may state prices without an offer region. Preserve that
+                # absence; the row stays historical and cannot join a regional median.
+                SupplierCreate(name=values['supplier_name'],tax_id=values['tax_id'],email=values['email'],phone=values['phone'],region=values['region'] or 'Не указан',categories=[values['category']] if values['category'] else [])
                 rows.append({'source_row':source['row'],**values})
             except (ValueError,TypeError) as exc:
                 errors.append({'row':source['row'],'error':str(exc)})
@@ -146,7 +148,7 @@ class Catalog:
                 self.db.audit('updated_from_price','supplier',supplier['id'],details={'fields':list(updates)},conn=conn)
             return supplier['id']
         from .launch_workflow import supplier_values
-        data=SupplierCreate(name=values['supplier_name'],tax_id=values['tax_id'],email=values['email'],phone=values['phone'],region=values['region'],categories=[values['category']] if values['category'] else [])
+        data=SupplierCreate(name=values['supplier_name'],tax_id=values['tax_id'],email=values['email'],phone=values['phone'],region=values['region'] or 'Не указан',categories=[values['category']] if values['category'] else [])
         fields=supplier_values(data)
         sid=conn.execute('INSERT INTO suppliers('+','.join(fields)+',source,created_at) VALUES ('+','.join('?' for _ in range(len(fields)+2))+')',(*fields.values(),'price_catalog',utcnow())).lastrowid
         self.db.audit('created_from_price','supplier',sid,conn=conn)
@@ -219,8 +221,8 @@ class Catalog:
             if r['price_date']>date.today().isoformat():
                 r['current']=False
                 continue
-            r['current']=key not in seen and bool(r['active']) and (not r['valid_until'] or r['valid_until']>=date.today().isoformat())
-            seen.add(key)
+            r['current']=key not in seen and bool(r['active']) and bool(r['region']) and bool(r['price_date']) and (not r['valid_until'] or r['valid_until']>=date.today().isoformat())
+            if r['current']:seen.add(key)
             if r['current'] and comparable_basis(r):current[key]=r
         groups={}
         for key,r in current.items():
@@ -293,7 +295,7 @@ class Catalog:
         headers=list(ALIASES)
         # Reuse the same strict validation/dedup/import, not another permissive PDF path.
         table={'headers':headers,'sheet':'PDF','rows':[{'row':n,'cells':[r.get(k,'') for k in headers]} for n,r in enumerate(rows,1)]}
-        return self.price_preview({'id':data['document_id']},table,{k:n for n,k in enumerate(headers)},document_currencies=currencies)
+        return self.price_preview({'id':data['document_id']},table,{k:n for n,k in enumerate(headers)},document_currencies=currencies,allow_unknown_region=True)
 
     def import_workbook(self,doc,rows,confirmed):
         if confirmed is not True:
