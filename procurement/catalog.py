@@ -99,8 +99,10 @@ class Catalog:
         for source in table['rows']:
             try:
                 values=mapped(source,chosen,table['headers'],set(ALIASES))
-                if not values.get('item_name') or not values.get('unit_price'):
-                    raise ValueError('Не найдены наименование / цена; проверьте сопоставление')
+                if not values.get('item_name'):
+                    raise ValueError('Не найдено наименование; проверьте сопоставление колонок')
+                if not values.get('unit_price'):
+                    raise ValueError('Цена не указана числом (например, «Договорная»); строка не импортируется')
                 values['unit_price']=number(values['unit_price'])
                 for k in ALIASES:
                     values.setdefault(k,'')
@@ -116,8 +118,10 @@ class Catalog:
                 for field in ('price_date','valid_until'):
                     if values[field]:
                         date.fromisoformat(values[field])
-                if not values['price_date'] or (not values['region'] and not allow_unknown_region):
-                    raise ValueError('Нужны дата прайса и регион')
+                if not values['price_date']:
+                    raise ValueError('Нужна дата прайса: в документе она не найдена, укажите её по оригиналу')
+                if not values['region'] and not allow_unknown_region:
+                    raise ValueError('Нужен регион прайса')
                 # A PDF may state prices without an offer region. Preserve that
                 # absence; the row stays historical and cannot join a regional median.
                 SupplierCreate(name=values['supplier_name'],tax_id=values['tax_id'],email=values['email'],phone=values['phone'],region=values['region'] or 'Не указан',categories=[values['category']] if values['category'] else [])
