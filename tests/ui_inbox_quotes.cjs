@@ -24,7 +24,7 @@ vm.createContext(ctx);vm.runInContext(source,ctx);
  assert(!html.includes('<блоки>')&&!html.includes('<Бетон>'));
  assert(html.includes('не с адреса, на который отправлен запрос'));
  assert(html.includes('data-inbox-quote="a1" data-inbox-message="m1">КП в закупку'));
- assert(html.includes('КП в закупке «Песок»')&&html.includes('КП сохранено в закупке')&&!html.includes('data-inbox-quote="a2"'));
+ assert(html.includes('kp2.xlsx · КП сохранено в закупке «Песок»')&&!html.includes('data-inbox-quote="a2"'));
 
  // the reply's purchase and supplier are preselected; only same-cluster active suppliers are offered
  ctx.state.lots=[{id:3,title:'Фундаментные <блоки>',project_name:'ЭХЗ',cluster:'cluster_1'},{id:4,title:'Архив',archived_at:'2026-10-01',cluster:'cluster_1'}];

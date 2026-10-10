@@ -179,7 +179,7 @@ async function loadIncomingPrices(before=null){
       const stale=!c.checked_at||Date.now()-Date.parse(c.checked_at)>180000;
       return `<p ${c.error||stale?'role="alert"':''}>${esc(c.error||(stale?'Автоматическая проверка почты задерживается.':'Почта проверяется автоматически.'))} Последняя проверка: ${esc(c.checked_at?new Date(c.checked_at).toLocaleString('ru-RU'):'ещё не выполнена')}${c.next_uid>c.last_uid+1?' · Обрабатываем предыдущие письма.':''}</p>`;
     }).join('')||'<p>Автоматический сбор ещё не запущен.</p>';
-    target.innerHTML=connections+(result.messages.length?result.messages.map(m=>`<article class="message-card"><h3>${esc(m.subject||'Без темы')}</h3><p>${esc(m.sender||'Отправитель не определён')} · ${esc(new Date(m.received_at).toLocaleString('ru-RU'))}</p>${inboxRfqLine(m)}${m.error?`<p role="alert">${esc(m.error)}</p>`:''}${m.status==='duplicate'?'<p>Повторное письмо. Повторный импорт не требуется.</p>':''}${m.attachments.length?m.attachments.map(a=>`<p>${esc(a.filename)} · ${a.applied?'Цены сохранены':a.quote?'КП сохранено в закупке':'Требует проверки'} <button class="btn secondary" data-inbox-attachment="${esc(a.id)}">${a.applied?'Открыть исходник':'Проверить КП'}</button> ${inboxQuoteControl(m,a)}</p>`).join(''):'<p>Поддерживаемых прайсов для проверки нет.</p>'}</article>`).join(''):'<p>Входящих писем пока нет. Новые PDF, XLSX и CSV появятся здесь после проверки ящика.</p>')+(result.next_before?'<button class="btn secondary" id="olderIncomingPrices">Предыдущие письма</button>':'');
+    target.innerHTML=connections+(result.messages.length?result.messages.map(m=>`<article class="message-card"><h3>${esc(m.subject||'Без темы')}</h3><p>${esc(m.sender||'Отправитель не определён')} · ${esc(new Date(m.received_at).toLocaleString('ru-RU'))}</p>${inboxRfqLine(m)}${m.error?`<p role="alert">${esc(m.error)}</p>`:''}${m.status==='duplicate'?'<p>Повторное письмо. Повторный импорт не требуется.</p>':''}${m.attachments.length?m.attachments.map(a=>`<p>${esc(a.filename)} · ${a.applied?'Цены сохранены':a.quote?'КП сохранено в закупке «'+esc(a.quote.lot_title)+'»':'Требует проверки'} <button class="btn secondary" data-inbox-attachment="${esc(a.id)}">${a.applied?'Открыть исходник':'Проверить КП'}</button> ${inboxQuoteControl(m,a)}</p>`).join(''):'<p>Поддерживаемых прайсов для проверки нет.</p>'}</article>`).join(''):'<p>Входящих писем пока нет. Новые PDF, XLSX и CSV появятся здесь после проверки ящика.</p>')+(result.next_before?'<button class="btn secondary" id="olderIncomingPrices">Предыдущие письма</button>':'');
     target.querySelectorAll('[data-inbox-attachment]').forEach(b=>b.onclick=()=>openInboxAttachment(b.dataset.inboxAttachment));
     target.querySelectorAll('[data-inbox-quote]').forEach(b=>b.onclick=()=>openInboxQuote(b.dataset.inboxQuote,b.dataset.inboxMessage));
     if(result.next_before)$('#olderIncomingPrices').onclick=()=>loadIncomingPrices(result.next_before);
@@ -223,7 +223,7 @@ function inboxRfqLine(m){
   return `<p>Ответ на запрос по закупке «${esc(m.rfq.lot_title)}» · поставщик ${esc(m.rfq.supplier_name)}${m.rfq.archived?' · закупка в архиве':''}</p>${m.rfq.sender_matches?'':'<p role="alert">Письмо пришло не с адреса, на который отправлен запрос. Сверьте поставщика по документу.</p>'}`;
 }
 function inboxQuoteControl(m,a){
-  if(a.quote)return `<span>КП в закупке «${esc(a.quote.lot_title)}»</span>`;
+  if(a.quote)return a.applied?`<span>КП сохранено в закупке «${esc(a.quote.lot_title)}»</span>`:'';
   return `<button class="btn${m.rfq?'':' secondary'}" data-inbox-quote="${esc(a.id)}" data-inbox-message="${esc(m.id)}">КП в закупку</button>`;
 }
 function inboxQuotePrice(value){
@@ -240,16 +240,17 @@ async function openInboxQuote(aid,mid){
   launchModal('КП в закупку',`<p><a href="${original}" target="_blank" rel="noopener">Открыть оригинал: ${esc(attachment.filename)}</a></p>
     <p>${rfq?`Письмо — ответ на запрос по закупке «${esc(rfq.lot_title)}», поставщик ${esc(rfq.supplier_name)}.`:'Письмо не связано с отправленным запросом. Выберите закупку и поставщика по документу.'}</p>
     ${rfq&&!rfq.sender_matches?'<p role="alert">Адрес отправителя отличается от адреса запроса. Сверьте поставщика по документу.</p>':''}
-    <label>Закупка<select id="inboxQuoteLot"><option value="">Выберите закупку</option>${lots.map(l=>`<option value="${Number(l.id)}" ${rfq&&Number(rfq.lot_id)===Number(l.id)?'selected':''}>${esc(l.title)}${l.project_name?' · '+esc(l.project_name):''}</option>`).join('')}</select></label>
-    <label>Поставщик<select id="inboxQuoteSupplier"></select></label>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px">
+    <label style="display:flex;flex-direction:column;min-width:0">Закупка<select id="inboxQuoteLot"><option value="">Выберите закупку</option>${lots.map(l=>`<option value="${Number(l.id)}" ${rfq&&Number(rfq.lot_id)===Number(l.id)?'selected':''}>${esc(l.title)}${l.project_name?' · '+esc(l.project_name):''}</option>`).join('')}</select></label>
+    <label style="display:flex;flex-direction:column;min-width:0">Поставщик<select id="inboxQuoteSupplier"></select></label></div>
     <div id="inboxQuoteItems" aria-live="polite"></div>
     <fieldset><legend>НДС — по документу</legend><label><input type="radio" name="inboxQuoteVat" value="true"> Цены с НДС</label> <label><input type="radio" name="inboxQuoteVat" value="false"> Цены без НДС</label></fieldset>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px">
-      <label>Доставка, сумма<input id="inboxQuoteDelivery" inputmode="decimal" value="0"></label>
-      <label>Срок поставки, дней<input id="inboxQuoteLead" type="number" min="0" max="3650" value="0"></label>
-      <label>Условия оплаты<input id="inboxQuotePayment" maxlength="1000"></label>
-      <label>Дата цены<input id="inboxQuotePriceDate" type="date"></label>
-      <label>КП действует до<input id="inboxQuoteValid" type="date"></label>
+      <label style="display:flex;flex-direction:column;min-width:0">Доставка, сумма<input id="inboxQuoteDelivery" inputmode="decimal" value="0"></label>
+      <label style="display:flex;flex-direction:column;min-width:0">Срок поставки, дней<input id="inboxQuoteLead" type="number" min="0" max="3650" value="0"></label>
+      <label style="display:flex;flex-direction:column;min-width:0">Условия оплаты<input id="inboxQuotePayment" maxlength="1000"></label>
+      <label style="display:flex;flex-direction:column;min-width:0">Дата цены<input id="inboxQuotePriceDate" type="date"></label>
+      <label style="display:flex;flex-direction:column;min-width:0">КП действует до<input id="inboxQuoteValid" type="date"></label>
     </div>
     <label><input id="inboxQuoteVerified" type="checkbox"> Поставщик, цены и НДС сверены с оригиналом КП</label>`,'Сохранить КП',()=>{});
   const suppliers=()=>{
@@ -267,7 +268,7 @@ async function openInboxQuote(aid,mid){
       if(String($('#inboxQuoteLot').value)!==String(lotId))return;
       draft=d;
       const hint=i=>i.unit_differs?`<small role="note">В КП единица «${esc(i.source_unit)}» вместо «${esc(i.unit)}» — пересчитайте цену по оригиналу.</small>`:i.candidates>1?'<small role="note">В КП несколько похожих строк — выберите цену по оригиналу.</small>':i.source_row?`<small>Из КП: «${esc(i.source_row)}» — проверьте.</small>`:'<small>В распознанных строках не найдено. Оставьте пустым, если позиции нет в КП.</small>';
-      box.innerHTML=`${d.saved?`<p role="alert">КП из этого вложения уже сохранено в закупке «${esc(d.saved.lot_title)}».</p>`:''}${d.foreign_currencies.length?`<p role="alert">В КП указана валюта ${esc(d.foreign_currencies.join(', '))}, закупка в ${esc(d.currency)}. Конвертации нет — сохранить нельзя.</p>`:''}${(d.errors||[]).map(e=>`<p role="note">${esc(e)}</p>`).join('')}<p>Цены за единицу, ${esc(d.currency)}. Пустая цена — позиции нет в КП.${d.document_vat.length?` В документе про НДС: ${esc(d.document_vat.join('; '))}.`:''}</p>${d.items.map(i=>`<fieldset style="border:1px solid #dbe2e5;border-radius:12px;margin:8px 0;padding:10px;min-width:0"><legend>${esc(i.name)} · ${esc(i.quantity)} ${esc(i.unit)}</legend><label>Цена за ${esc(i.unit)}<input data-quote-item="${Number(i.lot_item_id)}" inputmode="decimal" value="${esc(i.suggested_price)}"></label> ${hint(i)}</fieldset>`).join('')}`;
+      box.innerHTML=`${d.saved?`<p role="alert">КП из этого вложения уже сохранено в закупке «${esc(d.saved.lot_title)}».</p>`:''}${d.foreign_currencies.length?`<p role="alert">В КП указана валюта ${esc(d.foreign_currencies.join(', '))}, закупка в ${esc(d.currency)}. Конвертации нет — сохранить нельзя.</p>`:''}${(d.errors||[]).map(e=>`<p role="note">${esc(e)}</p>`).join('')}<p>Цены за единицу, ${esc(d.currency)}. Пустая цена — позиции нет в КП.${d.document_vat.length?` В документе про НДС: ${esc(d.document_vat.join('; '))}.`:''}</p>${d.items.map(i=>`<fieldset style="border:1px solid #dbe2e5;border-radius:12px;margin:8px 0;padding:10px;min-width:0"><legend>${esc(i.name)} · ${esc(i.quantity)} ${esc(i.unit)}</legend><label style="display:flex;flex-direction:column;max-width:240px">Цена за ${esc(i.unit)}<input data-quote-item="${Number(i.lot_item_id)}" inputmode="decimal" value="${esc(i.suggested_price)}"></label> ${hint(i)}</fieldset>`).join('')}`;
     }catch(e){box.textContent=e.message}
   };
   $('#inboxQuoteLot').onchange=()=>{suppliers();items()};
