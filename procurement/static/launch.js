@@ -35,7 +35,8 @@ async function editLaunchSupplier(id){
     $('#modalTitle').textContent='Редактирование поставщика';
     for(const [field,input] of Object.entries({name:'sName',tax_id:'sTax',region:'sRegion',email:'sEmail',phone:'sPhone',telegram:'sTelegram',max_contact:'sMax',rating:'sRating',verified:'sVerified'}))$('#'+input).value=String(field==='verified'?!!s[field]:s[field]);
     $('#sCategories').value=s.categories.join(', ');
-    $('#modalBody').insertAdjacentHTML('beforeend',`<label>Кластер<select id="sCluster"><option value="" ${!s.cluster?'selected':''}>По региону / не указан</option><option value="cluster_1" ${s.cluster==='cluster_1'?'selected':''}>Кластер 1</option><option value="cluster_2" ${s.cluster==='cluster_2'?'selected':''}>Кластер 2</option></select></label>`);
+    if($('#sCluster'))$('#sCluster').value=s.cluster||'';
+    else $('#modalBody').insertAdjacentHTML('beforeend',`<label>Кластер поставок<select id="sCluster">${clusterOptions(s.cluster||'')}</select></label>`);
     $('#modalSubmit').onclick=()=>modalAction(()=>launchJson(`/api/launch/suppliers/${id}`,'PUT',{
       revision:s.revision,name:$('#sName').value,tax_id:$('#sTax').value,region:$('#sRegion').value,
       email:$('#sEmail').value,phone:$('#sPhone').value,telegram:$('#sTelegram').value,max_contact:$('#sMax').value,

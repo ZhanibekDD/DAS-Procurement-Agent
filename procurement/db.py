@@ -419,6 +419,9 @@ class Database:
             "lots": (
                 ("cluster", "TEXT NOT NULL DEFAULT ''"),
                 ("rfq_requirements_json", "TEXT NOT NULL DEFAULT '{}'"),
+                # Archive hides a finished or unneeded purchase; quotes and mail stay intact.
+                ("archived_at", "TEXT NOT NULL DEFAULT ''"),
+                ("archived_by", "TEXT NOT NULL DEFAULT ''"),
             ),
             "lot_items": (
                 ("delivery_date", "TEXT"),

@@ -373,6 +373,6 @@ class Catalog:
                 'source_sheet':row['sheet'],'source_row':row['row_number'],'source_status':row['status']})
         lots=[l for l in self.service.list_lots() if l['project_id']==project_id]
         return {'project':project,'workbook_rows':rows,'documents':self.db.all('SELECT id,filename,sha256 FROM source_documents WHERE project_id=?',(project_id,)),
-            'materials':self.db.all('''SELECT i.*,l.title AS lot_title FROM lot_items i JOIN lots l ON l.id=i.lot_id WHERE l.project_id=?''',(project_id,))+source_materials,
+            'materials':self.db.all('''SELECT i.*,l.title AS lot_title FROM lot_items i JOIN lots l ON l.id=i.lot_id WHERE l.project_id=? AND length(l.archived_at)=0''',(project_id,))+source_materials,
             'procurements':lots,'quotes':[q for l in lots for q in self.service.list_quotes(l['id'])],
             'budget':self.db.all('SELECT currency,amount FROM project_budgets WHERE project_id=?',(project_id,))}

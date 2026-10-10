@@ -82,7 +82,7 @@ class ProcurementService:
             "SELECT * FROM project_sections WHERE project_id = ? ORDER BY code", (project_id,)
         )
         row["lots"] = self.db.all(
-            "SELECT * FROM lots WHERE project_id = ? ORDER BY id DESC", (project_id,)
+            "SELECT * FROM lots WHERE project_id = ? AND archived_at = '' ORDER BY id DESC", (project_id,)
         )
         return row
 
@@ -247,11 +247,14 @@ class ProcurementService:
         self._lot_mail_status([row])
         return row
 
-    def list_lots(self) -> list[dict[str, Any]]:
+    def list_lots(self, archived: str = "active") -> list[dict[str, Any]]:
+        """Active purchases by default; archived="only" lists the archive, "all" both."""
+        where = {"active": "WHERE lots.archived_at = ''", "only": "WHERE lots.archived_at != ''", "all": ""}[archived]
         rows = self.db.all(
-            """
+            f"""
             SELECT lots.*, projects.name AS project_name
             FROM lots JOIN projects ON projects.id = lots.project_id
+            {where}
             ORDER BY lots.id DESC
             """
         )
@@ -261,6 +264,34 @@ class ProcurementService:
             )
         self._lot_mail_status(rows)
         return rows
+
+    ARCHIVED_LOT = "Закупка в архиве. Верните её из архива, чтобы отправить запрос поставщикам."
+
+    def set_lot_archived(self, lot_id: int, archived: bool) -> dict[str, Any]:
+        """Hide or restore a purchase. Nothing is deleted; sending from an archived purchase is refused."""
+        with self.db.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            lot = conn.execute("SELECT id, archived_at FROM lots WHERE id = ?", (lot_id,)).fetchone()
+            if not lot:
+                raise NotFoundError("lot not found")
+            if archived and not lot["archived_at"]:
+                sending = conn.execute(
+                    """SELECT count(*) FROM outbox_messages m JOIN campaigns c ON c.id = m.campaign_id
+                       WHERE c.lot_id = ? AND m.status IN ('queued', 'sending')""",
+                    (lot_id,),
+                ).fetchone()[0]
+                if sending:
+                    raise ConflictError(
+                        "Запросы этой закупки ещё отправляются. Дождитесь окончания отправки, "
+                        "затем уберите закупку в архив."
+                    )
+                conn.execute("UPDATE lots SET archived_at = ?, archived_by = ? WHERE id = ?",
+                             (utcnow(), trusted_actor(), lot_id))
+                self.db.audit("archived", "lot", lot_id, conn=conn)
+            elif not archived and lot["archived_at"]:
+                conn.execute("UPDATE lots SET archived_at = '', archived_by = '' WHERE id = ?", (lot_id,))
+                self.db.audit("restored", "lot", lot_id, conn=conn)
+        return self.get_lot(lot_id)
 
     def _lot_mail_status(self, lots):
         from .mail_evidence import lot_mail_projection
@@ -384,6 +415,8 @@ class ProcurementService:
         if data.snapshot_sha256 and payload_sha256(snapshot) != data.snapshot_sha256:
             raise ConflictError('Выбранный лот изменился; обновите предпросмотр')
         lot = self.get_lot(lot_id)
+        if lot.get("archived_at"):
+            raise ConflictError(self.ARCHIVED_LOT)
         lot['items'] = snapshot['items']
         project = self.get_project(lot["project_id"])
         cluster = self._confirmed_cluster(lot["cluster"], project["cluster"])
@@ -462,10 +495,12 @@ class ProcurementService:
             conn.execute("BEGIN IMMEDIATE")
             if payload_sha256(lot_snapshot(conn,lot_id,[i['id'] for i in snapshot['items']])) != payload_sha256(snapshot):
                 raise ConflictError('Лот изменился во время формирования запроса')
-            current = conn.execute("""SELECT l.cluster AS lot_cluster,p.cluster AS project_cluster
+            current = conn.execute("""SELECT l.cluster AS lot_cluster,p.cluster AS project_cluster,l.archived_at
                 FROM lots l JOIN projects p ON p.id=l.project_id WHERE l.id=?""", (lot_id,)).fetchone()
             if not current or self._confirmed_cluster(current["lot_cluster"], current["project_cluster"]) != cluster:
                 raise ConflictError("campaign cluster context changed; retry after review")
+            if current["archived_at"]:
+                raise ConflictError(self.ARCHIVED_LOT)
             current_attachments = [dict(r) for r in conn.execute('''SELECT d.id AS document_id,d.filename,d.sha256,d.size_bytes
                 FROM lot_attachments a JOIN source_documents d ON d.id=a.document_id WHERE a.lot_id=? ORDER BY d.id''',(lot_id,))]
             if sorted(lot.get('attachments',[]),key=lambda a:a['document_id']) != current_attachments:
@@ -645,6 +680,9 @@ class ProcurementService:
         with self.db.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             message = self._outbox_context(conn, message_id)
+            archived = conn.execute("SELECT archived_at FROM lots WHERE id=?", (message["lot_id"],)).fetchone()
+            if archived and archived["archived_at"]:
+                raise ConflictError(self.ARCHIVED_LOT)
             fingerprint = message_fingerprint(message)
             existing = conn.execute("SELECT * FROM outbox_approvals WHERE message_id=?", (message_id,)).fetchone()
             if existing:
@@ -673,6 +711,9 @@ class ProcurementService:
         with self.db.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             message = self._outbox_context(conn, message_id)
+            archived = conn.execute("SELECT archived_at FROM lots WHERE id=?", (message["lot_id"],)).fetchone()
+            if archived and archived["archived_at"]:
+                raise ConflictError(self.ARCHIVED_LOT)
             fingerprint = message_fingerprint(message)
             approval = conn.execute("SELECT * FROM outbox_approvals WHERE message_id=?", (message_id,)).fetchone()
             if (not approval or message["status"] != "approved" or approval["payload_sha256"] != fingerprint
@@ -1608,7 +1649,7 @@ class ProcurementService:
             "active_lots": int(
                 (
                     self.db.one(
-                        "SELECT COUNT(*) AS n FROM lots WHERE status NOT IN ('awarded', 'cancelled')"
+                        "SELECT COUNT(*) AS n FROM lots WHERE status NOT IN ('awarded', 'cancelled') AND archived_at = ''"
                     )
                     or {"n": 0}
                 )["n"]
