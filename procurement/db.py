@@ -417,6 +417,7 @@ class Database:
             "suppliers": (
                 ("max_contact", "TEXT NOT NULL DEFAULT ''"),
                 ("cluster", "TEXT NOT NULL DEFAULT ''"),
+                ("both_clusters", "INTEGER NOT NULL DEFAULT 0"),
             ),
             "lots": (
                 ("cluster", "TEXT NOT NULL DEFAULT ''"),

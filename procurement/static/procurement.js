@@ -255,7 +255,7 @@ async function openInboxQuote(aid,mid){
     <label><input id="inboxQuoteVerified" type="checkbox"> Поставщик, цены и НДС сверены с оригиналом КП</label>`,'Сохранить КП',()=>{});
   const suppliers=()=>{
     const lot=lots.find(l=>Number(l.id)===Number($('#inboxQuoteLot').value));
-    const list=(state.suppliers||[]).filter(s=>s.active!==false&&(!lot||!lot.cluster||s.cluster===lot.cluster||(rfq&&Number(s.id)===Number(rfq.supplier_id))));
+    const list=(state.suppliers||[]).filter(s=>s.active!==false&&(!lot||!lot.cluster||s.cluster===lot.cluster||(s.both_clusters&&['cluster_1','cluster_2'].includes(lot.cluster))||(rfq&&Number(s.id)===Number(rfq.supplier_id))));
     $('#inboxQuoteSupplier').innerHTML='<option value="">Выберите поставщика</option>'+list.map(s=>`<option value="${Number(s.id)}" ${rfq&&Number(rfq.supplier_id)===Number(s.id)?'selected':''}>${esc(s.name)}${s.tax_id?' · ИНН '+esc(s.tax_id):''}</option>`).join('');
   };
   let draft=null;

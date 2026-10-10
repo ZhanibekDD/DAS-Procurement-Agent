@@ -34,6 +34,8 @@ class SupplierCreate(StrictModel):
     telegram: str = Field(default="", max_length=120)
     max_contact: str = Field(default="", max_length=120)
     cluster: Literal["cluster_1", "cluster_2", ""] = ""
+    # Works in both clusters: offered to purchases of either confirmed cluster.
+    both_clusters: bool = False
     categories: list[str] = Field(default_factory=list, max_length=50)
     rating: float = Field(default=3.0, ge=0, le=5)
     verified: bool = False
