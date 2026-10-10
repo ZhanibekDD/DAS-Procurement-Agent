@@ -385,6 +385,8 @@ class Database:
             conn.executescript(MEMORY_SCHEMA)
             from .incoming_mail import SCHEMA as INBOX_SCHEMA
             conn.executescript(INBOX_SCHEMA)
+            from .inbox_quotes import SCHEMA as INBOX_QUOTES_SCHEMA
+            conn.executescript(INBOX_QUOTES_SCHEMA)
             self._migrate_columns(conn)
             for code, template in DEFAULT_TEMPLATES.items():
                 conn.execute(

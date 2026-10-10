@@ -6,6 +6,8 @@ from pydantic import Field
 from .identity import trusted_role
 from .models import StrictModel
 from .incoming_mail import Inbox, MAX_ROWS
+from . import inbox_quotes
+from .inbox_quotes import InboxQuote
 
 
 class Review(StrictModel):
@@ -35,6 +37,14 @@ def install(app, service, launch, require_access, write_access, call):
     @app.post('/api/procurement/inbox/attachments/{aid}/review', dependencies=[Depends(administrator), Depends(write_access)])
     def review(aid: str, data: Review):
         return call(inbox.prepare, aid, data.rows, data.confirmed_source)
+
+    @app.get('/api/procurement/inbox/attachments/{aid}/quote-draft', dependencies=[Depends(administrator)])
+    def quote_draft(aid: str, lot_id: int):
+        return call(inbox_quotes.quote_draft, service, inbox, aid, lot_id)
+
+    @app.post('/api/procurement/inbox/attachments/{aid}/quote', dependencies=[Depends(administrator), Depends(write_access)])
+    def save_quote(aid: str, data: InboxQuote):
+        return call(inbox_quotes.save_quote, service, inbox, aid, data)
 
     @app.api_route('/api/procurement/inbox/attachments/{aid}/original', methods=['GET','HEAD'], dependencies=[Depends(administrator)])
     def original(aid: str, request: Request):
