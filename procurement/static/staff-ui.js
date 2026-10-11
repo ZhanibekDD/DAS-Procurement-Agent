@@ -453,3 +453,116 @@ document.querySelectorAll('.nav-more button[data-view]').forEach(button => {
 });
 const initialExtra = $('#nav').querySelector('button:not([data-view])');
 if (initialExtra) document.querySelector('.nav-more').append(initialExtra);
+
+// Архив закупок: отработанные и ненужные закупки уходят из списка, счётчиков и проектов.
+// Ничего не удаляется; пока закупка в архиве, сервер не отправит из неё запрос поставщикам.
+const lotArchive = { rows: null };
+
+function lotArchiveDate(value) {
+  const date = value ? new Date(value) : null;
+  return date && !Number.isNaN(date.getTime()) ? date.toLocaleDateString('ru-RU') : '—';
+}
+
+function archivedLotsTable(rows) {
+  if (!rows.length) return '<div class="empty">Архив пуст. Сюда попадают закупки, убранные кнопкой «В архив».</div>';
+  return `<div class="table-wrap"><table id="lotArchiveTable"><thead><tr><th>Лот</th><th>Проект</th><th>В архиве с</th><th>Статус</th><th></th></tr></thead><tbody>${rows.map(l => `<tr data-search="${esc((l.title + ' ' + l.project_name + ' ' + l.region).toLowerCase())}" data-project="${esc(l.project_id)}"><td><b>${esc(l.title)}</b><br><small class="muted">${esc(l.region)}</small></td><td>${esc(l.project_name)}</td><td>${esc(lotArchiveDate(l.archived_at))}</td><td>${badge(l.display_status || l.status)}</td><td><div style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn ghost small" onclick="openLot(${Number(l.id)})">Открыть</button><button class="btn secondary small" onclick="restoreLot(${Number(l.id)})">Вернуть</button></div></td></tr>`).join('')}</tbody></table></div>`;
+}
+
+function showLotArchive(panel) {
+  let host = panel.querySelector('#lotArchive');
+  if (!host) {
+    host = document.createElement('div');
+    host.id = 'lotArchive';
+    panel.append(host);
+  }
+  host.hidden = false;
+  host.innerHTML = '<div class="empty">Загружаю архив…</div>';
+  api('/api/lots?archived=only').then(rows => {
+    lotArchive.rows = rows;
+    if (($('#lotStatusFilter')?.value || '') !== 'archived') return;
+    host.innerHTML = archivedLotsTable(rows);
+    const search = ($('#lotSearch')?.value || '').trim().toLowerCase();
+    const project = $('#lotProjectFilter')?.value || '';
+    let visible = 0;
+    host.querySelectorAll('#lotArchiveTable tbody tr').forEach(row => {
+      const show = (!search || row.dataset.search.includes(search)) && (!project || row.dataset.project === project);
+      row.hidden = !show;
+      if (show) visible++;
+    });
+    const count = $('#lotFilterCount');
+    if (count) count.textContent = `В архиве: ${visible}`;
+  }).catch(error => {
+    host.innerHTML = `<div class="empty">${esc(error.message)}</div>`;
+  });
+}
+
+if (typeof filterLots === 'function') {
+  const filterLotsWithoutArchive = filterLots;
+  filterLots = function () {
+    const panel = $('#lotStatusFilter')?.closest('section.panel');
+    const archived = ($('#lotStatusFilter')?.value || '') === 'archived';
+    if (panel) {
+      [...panel.children].forEach(child => {
+        if (child.id !== 'lotArchive' && !child.matches('.panel-title, .toolbar')) child.hidden = archived;
+      });
+      if (archived) return showLotArchive(panel);
+      const host = panel.querySelector('#lotArchive');
+      if (host) host.hidden = true;
+    }
+    return filterLotsWithoutArchive();
+  };
+}
+
+if (typeof renderLots === 'function') {
+  const renderLotsWithoutArchive = renderLots;
+  renderLots = function () {
+    renderLotsWithoutArchive();
+    const select = $('#lotStatusFilter');
+    if (select && !select.querySelector('option[value="archived"]')) {
+      select.insertAdjacentHTML('beforeend', '<option value="archived">Архив закупок</option>');
+    }
+  };
+}
+
+async function archiveLot(id) {
+  const lot = purchasing.lot?.id === id ? purchasing.lot : state.lots.find(item => item.id === id);
+  const name = lot ? `«${lot.title}»` : `#${id}`;
+  if (!confirm(`Убрать закупку ${name} в архив?\n\nОна пропадёт из списка закупок и проекта. Цены и переписка сохранятся; вернуть её можно в фильтре «Архив закупок». Пока закупка в архиве, запросы поставщикам из неё не отправляются.`)) return;
+  try {
+    await api(`/api/lots/${id}/archive`, { method: 'POST' });
+    toast('Закупка убрана в архив');
+    state.selectedLot = null;
+    purchasing.lot = null;
+    await loadAll();
+    showView('lots');
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function restoreLot(id) {
+  try {
+    await api(`/api/lots/${id}/restore`, { method: 'POST' });
+    toast('Закупка возвращена из архива');
+    lotArchive.rows = null;
+    await loadAll();
+    showView('lots');
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+if (typeof renderRfq === 'function') {
+  const renderRfqWithoutArchive = renderRfq;
+  renderRfq = function () {
+    renderRfqWithoutArchive();
+    const lot = purchasing.lot;
+    const header = $('#rfq')?.querySelector(':scope > section.panel');
+    if (!lot || !header) return;
+    if (lot.archived_at) {
+      header.insertAdjacentHTML('beforeend', `<p class="amber" style="padding:10px 12px;border-radius:10px">Закупка в архиве с ${esc(lotArchiveDate(lot.archived_at))}. Запросы поставщикам из неё не отправляются. <button class="btn secondary small" onclick="restoreLot(${Number(lot.id)})">Вернуть из архива</button></p>`);
+    } else {
+      header.insertAdjacentHTML('beforeend', `<button class="btn ghost small" onclick="archiveLot(${Number(lot.id)})">В архив</button>`);
+    }
+  };
+}

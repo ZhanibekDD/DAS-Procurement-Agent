@@ -18,5 +18,7 @@ test('OCR exposes all lines and requires acknowledgement; no automatic guessed q
   assert.ok(script.includes("!$('#ocrLinesReviewed')?.checked||!$('#flowHumanApproval')?.checked"));
   assert.ok(script.includes('Проверьте поля')===false); // API helper remains shared, not masked per action.
   assert.ok(script.includes('captureOcrRows()'));assert.ok(script.includes('reviewed_line_ids:s.lines.map'));
-  assert.ok(script.includes('<option value="" ${!s.cluster'));
+  // The edit modal reuses the shared cluster select: an empty choice is offered and preselected without a cluster.
+  assert.ok(script.includes("$('#sCluster').value=s.cluster||''") && script.includes("clusterOptions(s.cluster||'')"));
+  assert.ok(html.includes('<option value="" ${selected?\'\':\'selected\'}>Определить по региону</option>'));
 });
