@@ -131,6 +131,23 @@ def test_review_does_not_silently_import_empty_negotiated_price(workflow):
     assert preview['rows'][0]['unit_price']=='' and preview['rows'][0]['review_warning']=='Уточните цену'
     checked=catalog.review_pdf(preview['preview_id'],preview['rows'])
     assert not checked['rows'] and checked['errors']
+    # The reviewer is told the real reason, not to re-check column mapping a PDF does not have.
+    assert 'Договорная' in checked['errors'][0]['error'] and 'сопоставление' not in checked['errors'][0]['error']
+    assert not db.all('SELECT * FROM supplier_catalog_prices')
+
+
+def test_missing_price_date_is_named_alone_for_a_pdf_without_region(workflow):
+    from procurement.catalog import Catalog
+    from procurement.imports import ExtractedItem,DocumentExtractResult
+    db,service,launch=workflow
+    doc=service.register_source_document(filename='price.csv',content=b'item;price\nx;1\n',document_type='price_list')
+    result=DocumentExtractResult('price.pdf','0'*64,'price_list','ТЕСТ прайс','7707083893','','','','',
+                                None,None,'RUB',True,
+                                [ExtractedItem('ФБС 24.4.6','фбс','', '', 'шт','8897','','RUB',True,1,'',2,'','8897')])
+    catalog=Catalog(service,launch);preview=catalog.extracted_price_preview(doc,result)
+    checked=catalog.review_pdf(preview['preview_id'],preview['rows'])
+    assert not checked['rows']
+    assert checked['errors'][0]['error'].startswith('Нужна дата прайса') and 'регион' not in checked['errors'][0]['error']
     assert not db.all('SELECT * FROM supplier_catalog_prices')
 
 from test_launch_workflow import workflow

@@ -119,6 +119,10 @@ def scanned_items(lines, page, currency, vat):
 def document_date(text):
     months='января февраля марта апреля мая июня июля августа сентября октября ноября декабря'.split()
     text=text.replace('«','').replace('»','').replace('"','')
+    # A published price snapshot may omit an issue number/date but explicitly
+    # identify the date of its prices. Do not substitute upload or mail dates.
+    priced=re.search(r'\bЦены\s+указаны\s+на\s+(\d{1,2}[./-]\d{1,2}[./-](?:20\d{2}|\d{2}))(?!\d)',text,re.I)
+    if priced:return extract_date(priced[1])
     # A validity deadline is not the issue date. Never read the first arbitrary
     # date in the footer, filename or bank details as the price date.
     label=re.search(r'(?:(?:Сч[её]т|Исх\.|КП|Предложение)[^\n]{0,85}?\bот\s+|\bДата(?:\s+(?:прайса|документа))?\s*:\s*)(\d{1,2}(?:[. /-]|\s)[^\n]{3,50})',text,re.I)

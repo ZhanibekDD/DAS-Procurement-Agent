@@ -18,5 +18,13 @@ vm.createContext(ctx);vm.runInContext(source,ctx);
  assert(!source.includes('setInterval('));
  assert(source.includes("const main=['item_name','unit_price','unit','specification']"));
  assert(source.includes("k!=='currency'"));assert(source.includes('showInboxPriceRows(p)'));
+ nodes['#catalogImportPreview']={innerHTML:''};nodes['#modalSubmit']={textContent:'',onclick:null};
+ ctx.showConfirmedCatalog({preview_id:'reviewed',rows:[{item_name:'ФБС',unit_price:'100'}],
+   errors:[{row:2,error:'Цена не указана <script>'}]});
+ assert(nodes['#catalogImportPreview'].innerHTML.includes('К сохранению: 1'));
+ assert(nodes['#catalogImportPreview'].innerHTML.includes('не попадут в историю'));
+ assert(nodes['#catalogImportPreview'].innerHTML.includes('&lt;script&gt;'));
+ assert(!nodes['#catalogImportPreview'].innerHTML.includes('<script>'));
+ assert.equal(nodes['#modalSubmit'].textContent,'Сохранить проверенные цены');
  console.log('incoming mail UI: escaped content, explicit review, no false import, admin-only PASS');
 })().catch(e=>{console.error(e);process.exitCode=1});

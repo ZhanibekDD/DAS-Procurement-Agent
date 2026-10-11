@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from contextlib import AsyncExitStack
 from ipaddress import ip_address, ip_network
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import (
     Cookie,
@@ -57,7 +57,7 @@ from .models import (
 )
 from .launch_workflow import LaunchWorkflow
 from .table_ingest import MAX_FILE, read_table
-from .upload_io import staged_upload, UploadBodyLimit, upload_request, UploadTooLarge, MAX_BATCH
+from .upload_io import staged_upload, UploadBodyLimit, upload_request, price_review_request, UploadTooLarge, MAX_BATCH
 from .passwords import verify_password
 from .service import ConflictError, NotFoundError, ProcurementService
 from .identity import authenticated_actor, authenticated_role, trusted_actor, trusted_role
@@ -134,7 +134,7 @@ async def das_identity_boundary(request: Request, call_next):
         actor = claims['sub'] if claims else None
         if not actor and settings.api_key and hmac.compare_digest(request.headers.get('x-api-key',''),settings.api_key):
             actor = 'service-api'
-        if upload_request(request.scope) and not actor and (settings.environment=='production' or settings.api_key or settings.local_auth_configured):
+        if (upload_request(request.scope) or price_review_request(request.scope)) and not actor and (settings.environment=='production' or settings.api_key or settings.local_auth_configured):
             return JSONResponse({'detail':'access denied'},status_code=403)
         context = authenticated_actor.set(actor)
         role_context=authenticated_role.set(claims.get('role','staff') if claims else 'staff')
@@ -717,8 +717,24 @@ def create_lot(data: LotCreate):
 
 
 @app.get("/api/lots", dependencies=[Depends(require_access)])
-def list_lots():
-    return service.list_lots()
+def list_lots(archived: Literal["active", "only", "all"] = Query(default="active")):
+    return service.list_lots(archived)
+
+
+@app.post("/api/lots/{lot_id}/archive", dependencies=[Depends(require_access)])
+def archive_lot(lot_id: int):
+    try:
+        return service.set_lot_archived(lot_id, True)
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
+@app.post("/api/lots/{lot_id}/restore", dependencies=[Depends(require_access)])
+def restore_lot(lot_id: int):
+    try:
+        return service.set_lot_archived(lot_id, False)
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
 
 
 @app.get("/api/lots/{lot_id}", dependencies=[Depends(require_access)])

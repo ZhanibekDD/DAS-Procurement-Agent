@@ -27,6 +27,8 @@ async function approveProcurementMessage(id){try{await launchJson(`/api/procurem
 async function sendSavedProcurementMessage(id){try{const p=await api(`/api/outbox?lot_id=${state.selectedLot}`);const m=p.find(r=>r.id===id);if(!m||m.lot_id!==state.selectedLot)throw new Error('Запрос не принадлежит выбранной закупке');const snap=await api(`/api/procurement/campaigns/${m.campaign_id}/snapshot`);const r=await launchJson(`/api/procurement/outbox/${id}/send`,'POST',{lot_id:state.selectedLot,snapshot_sha256:snap.snapshot_sha256,confirmed:true});const notice=confirmedMailNotice(r);purchasing.lastSendError=null;await loadAll();await openLot(state.selectedLot);toast(notice,!!r.warning)}catch(e){purchasing.lastSendError=e.message;await loadAll();await openLot(state.selectedLot);toast(e.message,true)}}
 const procurementLots=renderLots;
 renderLots=function(){procurementLots();$('#lots').insertAdjacentHTML('afterbegin',`<section class="panel"><h2>Закупочный процесс</h2><p>${procurementStages.map(esc).join(' → ')}</p><p>Старые заявки и запросы сохранены с прежними ID. Откройте закупку для выбора позиций и предпросмотра.</p><button class="btn secondary" onclick="editApprovalPolicy()">Правила согласования</button></section>`)};
+// Без кластера поставщик не попадает ни в одну закупку: подсказываем, кого и как включить.
+function procurementClusterHint(lot,hasMatches){const text=[lot.title,...lot.items.map(i=>i.name)].join(' ').toLowerCase();const loose=(state.suppliers||[]).filter(s=>!s.cluster&&s.active!==false&&(s.categories||[]).some(c=>c&&text.includes(String(c).toLowerCase())));const cluster=esc(clusterLabel(lot.cluster).split(' — ')[0]);if(loose.length)return `<p class="amber" style="padding:10px 12px;border-radius:10px">${hasMatches?'Ещё п':'П'}одходят по категории, но без кластера: ${loose.length} — ${loose.slice(0,5).map(s=>esc(s.name)).join(', ')}${loose.length>5?'…':''}. Откройте «Поставщики» → «Ещё» → «Редактировать» и выберите «${cluster}» — после этого они появятся здесь.</p>`;return hasMatches?'':`<p class="muted">Добавьте поставщика с кластером «${cluster}» или назначьте его существующему поставщику.</p>`}
 const procurementOpenLot=openLot;
 openLot=async function(id){invalidateProcurement();const epoch=purchasing.epoch;state.selectedLot=Number(id);purchasing.lot=null;
  const inline=state.view==='lots';
@@ -40,7 +42,7 @@ openLot=async function(id){invalidateProcurement();const epoch=purchasing.epoch;
 renderRfq=function(){
  const lot=purchasing.lot?.id===state.selectedLot?purchasing.lot:null;
  const options=state.lots.map(l=>`<option value="${Number(l.id)}" ${Number(l.id)===state.selectedLot?'selected':''}>#${l.id} · ${esc(l.title)}</option>`).join('');
- $('#rfq').innerHTML=`<section class="panel"><button class="btn secondary" onclick="showView('lots')">← Все закупки</button><h2>${lot?esc(lot.title):'Выберите закупку'}</h2><select id="procurementLot" aria-label="Закупка"><option value="">Выберите лот</option>${options}</select><p>${procurementStages.map(esc).join(' → ')}</p></section>${lot?`<div class="layout"><section class="panel"><h3>Позиции лота #${lot.id}</h3><p>Источник запроса — только выбранный immutable ID и его позиции.</p>${lot.items.map(i=>`<label style="display:block;padding:8px"><input type="checkbox" name="procurementItem" value="${i.id}" checked> ${esc(i.name)} — ${esc(i.quantity)} ${esc(i.unit)}<small> ${esc(i.specification)}</small></label>`).join('')}<h3>Поставщики</h3>${state.matches.map(s=>`<label style="display:block;padding:8px"><input type="checkbox" name="procurementSupplier" value="${s.id}" ${s.auto_select?'checked':''}> ${esc(s.name)} · ${esc(s.email||'почта не указана')} · надёжность ${Number(s.rating).toFixed(1)} / 5</label>`).join('')||'<p>Нет подходящих поставщиков этого кластера.</p>'}<button class="btn secondary" id="procurementPreviewBtn" onclick="previewProcurement()">Обновить предпросмотр</button><div id="procurementPreview"></div></section><section class="panel"><h3>Запросы только этой закупки</h3>${filteredProcurementMessages(lot.id).map(m=>`<article class="message-card"><p>#${m.id} · ${esc(m.supplier_name)} · ${esc(m.status)}</p><details><summary>История запроса</summary>${messagePreview(m)}</details></article>`).join('')||'<p>Запросов ещё нет.</p>'}<button class="btn secondary" onclick="openProcurementComparison(${lot.id})">Цены и сравнение</button><button class="btn secondary" onclick="openModal('quote')">Добавить полученное КП</button></section></div>`:''}`;
+ $('#rfq').innerHTML=`<section class="panel"><button class="btn secondary" onclick="showView('lots')">← Все закупки</button><h2>${lot?esc(lot.title):'Выберите закупку'}</h2><select id="procurementLot" aria-label="Закупка"><option value="">Выберите лот</option>${options}</select><p>${procurementStages.map(esc).join(' → ')}</p></section>${lot?`<div class="layout"><section class="panel"><h3>Позиции лота #${lot.id}</h3><p>Источник запроса — только выбранный immutable ID и его позиции.</p>${lot.items.map(i=>`<label style="display:block;padding:8px"><input type="checkbox" name="procurementItem" value="${i.id}" checked> ${esc(i.name)} — ${esc(i.quantity)} ${esc(i.unit)}<small> ${esc(i.specification)}</small></label>`).join('')}<h3>Поставщики</h3>${state.matches.map(s=>`<label style="display:block;padding:8px"><input type="checkbox" name="procurementSupplier" value="${s.id}" ${s.auto_select?'checked':''}> ${esc(s.name)} · ${esc(s.email||'почта не указана')} · надёжность ${Number(s.rating).toFixed(1)} / 5</label>`).join('')||'<p>Нет подходящих поставщиков этого кластера.</p>'}${procurementClusterHint(lot,state.matches.length>0)}<button class="btn secondary" id="procurementPreviewBtn" onclick="previewProcurement()">Обновить предпросмотр</button><div id="procurementPreview"></div></section><section class="panel"><h3>Запросы только этой закупки</h3>${filteredProcurementMessages(lot.id).map(m=>`<article class="message-card"><p>#${m.id} · ${esc(m.supplier_name)} · ${esc(m.status)}</p><details><summary>История запроса</summary>${messagePreview(m)}</details></article>`).join('')||'<p>Запросов ещё нет.</p>'}<button class="btn secondary" onclick="openProcurementComparison(${lot.id})">Цены и сравнение</button><button class="btn secondary" onclick="openModal('quote')">Добавить полученное КП</button></section></div>`:''}`;
  $('#procurementLot').onchange=e=>{const id=Number(e.target.value);invalidateProcurement();state.selectedLot=id||null;purchasing.lot=null;if(id)openLot(id);else renderRfq()};
  document.querySelectorAll('[name="procurementItem"],[name="procurementSupplier"]').forEach(el=>el.onchange=()=>{
    invalidateProcurement();if(selectedRfqRequest().supplier_ids.length&&selectedRfqRequest().item_ids.length)previewProcurement();
@@ -114,7 +116,13 @@ function catalogEditableRows(){return catalogPdfRows.map(r=>Object.fromEntries(O
 function catalogRowErrors(errors){
   const target=$('#catalogRowErrors');
   if(target)target.innerHTML='<p><b>Прайс пока не сохранён. Исправьте указанные строки:</b></p>'+errors.map(e=>`<p>Строка ${Number(e.row)}: ${esc(e.error)}</p>`).join('');
+  target?.scrollIntoView?.({block:'nearest'});
   toast(errors.map(e=>`Строка ${e.row}: ${e.error}`).slice(0,5).join('; '),true);
+}
+function catalogRequestError(message){
+  const target=$('#catalogRowErrors');
+  if(target){target.textContent='Прайс пока не сохранён: '+message;target.scrollIntoView?.({block:'nearest'});}
+  toast(message,true);
 }
 function showPdfPricePreview(p){
   showInboxPriceRows({...p,filename:p.source_filename,confirm_rub:true});
@@ -127,12 +135,20 @@ function showPdfPricePreview(p){
       const rows=catalogEditableRows();
       if(rows.some(r=>!r.currency)&&!confirmed_rub){catalogRowErrors([{row:1,error:'Подтвердите по оригиналу, что цены указаны в рублях'}]);return;}
       const checked=await launchJson(`/api/procurement/catalog/${p.preview_id}/review-pdf`,'POST',{rows,confirmed_rub});
-      if(checked.errors?.length){catalogRowErrors(checked.errors);return;}
+      if(!checked.rows?.length){catalogRowErrors(checked.errors||[{row:1,error:'Нет подтверждённых цен'}]);return;}
       showConfirmedCatalog(checked);
-    }catch(e){toast(e.message,true)}finally{button.disabled=false}
+    }catch(e){catalogRequestError(e.message)}finally{button.disabled=false}
   };
 }
-function showConfirmedCatalog(p){$('#catalogImportPreview').innerHTML=`<p>Корректных строк ${p.rows.length}; ошибок ${p.errors.length}</p>${p.errors.map(e=>`<p>Строка ${e.row}: ${esc(e.error)}</p>`).join('')}<details><summary>Проверенные строки</summary>${p.rows.map(r=>`<p>${esc(JSON.stringify(r))}</p>`).join('')}</details><label><input id="catalogConfirmed" type="checkbox"> Подтверждаю корректные строки; строки с указанными ошибками пропустить</label>`;$('#modalSubmit').textContent='Импортировать';$('#modalSubmit').onclick=async()=>{if(!$('#catalogConfirmed').checked)return toast('Подтвердите строки',true);try{const r=await launchJson(`/api/procurement/catalog/${p.preview_id}/apply`,'POST',{confirmed:true});$('#modal').close();await loadAll();showView('pricebook');toast(`Добавлено ${r.added}, пропущено ${r.skipped}; ошибок ${r.errors.length}`)}catch(e){toast(e.message,true)}}}
+function showConfirmedCatalog(p){
+  $('#catalogImportPreview').innerHTML=`<div id="catalogRowErrors" role="alert"></div><p>К сохранению: ${p.rows.length} строк с подтверждённой ценой. ${p.errors.length?`${p.errors.length} строк без проверенной цены или реквизитов не попадут в историю.`:'Ошибок нет.'}</p>${p.errors.length?`<details><summary>Строки, которые не будут сохранены (${p.errors.length})</summary>${p.errors.map(e=>`<p>Строка ${Number(e.row)}: ${esc(e.error)}</p>`).join('')}</details>`:''}<details><summary>Проверенные строки (${p.rows.length})</summary>${p.rows.map(r=>`<p>${esc(JSON.stringify(r))}</p>`).join('')}</details><label><input id="catalogConfirmed" type="checkbox"> Подтверждаю сохранение ${p.rows.length} строк; ${p.errors.length} строк с ошибками пропустить</label>`;
+  $('#modalSubmit').textContent='Сохранить проверенные цены';
+  $('#modalSubmit').onclick=async()=>{
+    if(!$('#catalogConfirmed').checked)return catalogRequestError('Подтвердите, какие строки будут сохранены и какие останутся без цены');
+    try{const r=await launchJson(`/api/procurement/catalog/${p.preview_id}/apply`,'POST',{confirmed:true});$('#modal').close();await loadAll();showView('pricebook');toast(`Добавлено ${r.added}, повторов ${r.skipped}; не сохранено строк с ошибками ${r.errors.length}`)}
+    catch(e){catalogRequestError(e.message)}
+  };
+}
 function openIncomingPrices(){launchModal('Прайсы из входящей почты',`<p>Сохраните исходное входящее письмо как EML и загрузите сюда. Вложения XLSX/CSV/PDF разбираются отдельно; отправитель письма не считается подтверждённым поставщиком.</p><input id="incomingPriceMail" type="file" accept=".eml"><div id="incomingPriceChoices"></div><div id="catalogImportPreview"></div>`,'Предпросмотр',async()=>{const file=$('#incomingPriceMail').files[0];if(!file)return toast('Выберите EML',true);try{const fd=new FormData();fd.append('file',file);const result=await api('/api/procurement/catalog/incoming-mail',{method:'POST',body:fd});$('#incomingPriceChoices').innerHTML=result.previews.map((p,n)=>`<button type="button" id="incomingPrice${n}" class="btn secondary">Вложение ${n+1}</button>`).join('');result.previews.forEach((p,n)=>{$('#incomingPrice'+n).onclick=()=>p.requires_review?showPdfPricePreview(p):showConfirmedCatalog(p)});toast('Вложения извлечены; выберите и проверьте каждое')}catch(e){toast(e.message,true)}})}
 const catalogWithMail=renderPricebook;
 renderPricebook=function(){catalogWithMail();$('#pricebook .panel').insertAdjacentHTML('beforeend','<button class="btn secondary" onclick="openIncomingPrices()">Из входящего письма EML</button>')};
@@ -158,12 +174,14 @@ async function loadIncomingPrices(before=null){
   try{
     const result=await api('/api/procurement/inbox'+(before?'?before='+encodeURIComponent(before):''));
     if(target!==$('#mailPriceInbox'))return;
+    result.messages.forEach(m=>{inboxMessages[m.id]=m});
     const connections=result.connections.map(c=>{
       const stale=!c.checked_at||Date.now()-Date.parse(c.checked_at)>180000;
       return `<p ${c.error||stale?'role="alert"':''}>${esc(c.error||(stale?'Автоматическая проверка почты задерживается.':'Почта проверяется автоматически.'))} Последняя проверка: ${esc(c.checked_at?new Date(c.checked_at).toLocaleString('ru-RU'):'ещё не выполнена')}${c.next_uid>c.last_uid+1?' · Обрабатываем предыдущие письма.':''}</p>`;
     }).join('')||'<p>Автоматический сбор ещё не запущен.</p>';
-    target.innerHTML=connections+(result.messages.length?result.messages.map(m=>`<article class="message-card"><h3>${esc(m.subject||'Без темы')}</h3><p>${esc(m.sender||'Отправитель не определён')} · ${esc(new Date(m.received_at).toLocaleString('ru-RU'))}</p>${m.error?`<p role="alert">${esc(m.error)}</p>`:''}${m.status==='duplicate'?'<p>Повторное письмо. Повторный импорт не требуется.</p>':''}${m.attachments.length?m.attachments.map(a=>`<p>${esc(a.filename)} · ${a.applied?'Цены сохранены':'Требует проверки'} <button class="btn secondary" data-inbox-attachment="${esc(a.id)}">${a.applied?'Открыть исходник':'Проверить КП'}</button></p>`).join(''):'<p>Поддерживаемых прайсов для проверки нет.</p>'}</article>`).join(''):'<p>Входящих писем пока нет. Новые PDF, XLSX и CSV появятся здесь после проверки ящика.</p>')+(result.next_before?'<button class="btn secondary" id="olderIncomingPrices">Предыдущие письма</button>':'');
+    target.innerHTML=connections+(result.messages.length?result.messages.map(m=>`<article class="message-card"><h3>${esc(m.subject||'Без темы')}</h3><p>${esc(m.sender||'Отправитель не определён')} · ${esc(new Date(m.received_at).toLocaleString('ru-RU'))}</p>${inboxRfqLine(m)}${m.error?`<p role="alert">${esc(m.error)}</p>`:''}${m.status==='duplicate'?'<p>Повторное письмо. Повторный импорт не требуется.</p>':''}${m.attachments.length?m.attachments.map(a=>`<p>${esc(a.filename)} · ${a.applied?'Цены сохранены':a.quote?'КП сохранено в закупке «'+esc(a.quote.lot_title)+'»':'Требует проверки'} <button class="btn secondary" data-inbox-attachment="${esc(a.id)}">${a.applied?'Открыть исходник':'Проверить КП'}</button> ${inboxQuoteControl(m,a)}</p>`).join(''):'<p>Поддерживаемых прайсов для проверки нет.</p>'}</article>`).join(''):'<p>Входящих писем пока нет. Новые PDF, XLSX и CSV появятся здесь после проверки ящика.</p>')+(result.next_before?'<button class="btn secondary" id="olderIncomingPrices">Предыдущие письма</button>':'');
     target.querySelectorAll('[data-inbox-attachment]').forEach(b=>b.onclick=()=>openInboxAttachment(b.dataset.inboxAttachment));
+    target.querySelectorAll('[data-inbox-quote]').forEach(b=>b.onclick=()=>openInboxQuote(b.dataset.inboxQuote,b.dataset.inboxMessage));
     if(result.next_before)$('#olderIncomingPrices').onclick=()=>loadIncomingPrices(result.next_before);
   }catch(e){if(target===$('#mailPriceInbox'))target.textContent=e.message;}
 }
@@ -193,9 +211,93 @@ async function openInboxAttachment(id){
           catalogRowErrors(checked.errors);return;
         }
         showConfirmedCatalog(checked);
-      }catch(e){toast(e.message,true)}finally{button.disabled=false}
+      }catch(e){catalogRequestError(e.message)}finally{button.disabled=false}
     };
   }catch(e){toast(e.message,true)}
+}
+
+// A reply to our request becomes a quote of that purchase; the link comes only from the request's Message-ID.
+const inboxMessages={};
+function inboxRfqLine(m){
+  if(!m.rfq)return '';
+  return `<p>Ответ на запрос по закупке «${esc(m.rfq.lot_title)}» · поставщик ${esc(m.rfq.supplier_name)}${m.rfq.archived?' · закупка в архиве':''}</p>${m.rfq.sender_matches?'':'<p role="alert">Письмо пришло не с адреса, на который отправлен запрос. Сверьте поставщика по документу.</p>'}`;
+}
+function inboxQuoteControl(m,a){
+  if(a.quote)return a.applied?`<span>КП сохранено в закупке «${esc(a.quote.lot_title)}»</span>`:'';
+  return `<button class="btn${m.rfq?'':' secondary'}" data-inbox-quote="${esc(a.id)}" data-inbox-message="${esc(m.id)}">КП в закупку</button>`;
+}
+function inboxQuotePrice(value){
+  const text=String(value||'').replace(/[\s ]/g,'').replace(',','.');
+  return /^\d+(\.\d+)?$/.test(text)?text:null;
+}
+async function openInboxQuote(aid,mid){
+  const message=inboxMessages[mid]||{},rfq=message.rfq||null;
+  const attachment=(message.attachments||[]).find(a=>a.id===aid)||{filename:''};
+  if(rfq&&rfq.archived)return toast(`Закупка «${rfq.lot_title}» в архиве. Верните её из архива, чтобы добавить КП.`,true);
+  const lots=(state.lots||[]).filter(l=>!l.archived_at);
+  if(!lots.length)return toast('Нет активных закупок, к которым можно добавить КП',true);
+  const original=`/api/procurement/inbox/attachments/${encodeURIComponent(aid)}/original`;
+  launchModal('КП в закупку',`<p><a href="${original}" target="_blank" rel="noopener">Открыть оригинал: ${esc(attachment.filename)}</a></p>
+    <p>${rfq?`Письмо — ответ на запрос по закупке «${esc(rfq.lot_title)}», поставщик ${esc(rfq.supplier_name)}.`:'Письмо не связано с отправленным запросом. Выберите закупку и поставщика по документу.'}</p>
+    ${rfq&&!rfq.sender_matches?'<p role="alert">Адрес отправителя отличается от адреса запроса. Сверьте поставщика по документу.</p>':''}
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px">
+    <label style="display:flex;flex-direction:column;min-width:0">Закупка<select id="inboxQuoteLot"><option value="">Выберите закупку</option>${lots.map(l=>`<option value="${Number(l.id)}" ${rfq&&Number(rfq.lot_id)===Number(l.id)?'selected':''}>${esc(l.title)}${l.project_name?' · '+esc(l.project_name):''}</option>`).join('')}</select></label>
+    <label style="display:flex;flex-direction:column;min-width:0">Поставщик<select id="inboxQuoteSupplier"></select></label></div>
+    <div id="inboxQuoteItems" aria-live="polite"></div>
+    <fieldset><legend>НДС — по документу</legend><label><input type="radio" name="inboxQuoteVat" value="true"> Цены с НДС</label> <label><input type="radio" name="inboxQuoteVat" value="false"> Цены без НДС</label></fieldset>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px">
+      <label style="display:flex;flex-direction:column;min-width:0">Доставка, сумма<input id="inboxQuoteDelivery" inputmode="decimal" value="0"></label>
+      <label style="display:flex;flex-direction:column;min-width:0">Срок поставки, дней<input id="inboxQuoteLead" type="number" min="0" max="3650" value="0"></label>
+      <label style="display:flex;flex-direction:column;min-width:0">Условия оплаты<input id="inboxQuotePayment" maxlength="1000"></label>
+      <label style="display:flex;flex-direction:column;min-width:0">Дата цены<input id="inboxQuotePriceDate" type="date"></label>
+      <label style="display:flex;flex-direction:column;min-width:0">КП действует до<input id="inboxQuoteValid" type="date"></label>
+    </div>
+    <label><input id="inboxQuoteVerified" type="checkbox"> Поставщик, цены и НДС сверены с оригиналом КП</label>`,'Сохранить КП',()=>{});
+  const suppliers=()=>{
+    const lot=lots.find(l=>Number(l.id)===Number($('#inboxQuoteLot').value));
+    const list=(state.suppliers||[]).filter(s=>s.active!==false&&(!lot||!lot.cluster||s.cluster===lot.cluster||(s.both_clusters&&['cluster_1','cluster_2'].includes(lot.cluster))||(rfq&&Number(s.id)===Number(rfq.supplier_id))));
+    $('#inboxQuoteSupplier').innerHTML='<option value="">Выберите поставщика</option>'+list.map(s=>`<option value="${Number(s.id)}" ${rfq&&Number(rfq.supplier_id)===Number(s.id)?'selected':''}>${esc(s.name)}${s.tax_id?' · ИНН '+esc(s.tax_id):''}</option>`).join('');
+  };
+  let draft=null;
+  const items=async()=>{
+    const lotId=$('#inboxQuoteLot').value,box=$('#inboxQuoteItems');draft=null;
+    if(!lotId){box.innerHTML='<p>Выберите закупку, чтобы увидеть её позиции.</p>';return;}
+    box.textContent='Загрузка позиций…';
+    try{
+      const d=await api(`/api/procurement/inbox/attachments/${encodeURIComponent(aid)}/quote-draft?lot_id=${encodeURIComponent(lotId)}`);
+      if(String($('#inboxQuoteLot').value)!==String(lotId))return;
+      draft=d;
+      const hint=i=>i.unit_differs?`<small role="note">В КП единица «${esc(i.source_unit)}» вместо «${esc(i.unit)}» — пересчитайте цену по оригиналу.</small>`:i.candidates>1?'<small role="note">В КП несколько похожих строк — выберите цену по оригиналу.</small>':i.source_row?`<small>Из КП: «${esc(i.source_row)}» — проверьте.</small>`:'<small>В распознанных строках не найдено. Оставьте пустым, если позиции нет в КП.</small>';
+      box.innerHTML=`${d.saved?`<p role="alert">КП из этого вложения уже сохранено в закупке «${esc(d.saved.lot_title)}».</p>`:''}${d.foreign_currencies.length?`<p role="alert">В КП указана валюта ${esc(d.foreign_currencies.join(', '))}, закупка в ${esc(d.currency)}. Конвертации нет — сохранить нельзя.</p>`:''}${(d.errors||[]).map(e=>`<p role="note">${esc(e)}</p>`).join('')}<p>Цены за единицу, ${esc(d.currency)}. Пустая цена — позиции нет в КП.${d.document_vat.length?` В документе про НДС: ${esc(d.document_vat.join('; '))}.`:''}</p>${d.items.map(i=>`<fieldset style="border:1px solid #dbe2e5;border-radius:12px;margin:8px 0;padding:10px;min-width:0"><legend>${esc(i.name)} · ${esc(i.quantity)} ${esc(i.unit)}</legend><label style="display:flex;flex-direction:column;max-width:240px">Цена за ${esc(i.unit)}<input data-quote-item="${Number(i.lot_item_id)}" inputmode="decimal" value="${esc(i.suggested_price)}"></label> ${hint(i)}</fieldset>`).join('')}`;
+    }catch(e){box.textContent=e.message}
+  };
+  $('#inboxQuoteLot').onchange=()=>{suppliers();items()};
+  suppliers();items();
+  $('#modalSubmit').onclick=async()=>{
+    if(!draft)return toast('Выберите закупку и дождитесь её позиций',true);
+    const supplierId=Number($('#inboxQuoteSupplier').value);
+    if(!supplierId)return toast('Выберите поставщика по документу',true);
+    const vat=document.querySelector('input[name="inboxQuoteVat"]:checked');
+    if(!vat)return toast('Укажите по документу, цены с НДС или без',true);
+    const entered=[...document.querySelectorAll('[data-quote-item]')].filter(e=>e.value.trim());
+    const wrong=entered.find(e=>inboxQuotePrice(e.value)===null);
+    if(wrong){wrong.setAttribute('aria-invalid','true');wrong.focus();return toast('Цена должна быть числом, например 5120,50',true);}
+    if(!entered.length)return toast('Укажите цену хотя бы для одной позиции',true);
+    const delivery=inboxQuotePrice($('#inboxQuoteDelivery').value||'0');
+    if(delivery===null)return toast('Доставка должна быть числом',true);
+    if(!$('#inboxQuoteVerified').checked)return toast('Сверьте поставщика, цены и НДС с оригиналом и отметьте это',true);
+    const button=$('#modalSubmit');button.disabled=true;
+    try{
+      const saved=await launchJson(`/api/procurement/inbox/attachments/${encodeURIComponent(aid)}/quote`,'POST',{
+        lot_id:Number($('#inboxQuoteLot').value),supplier_id:supplierId,vat_included:vat.value==='true',confirmed_source:true,
+        delivery_cost:delivery,lead_days:Number($('#inboxQuoteLead').value||0),payment_terms:$('#inboxQuotePayment').value.trim(),
+        price_date:$('#inboxQuotePriceDate').value||null,valid_until:$('#inboxQuoteValid').value||null,
+        items:entered.map(e=>({lot_item_id:Number(e.dataset.quoteItem),unit_price:inboxQuotePrice(e.value)}))});
+      $('#modal').close();
+      toast(`КП сохранено в закупке «${saved.lot_title}»: позиций ${saved.items}`);
+      loadIncomingPrices();
+    }catch(e){toast(e.message,true)}finally{button.disabled=false}
+  };
 }
 
 function catalogCommonFields(target){

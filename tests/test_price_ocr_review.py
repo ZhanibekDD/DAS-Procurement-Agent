@@ -6,6 +6,8 @@ import pytest
 from procurement.price_ocr import scanned_items, document_date, seller_fields, extract_price_document
 from procurement.imports import DocumentExtractResult
 from procurement.catalog import Catalog, ALIASES
+from procurement.models import SupplierCreate
+from procurement.service import ConflictError
 from procurement.incoming_mail import Inbox
 from test_incoming_mail import ingest, rows_of, admin
 from test_launch_workflow import workflow
@@ -120,7 +122,101 @@ def test_issuer_is_not_bank_buyer_or_sender_and_date_is_printed():
     assert document_date('31 февраля 2026') is None
     assert document_date('Исх. №85 от «24» февраля 2026г.\nСрок действия: до 15.03.2026')=='2026-02-24'
     assert document_date('Срок действия: до 15.03.2026') is None
+    assert document_date('Прайс-лист\nЦены указаны на 01.08.2026\nСрок действия не указан')=='2026-08-01'
 
+
+def test_large_historical_pdf_review_keeps_unknown_region_and_never_marks_current(workflow):
+    from procurement.procurement_routes import ReviewedPriceRows
+    db,service,launch=workflow
+    doc=service.register_source_document(filename='old-price.pdf',content=b'%PDF-test',document_type='price_list')
+    rows=[]
+    for n in range(501):
+        row={key:'' for key in ALIASES}
+        row.update(item_name=f'ФБС TEST-{n}',unit='шт',unit_price='100',currency='RUB',
+                   vat='с НДС',price_date='2026-08-01',supplier_name='АО Испытательный завод',
+                   email='prices@example.test')
+        rows.append(row)
+    rows[500]['unit_price']=''  # No implicit numeric value for an unpriced row.
+    ReviewedPriceRows(rows=rows,confirmed_rub=True)
+    preview=launch.save_preview('price_catalog_pdf',{'document_id':doc['id'],'rows':rows,
+        'errors':[],'document_currencies':['RUB']})
+    catalog=Catalog(service,launch)
+    checked=catalog.review_pdf(preview['preview_id'],rows,True)
+    assert len(checked['rows'])==500 and len(checked['errors'])==1
+    assert all(not row['region'] for row in checked['rows'])
+    report=catalog.apply_prices(checked['preview_id'],True)
+    assert report['added']==500 and len(report['errors'])==1
+    assert db.one('SELECT COUNT(*) AS n FROM supplier_catalog_prices')['n']==500
+    assert db.one('SELECT region FROM suppliers WHERE email=?',('prices@example.test',))['region']=='Не указан'
+    assert all(not row['current'] for row in catalog.prices('ФБС TEST-'))
+
+    # Later independently reviewed regional evidence must make this exact
+    # supplier routable without changing the earlier unknown-region prices.
+    next_doc=service.register_source_document(filename='regional-price.pdf',content=b'%PDF-regional',document_type='price_list')
+    regional=dict(rows[0],item_name='ФБС TEST-REGION',region='Воронежская область',source_row=1)
+    next_preview=launch.save_preview('price_catalog_pdf',{'document_id':next_doc['id'],'rows':[regional],
+        'errors':[],'document_currencies':['RUB']})
+    checked=catalog.review_pdf(next_preview['preview_id'],[regional],True)
+    assert catalog.apply_prices(checked['preview_id'],True)['added']==1
+    supplier=db.one('SELECT region,cluster FROM suppliers WHERE email=?',('prices@example.test',))
+    assert supplier['region']=='Воронежская область' and supplier['cluster']
+    assert all(not row['current'] for row in catalog.prices('ФБС TEST-0'))
+    assert any(row['current'] for row in catalog.prices('ФБС TEST-REGION'))
+    sid=db.one('SELECT id FROM suppliers WHERE email=?',('prices@example.test',))['id']
+    with db.connection() as conn:
+        conn.execute("UPDATE suppliers SET region='Не указан',cluster='' WHERE id=?",(sid,))
+    repeat=launch.save_preview('price_catalog_pdf',{'document_id':next_doc['id'],
+        'rows':[regional],'errors':[],'document_currencies':['RUB']})
+    checked=catalog.review_pdf(repeat['preview_id'],[regional],True)
+    assert catalog.apply_prices(checked['preview_id'],True)['skipped']==1
+    assert db.one('SELECT region FROM suppliers WHERE id=?',(sid,))['region']=='Воронежская область'
+    altered=dict(regional,email='different@example.test')
+    repeat=launch.save_preview('price_catalog_pdf',{'document_id':next_doc['id'],
+        'rows':[altered],'errors':[],'document_currencies':['RUB']})
+    checked=catalog.review_pdf(repeat['preview_id'],[altered],True)
+    with pytest.raises(ConflictError,match='Идентификатор ранее импортированного поставщика не совпадает'):
+        catalog.apply_prices(checked['preview_id'],True)
+    other=service.create_supplier(SupplierCreate(name='Другой подтверждённый поставщик',
+        email='other-owned@example.test',tax_id='7707083893',region='Москва'))
+    with db.connection() as conn:
+        conn.execute("UPDATE suppliers SET region='Не указан',cluster='' WHERE id=?",(sid,))
+    conflicting=dict(regional,tax_id=other['tax_id'])
+    repeat=launch.save_preview('price_catalog_pdf',{'document_id':next_doc['id'],
+        'rows':[conflicting],'errors':[],'document_currencies':['RUB']})
+    checked=catalog.review_pdf(repeat['preview_id'],[conflicting],True)
+    with pytest.raises(ConflictError,match='уже принадлежит другому поставщику'):
+        catalog.apply_prices(checked['preview_id'],True)
+    assert db.one('SELECT region FROM suppliers WHERE id=?',(sid,))['region']=='Не указан'
+
+
+def test_owned_price_source_promotes_only_placeholder_supplier_region(workflow):
+    db,service,launch=workflow
+    supplier=service.create_supplier(SupplierCreate(name='АО Испытательный завод',
+        email='prices-owned@example.test',region='Не указан'))
+    doc=service.register_source_document(filename='owned-regional.pdf',content=b'%PDF-owned',
+        document_type='price_list',supplier_id=supplier['id'])
+    row={key:'' for key in ALIASES}
+    row.update(item_name='ФБС OWNED-REGION',unit='шт',unit_price='100',currency='RUB',
+        vat='с НДС',price_date='2026-08-01',region='Воронежская область',
+        supplier_name='АО Испытательный завод',email='prices-owned@example.test')
+    catalog=Catalog(service,launch)
+    preview=launch.save_preview('price_catalog_pdf',{'document_id':doc['id'],'rows':[row],
+        'errors':[],'document_currencies':['RUB']})
+    checked=catalog.review_pdf(preview['preview_id'],[row],True)
+    assert catalog.apply_prices(checked['preview_id'],True)['added']==1
+    updated=db.one('SELECT region,cluster FROM suppliers WHERE id=?',(supplier['id'],))
+    assert updated['region']=='Воронежская область' and updated['cluster']
+    assert any(price['current'] for price in catalog.prices('ФБС OWNED-REGION'))
+    # A repeat of the same source must repair the legacy placeholder even when
+    # all price rows are already present and therefore skipped.
+    with db.connection() as conn:
+        conn.execute("UPDATE suppliers SET region='Не указан',cluster='' WHERE id=?",(supplier['id'],))
+    repeat=launch.save_preview('price_catalog_pdf',{'document_id':doc['id'],'rows':[row],
+        'errors':[],'document_currencies':['RUB']})
+    checked=catalog.review_pdf(repeat['preview_id'],[row],True)
+    assert catalog.apply_prices(checked['preview_id'],True)['skipped']==1
+    repaired=db.one('SELECT region,cluster FROM suppliers WHERE id=?',(supplier['id'],))
+    assert repaired['region']=='Воронежская область' and repaired['cluster']
 
 @pytest.mark.parametrize('label',['Дата окончания','Дата поставки','Дата действия','Дата окончания действия','Дата доставки','Дата отгрузки'])
 def test_non_issue_dates_are_not_price_dates(label):

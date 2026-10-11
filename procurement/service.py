@@ -82,7 +82,7 @@ class ProcurementService:
             "SELECT * FROM project_sections WHERE project_id = ? ORDER BY code", (project_id,)
         )
         row["lots"] = self.db.all(
-            "SELECT * FROM lots WHERE project_id = ? ORDER BY id DESC", (project_id,)
+            "SELECT * FROM lots WHERE project_id = ? AND archived_at = '' ORDER BY id DESC", (project_id,)
         )
         return row
 
@@ -108,8 +108,8 @@ class ProcurementService:
                     """
                     INSERT INTO suppliers(
                         name, tax_id, region, email, phone, telegram, max_contact, cluster,
-                        categories_json, rating, verified, source, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        both_clusters, categories_json, rating, verified, source, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         data.name,
@@ -120,6 +120,7 @@ class ProcurementService:
                         data.telegram,
                         data.max_contact,
                         cluster,
+                        int(data.both_clusters),
                         json.dumps(data.categories, ensure_ascii=False),
                         data.rating,
                         int(data.verified),
@@ -142,6 +143,7 @@ class ProcurementService:
         row["categories"] = json.loads(row.pop("categories_json"))
         row["verified"] = bool(row["verified"])
         row["active"] = bool(row["active"])
+        row["both_clusters"] = bool(row.get("both_clusters"))
         return row
 
     def list_suppliers(self, region: str = "", category: str = "") -> list[dict[str, Any]]:
@@ -155,6 +157,7 @@ class ProcurementService:
                 continue
             row["verified"] = bool(row["verified"])
             row["active"] = bool(row["active"])
+            row["both_clusters"] = bool(row.get("both_clusters"))
             result.append(row)
         return result
 
@@ -247,11 +250,14 @@ class ProcurementService:
         self._lot_mail_status([row])
         return row
 
-    def list_lots(self) -> list[dict[str, Any]]:
+    def list_lots(self, archived: str = "active") -> list[dict[str, Any]]:
+        """Active purchases by default; archived="only" lists the archive, "all" both."""
+        where = {"active": "WHERE lots.archived_at = ''", "only": "WHERE lots.archived_at != ''", "all": ""}[archived]
         rows = self.db.all(
-            """
+            f"""
             SELECT lots.*, projects.name AS project_name
             FROM lots JOIN projects ON projects.id = lots.project_id
+            {where}
             ORDER BY lots.id DESC
             """
         )
@@ -261,6 +267,34 @@ class ProcurementService:
             )
         self._lot_mail_status(rows)
         return rows
+
+    ARCHIVED_LOT = "Закупка в архиве. Верните её из архива, чтобы отправить запрос поставщикам."
+
+    def set_lot_archived(self, lot_id: int, archived: bool) -> dict[str, Any]:
+        """Hide or restore a purchase. Nothing is deleted; sending from an archived purchase is refused."""
+        with self.db.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            lot = conn.execute("SELECT id, archived_at FROM lots WHERE id = ?", (lot_id,)).fetchone()
+            if not lot:
+                raise NotFoundError("lot not found")
+            if archived and not lot["archived_at"]:
+                sending = conn.execute(
+                    """SELECT count(*) FROM outbox_messages m JOIN campaigns c ON c.id = m.campaign_id
+                       WHERE c.lot_id = ? AND m.status IN ('queued', 'sending')""",
+                    (lot_id,),
+                ).fetchone()[0]
+                if sending:
+                    raise ConflictError(
+                        "Запросы этой закупки ещё отправляются. Дождитесь окончания отправки, "
+                        "затем уберите закупку в архив."
+                    )
+                conn.execute("UPDATE lots SET archived_at = ?, archived_by = ? WHERE id = ?",
+                             (utcnow(), trusted_actor(), lot_id))
+                self.db.audit("archived", "lot", lot_id, conn=conn)
+            elif not archived and lot["archived_at"]:
+                conn.execute("UPDATE lots SET archived_at = '', archived_by = '' WHERE id = ?", (lot_id,))
+                self.db.audit("restored", "lot", lot_id, conn=conn)
+        return self.get_lot(lot_id)
 
     def _lot_mail_status(self, lots):
         from .mail_evidence import lot_mail_projection
@@ -295,8 +329,13 @@ class ProcurementService:
         return self._confirmed_cluster(lot["cluster"], project["cluster"])
 
     @staticmethod
-    def _supplier_cluster(supplier: dict, cluster: str) -> None:
-        if supplier["cluster"] != cluster:
+    def serves_cluster(supplier_cluster: str, both_clusters, cluster: str) -> bool:
+        """Own cluster, or either confirmed cluster for a supplier that works in both."""
+        return supplier_cluster == cluster or (bool(both_clusters) and cluster in {"cluster_1", "cluster_2"})
+
+    @classmethod
+    def _supplier_cluster(cls, supplier: dict, cluster: str) -> None:
+        if not cls.serves_cluster(supplier["cluster"], supplier.get("both_clusters"), cluster):
             raise ValueError("supplier cluster must match lot cluster")
         if not supplier.get("active", True):
             raise ValueError("inactive supplier cannot participate in procurement")
@@ -316,7 +355,7 @@ class ProcurementService:
             WHERE review_status='approved' AND supplier_id IS NOT NULL''')
         candidates = []
         for supplier in self.list_suppliers():
-            if supplier["cluster"] != cluster:
+            if not self.serves_cluster(supplier["cluster"], supplier["both_clusters"], cluster):
                 continue
             region_match = lot["region"].casefold() in supplier["region"].casefold() or supplier[
                 "region"
@@ -384,6 +423,8 @@ class ProcurementService:
         if data.snapshot_sha256 and payload_sha256(snapshot) != data.snapshot_sha256:
             raise ConflictError('Выбранный лот изменился; обновите предпросмотр')
         lot = self.get_lot(lot_id)
+        if lot.get("archived_at"):
+            raise ConflictError(self.ARCHIVED_LOT)
         lot['items'] = snapshot['items']
         project = self.get_project(lot["project_id"])
         cluster = self._confirmed_cluster(lot["cluster"], project["cluster"])
@@ -462,10 +503,12 @@ class ProcurementService:
             conn.execute("BEGIN IMMEDIATE")
             if payload_sha256(lot_snapshot(conn,lot_id,[i['id'] for i in snapshot['items']])) != payload_sha256(snapshot):
                 raise ConflictError('Лот изменился во время формирования запроса')
-            current = conn.execute("""SELECT l.cluster AS lot_cluster,p.cluster AS project_cluster
+            current = conn.execute("""SELECT l.cluster AS lot_cluster,p.cluster AS project_cluster,l.archived_at
                 FROM lots l JOIN projects p ON p.id=l.project_id WHERE l.id=?""", (lot_id,)).fetchone()
             if not current or self._confirmed_cluster(current["lot_cluster"], current["project_cluster"]) != cluster:
                 raise ConflictError("campaign cluster context changed; retry after review")
+            if current["archived_at"]:
+                raise ConflictError(self.ARCHIVED_LOT)
             current_attachments = [dict(r) for r in conn.execute('''SELECT d.id AS document_id,d.filename,d.sha256,d.size_bytes
                 FROM lot_attachments a JOIN source_documents d ON d.id=a.document_id WHERE a.lot_id=? ORDER BY d.id''',(lot_id,))]
             if sorted(lot.get('attachments',[]),key=lambda a:a['document_id']) != current_attachments:
@@ -594,6 +637,10 @@ class ProcurementService:
             self.get_lot(lot_id)
             clauses.append("campaigns.lot_id = ?")
             params.append(lot_id)
+        else:
+            # An archived purchase's unsent drafts cannot be approved or sent any more: keep them out of the
+            # work queue; the purchase's own view (lot_id) still shows its whole history.
+            clauses.append("NOT (lots.archived_at != '' AND outbox_messages.status IN ('draft', 'approved'))")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self.db.all(
             f"""
@@ -621,7 +668,8 @@ class ProcurementService:
     def _outbox_record(self, conn, message_id: int) -> dict:
         row = conn.execute("""
             SELECT m.*, c.lot_id, l.cluster AS lot_cluster, p.cluster AS project_cluster,
-                   s.cluster AS supplier_cluster, s.active AS supplier_active
+                   s.cluster AS supplier_cluster, s.both_clusters AS supplier_both_clusters,
+                   s.active AS supplier_active
             FROM outbox_messages m JOIN campaigns c ON c.id=m.campaign_id
             JOIN lots l ON l.id=c.lot_id JOIN projects p ON p.id=l.project_id
             JOIN suppliers s ON s.id=m.supplier_id WHERE m.id=?
@@ -635,7 +683,8 @@ class ProcurementService:
     def _outbox_context(self, conn, message_id: int) -> dict:
         message = self._outbox_record(conn, message_id)
         cluster = self._confirmed_cluster(message["lot_cluster"], message["project_cluster"])
-        self._supplier_cluster({"cluster": message["supplier_cluster"], "active": message["supplier_active"]}, cluster)
+        self._supplier_cluster({"cluster": message["supplier_cluster"], "both_clusters": message["supplier_both_clusters"],
+                                "active": message["supplier_active"]}, cluster)
         return message
 
     def approve_message(self, message_id: int, approved_by: str, comment: str = "", *, admin_policy_approval: bool = False) -> dict[str, Any]:
@@ -645,6 +694,9 @@ class ProcurementService:
         with self.db.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             message = self._outbox_context(conn, message_id)
+            archived = conn.execute("SELECT archived_at FROM lots WHERE id=?", (message["lot_id"],)).fetchone()
+            if archived and archived["archived_at"]:
+                raise ConflictError(self.ARCHIVED_LOT)
             fingerprint = message_fingerprint(message)
             existing = conn.execute("SELECT * FROM outbox_approvals WHERE message_id=?", (message_id,)).fetchone()
             if existing:
@@ -673,6 +725,9 @@ class ProcurementService:
         with self.db.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             message = self._outbox_context(conn, message_id)
+            archived = conn.execute("SELECT archived_at FROM lots WHERE id=?", (message["lot_id"],)).fetchone()
+            if archived and archived["archived_at"]:
+                raise ConflictError(self.ARCHIVED_LOT)
             fingerprint = message_fingerprint(message)
             approval = conn.execute("SELECT * FROM outbox_approvals WHERE message_id=?", (message_id,)).fetchone()
             if (not approval or message["status"] != "approved" or approval["payload_sha256"] != fingerprint
@@ -710,7 +765,7 @@ class ProcurementService:
                 raise ConflictError("quote cluster context changed; retry after review")
             if current["currency"] != data.currency:
                 raise ValueError("quote currency must match lot currency")
-            current_supplier = conn.execute("SELECT cluster,active FROM suppliers WHERE id=?", (data.supplier_id,)).fetchone()
+            current_supplier = conn.execute("SELECT cluster,both_clusters,active FROM suppliers WHERE id=?", (data.supplier_id,)).fetchone()
             if not current_supplier:
                 raise NotFoundError("supplier not found")
             self._supplier_cluster(dict(current_supplier), cluster)
@@ -871,7 +926,7 @@ class ProcurementService:
         row = self.db.one(
             """
             SELECT purchase_history.*, suppliers.name AS supplier_name,
-                   suppliers.cluster AS supplier_cluster
+                   suppliers.cluster AS supplier_cluster, suppliers.both_clusters AS supplier_both_clusters
             FROM purchase_history
             LEFT JOIN suppliers ON suppliers.id = purchase_history.supplier_id
             WHERE purchase_history.id = ?
@@ -904,7 +959,7 @@ class ProcurementService:
         rows = self.db.all(
             f"""
             SELECT purchase_history.*, suppliers.name AS supplier_name,
-                   suppliers.cluster AS supplier_cluster
+                   suppliers.cluster AS supplier_cluster, suppliers.both_clusters AS supplier_both_clusters
             FROM purchase_history
             LEFT JOIN suppliers ON suppliers.id = purchase_history.supplier_id
             WHERE {' AND '.join(clauses)}
@@ -931,7 +986,7 @@ class ProcurementService:
                 # missing regions or cluster drift require explicit human review.
                 if (not region or normalize_region(record["region"]) != region
                         or infer_cluster(record["region"]) != cluster
-                        or record["supplier_cluster"] != cluster):
+                        or not self.serves_cluster(record["supplier_cluster"], record["supplier_both_clusters"], cluster)):
                     continue
                 if record["currency"] != lot["currency"]:
                     continue
@@ -1023,7 +1078,7 @@ class ProcurementService:
         quotes = self.db.all(
             """
             SELECT quotes.*, suppliers.name AS supplier_name, suppliers.rating AS supplier_rating,
-                   suppliers.cluster AS supplier_cluster
+                   suppliers.cluster AS supplier_cluster, suppliers.both_clusters AS supplier_both_clusters
             FROM quotes JOIN suppliers ON suppliers.id = quotes.supplier_id
             WHERE quotes.lot_id = ? ORDER BY quotes.id
             """,
@@ -1031,7 +1086,7 @@ class ProcurementService:
         )
         rows = []
         for quote in quotes:
-            if quote["supplier_cluster"] != cluster:
+            if not self.serves_cluster(quote["supplier_cluster"], quote["supplier_both_clusters"], cluster):
                 raise ValueError("stored quote supplier cluster must match lot cluster before comparison")
             if quote["currency"] != lot["currency"]:
                 raise ValueError("stored quote currency differs from lot; review is required before ranking")
@@ -1608,14 +1663,17 @@ class ProcurementService:
             "active_lots": int(
                 (
                     self.db.one(
-                        "SELECT COUNT(*) AS n FROM lots WHERE status NOT IN ('awarded', 'cancelled')"
+                        "SELECT COUNT(*) AS n FROM lots WHERE status NOT IN ('awarded', 'cancelled') AND archived_at = ''"
                     )
                     or {"n": 0}
                 )["n"]
             ),
             "draft_messages": int(
                 (
-                    self.db.one("SELECT COUNT(*) AS n FROM outbox_messages WHERE status='draft'")
+                    self.db.one(
+                        "SELECT COUNT(*) AS n FROM outbox_messages m JOIN campaigns c ON c.id = m.campaign_id "
+                        "JOIN lots l ON l.id = c.lot_id WHERE m.status='draft' AND l.archived_at = ''"
+                    )
                     or {"n": 0}
                 )["n"]
             ),
@@ -1968,8 +2026,10 @@ class ProcurementService:
             matched = self._match_existing_supplier(
                 {'name': name, 'tax_id': draft['tax_id'], 'email': email},
                 [dict(row) for row in conn.execute(
-                    'SELECT id,name,tax_id,region,cluster,email FROM suppliers WHERE active=1').fetchall()])
-            if matched and matched['cluster'] and matched['cluster'] != cluster:
+                    'SELECT id,name,tax_id,region,cluster,both_clusters,email FROM suppliers WHERE active=1').fetchall()])
+            # A supplier that works in both clusters is reused for a draft of either cluster.
+            if matched and matched['cluster'] and not self.serves_cluster(
+                    matched['cluster'], matched.get('both_clusters'), cluster):
                 raise ConflictError('existing supplier belongs to another cluster')
             if matched:
                 supplier_id = int(matched['id'])

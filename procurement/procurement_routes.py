@@ -41,7 +41,7 @@ class Budget(StrictModel):
 
 
 class ReviewedPriceRows(StrictModel):
-    rows:list[dict[str,str]]=Field(min_length=1,max_length=500)
+    rows:list[dict[str,str]]=Field(min_length=1,max_length=2000)
     confirmed_rub:bool=Field(default=False,strict=True)
 
 class ReadAlerts(StrictModel):
@@ -319,8 +319,12 @@ def install(app,settings,service,launch,require_access,write_access,session_clai
 
     @app.post('/api/procurement/catalog/{pid}/review-pdf',dependencies=[Depends(write_access)])
     def review_pdf(pid:str,data:ReviewedPriceRows):
-        if any(set(r)-set(ALIASES) or any(len(v)>8000 for v in r.values()) for r in data.rows):
-            raise HTTPException(422,'Некорректные поля прайса')
+        # An older cached page posts fields this server no longer knows; say so instead of a vague rejection.
+        if any(set(r)-set(ALIASES) for r in data.rows):
+            raise HTTPException(422,'Страница устарела и отправила неизвестные поля прайса. Обновите страницу и проверьте строки заново')
+        long_row=next((n for n,r in enumerate(data.rows,1) if any(len(v)>8000 for v in r.values())),None)
+        if long_row:
+            raise HTTPException(422,f'Строка {long_row}: значение длиннее 8000 символов. Сократите его и проверьте строки заново')
         return call(catalog.review_pdf,pid,data.rows,data.confirmed_rub)
 
     @app.post('/api/procurement/catalog/incoming-mail',dependencies=[Depends(write_access)])
