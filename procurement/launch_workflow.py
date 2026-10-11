@@ -91,7 +91,9 @@ class LaunchWorkflow:
             # Cluster changes remain explicit and subject to the used-supplier guard.
             values = supplier_values(SupplierCreate(**{**prepared, 'cluster': ''} if keep_cluster else prepared))
             if keep_cluster: values['cluster'] = before['cluster']
-            if before['cluster'] != values['cluster'] and self._supplier_used(conn,supplier_id):
+            # One-time assignment of a missing cluster is the advertised repair for used suppliers;
+            # moving an assigned cluster would re-file their history and stays refused.
+            if before['cluster'] and before['cluster'] != values['cluster'] and self._supplier_used(conn,supplier_id):
                 raise ConflictError('Поставщик уже используется; смена кластера запрещена')
             # Adding the second cluster is always safe; removing it could orphan his quotes there.
             if before['both_clusters'] and not values['both_clusters'] and self._supplier_used(conn,supplier_id):
@@ -211,7 +213,7 @@ class LaunchWorkflow:
                     if not current or dict(current) != before:
                         raise ConflictError('Поставщик изменился после предпросмотра')
                     sid = before['id']
-                    if before['cluster'] != values['cluster'] and self._supplier_used(conn,sid):
+                    if before['cluster'] and before['cluster'] != values['cluster'] and self._supplier_used(conn,sid):
                         raise ConflictError('Поставщик уже используется; смена кластера импортом запрещена')
                     self._update(conn, sid, values)
                 else:

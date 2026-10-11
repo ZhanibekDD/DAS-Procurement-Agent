@@ -637,6 +637,10 @@ class ProcurementService:
             self.get_lot(lot_id)
             clauses.append("campaigns.lot_id = ?")
             params.append(lot_id)
+        else:
+            # An archived purchase's unsent drafts cannot be approved or sent any more: keep them out of the
+            # work queue; the purchase's own view (lot_id) still shows its whole history.
+            clauses.append("NOT (lots.archived_at != '' AND outbox_messages.status IN ('draft', 'approved'))")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self.db.all(
             f"""
@@ -1666,7 +1670,10 @@ class ProcurementService:
             ),
             "draft_messages": int(
                 (
-                    self.db.one("SELECT COUNT(*) AS n FROM outbox_messages WHERE status='draft'")
+                    self.db.one(
+                        "SELECT COUNT(*) AS n FROM outbox_messages m JOIN campaigns c ON c.id = m.campaign_id "
+                        "JOIN lots l ON l.id = c.lot_id WHERE m.status='draft' AND l.archived_at = ''"
+                    )
                     or {"n": 0}
                 )["n"]
             ),

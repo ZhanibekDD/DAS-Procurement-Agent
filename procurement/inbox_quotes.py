@@ -189,11 +189,23 @@ def save_quote(service, inbox, aid: str, data: InboxQuote) -> dict:
     stale = (datetime.now(UTC).replace(microsecond=0) - STALE_CLAIM).isoformat()
     with service.db.connection() as conn:
         conn.execute('BEGIN IMMEDIATE')
-        conn.execute('DELETE FROM inbox_quotes WHERE attachment_id=? AND quote_id IS NULL AND created_at<?', (aid, stale))
-        if conn.execute('SELECT 1 FROM inbox_quotes WHERE attachment_id=?', (aid,)).fetchone():
-            raise ConflictError('КП из этого вложения уже сохранено или сохраняется')
-        conn.execute('INSERT INTO inbox_quotes VALUES (?,?,?,?,NULL,?,?)',
-                     (aid, attachment['message_id'], lot['id'], data.supplier_id, trusted_actor(), now))
+        stale_claim = conn.execute('SELECT lot_id FROM inbox_quotes WHERE attachment_id=? AND quote_id IS NULL AND created_at<?',
+                                   (aid, stale)).fetchone()
+        if stale_claim:
+            # The request may have stopped after add_quote() committed but before the claim was finalized:
+            # a quote of that purchase from this very file is recovered, never created a second time.
+            committed = conn.execute('''SELECT q.id FROM quotes q JOIN source_documents d ON d.id = q.source_document_id
+                WHERE d.sha256=? AND q.lot_id=? ORDER BY q.id LIMIT 1''', (attachment['sha256'], stale_claim[0])).fetchone()
+            if committed:
+                conn.execute('UPDATE inbox_quotes SET quote_id=? WHERE attachment_id=?', (committed[0], aid))
+            else:
+                conn.execute('DELETE FROM inbox_quotes WHERE attachment_id=? AND quote_id IS NULL', (aid,))
+        taken = bool(conn.execute('SELECT 1 FROM inbox_quotes WHERE attachment_id=?', (aid,)).fetchone())
+        if not taken:
+            conn.execute('INSERT INTO inbox_quotes VALUES (?,?,?,?,NULL,?,?)',
+                         (aid, attachment['message_id'], lot['id'], data.supplier_id, trusted_actor(), now))
+    if taken:  # raised after the commit, so a recovered quote id is kept
+        raise ConflictError('КП из этого вложения уже сохранено или сохраняется')
     try:
         existing = service.db.one('SELECT * FROM source_documents WHERE sha256=?', (attachment['sha256'],))
         if existing:
