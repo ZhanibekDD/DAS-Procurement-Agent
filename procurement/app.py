@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from contextlib import AsyncExitStack
 from ipaddress import ip_address, ip_network
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import (
     Cookie,
@@ -717,8 +717,24 @@ def create_lot(data: LotCreate):
 
 
 @app.get("/api/lots", dependencies=[Depends(require_access)])
-def list_lots():
-    return service.list_lots()
+def list_lots(archived: Literal["active", "only", "all"] = Query(default="active")):
+    return service.list_lots(archived)
+
+
+@app.post("/api/lots/{lot_id}/archive", dependencies=[Depends(require_access)])
+def archive_lot(lot_id: int):
+    try:
+        return service.set_lot_archived(lot_id, True)
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
+
+
+@app.post("/api/lots/{lot_id}/restore", dependencies=[Depends(require_access)])
+def restore_lot(lot_id: int):
+    try:
+        return service.set_lot_archived(lot_id, False)
+    except Exception as exc:
+        raise handle_domain_error(exc) from exc
 
 
 @app.get("/api/lots/{lot_id}", dependencies=[Depends(require_access)])

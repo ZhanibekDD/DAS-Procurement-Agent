@@ -99,8 +99,12 @@ class Catalog:
         for source in table['rows']:
             try:
                 values=mapped(source,chosen,table['headers'],set(ALIASES))
-                if not values.get('item_name') or not values.get('unit_price'):
-                    raise ValueError('Не найдены наименование / цена; проверьте сопоставление')
+                if not values.get('item_name'):
+                    raise ValueError('Не найдено наименование; проверьте сопоставление колонок')
+                if 'unit_price' not in chosen:
+                    raise ValueError('Колонка цены не выбрана: укажите её в сопоставлении колонок')
+                if not values.get('unit_price'):
+                    raise ValueError('Цена не указана числом (например, «Договорная»); строка не импортируется')
                 values['unit_price']=number(values['unit_price'])
                 for k in ALIASES:
                     values.setdefault(k,'')
@@ -116,8 +120,10 @@ class Catalog:
                 for field in ('price_date','valid_until'):
                     if values[field]:
                         date.fromisoformat(values[field])
-                if not values['price_date'] or (not values['region'] and not allow_unknown_region):
-                    raise ValueError('Нужны дата прайса и регион')
+                if not values['price_date']:
+                    raise ValueError('Нужна дата прайса: в документе она не найдена, укажите её по оригиналу')
+                if not values['region'] and not allow_unknown_region:
+                    raise ValueError('Нужен регион прайса')
                 # A PDF may state prices without an offer region. Preserve that
                 # absence; the row stays historical and cannot join a regional median.
                 SupplierCreate(name=values['supplier_name'],tax_id=values['tax_id'],email=values['email'],phone=values['phone'],region=values['region'] or 'Не указан',categories=[values['category']] if values['category'] else [])
@@ -369,6 +375,6 @@ class Catalog:
                 'source_sheet':row['sheet'],'source_row':row['row_number'],'source_status':row['status']})
         lots=[l for l in self.service.list_lots() if l['project_id']==project_id]
         return {'project':project,'workbook_rows':rows,'documents':self.db.all('SELECT id,filename,sha256 FROM source_documents WHERE project_id=?',(project_id,)),
-            'materials':self.db.all('''SELECT i.*,l.title AS lot_title FROM lot_items i JOIN lots l ON l.id=i.lot_id WHERE l.project_id=?''',(project_id,))+source_materials,
+            'materials':self.db.all('''SELECT i.*,l.title AS lot_title FROM lot_items i JOIN lots l ON l.id=i.lot_id WHERE l.project_id=? AND length(l.archived_at)=0''',(project_id,))+source_materials,
             'procurements':lots,'quotes':[q for l in lots for q in self.service.list_quotes(l['id'])],
             'budget':self.db.all('SELECT currency,amount FROM project_budgets WHERE project_id=?',(project_id,))}

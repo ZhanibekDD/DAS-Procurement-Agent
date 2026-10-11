@@ -28,6 +28,7 @@ from pathlib import Path
 from .catalog import ALIASES, Catalog
 from .db import utcnow
 from .identity import authenticated_actor, trusted_actor
+from .inbox_quotes import listing_extras, store_refs
 from .sent_mail import PreAuthTransportError, connect_imap
 from .service import ConflictError, NotFoundError
 from .table_ingest import mapped, read_table, safe_upload, suggested_mapping
@@ -292,6 +293,8 @@ class Inbox:
         headers = [clean_header(mail.get(key)) if mail is not None else '' for key in ('From', 'Subject', 'Message-ID', 'Date')]
         conn.execute('INSERT INTO inbox_messages VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
             (mid, account, validity, uid, digest, *headers, utcnow(), status, error, duplicate_of))
+        if mail is not None:
+            store_refs(conn, mid, mail)
 
     def listing(self, before=None):
         if before is not None and (type(before) is not int or before < 1):
@@ -303,6 +306,7 @@ class Inbox:
                 EXISTS(SELECT 1 FROM inbox_reviews r JOIN launch_previews p ON p.id=r.preview_id
                        WHERE r.attachment_id=a.id AND p.status='applied') AS applied
                 FROM inbox_attachments a WHERE a.message_id=? ORDER BY a.part''', (row['id'],))
+        listing_extras(self.db, rows[:50])
         state = self.db.all('SELECT checked_at,error,next_uid,last_uid FROM inbox_state')
         return {'messages': rows[:50], 'next_before': rows[49]['sequence'] if len(rows) > 50 else None, 'connections': state}
 

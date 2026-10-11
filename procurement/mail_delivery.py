@@ -155,6 +155,9 @@ def send(workflow, mid, confirmed):
     with db.connection() as conn:
         conn.execute('BEGIN IMMEDIATE')
         message = service._outbox_context(conn, mid)
+        archived = conn.execute('SELECT archived_at FROM lots WHERE id=?', (message['lot_id'],)).fetchone()
+        if archived and archived['archived_at']:
+            raise ConflictError(service.ARCHIVED_LOT)
         from .procurement_flow import validate_message, ProcurementFlow
         validate_message(conn, message)
         fingerprint = message_fingerprint(message)

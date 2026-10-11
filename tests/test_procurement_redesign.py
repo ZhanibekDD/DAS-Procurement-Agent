@@ -514,3 +514,12 @@ def test_docx_preview_escapes_markup_and_keeps_original():
     data=raw.getvalue();digest=hashlib.sha256(data).hexdigest()
     text=office_html(data,'doc.docx');assert '<script>' not in text and '&lt;script&gt;001230040500' in text
     assert hashlib.sha256(data).hexdigest()==digest
+
+
+def test_review_pdf_explains_stale_page_and_overlong_value(http_boundary):
+    client,a,settings,db=http_boundary;u=login(client,a);h=headers(u)
+    row={k:'' for k in ALIASES}
+    stale=client.post('/api/procurement/catalog/missing/review-pdf',headers=h,json={'rows':[{**row,'source_row':'1'}]})
+    assert stale.status_code==422 and 'Страница устарела' in stale.json()['detail']
+    long=client.post('/api/procurement/catalog/missing/review-pdf',headers=h,json={'rows':[row,{**row,'specification':'x'*8001}]})
+    assert long.status_code==422 and long.json()['detail'].startswith('Строка 2:')
