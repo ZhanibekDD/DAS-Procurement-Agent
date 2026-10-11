@@ -385,6 +385,8 @@ class Database:
             conn.executescript(MEMORY_SCHEMA)
             from .incoming_mail import SCHEMA as INBOX_SCHEMA
             conn.executescript(INBOX_SCHEMA)
+            from .inbox_quotes import SCHEMA as INBOX_QUOTES_SCHEMA
+            conn.executescript(INBOX_QUOTES_SCHEMA)
             self._migrate_columns(conn)
             for code, template in DEFAULT_TEMPLATES.items():
                 conn.execute(
@@ -415,6 +417,7 @@ class Database:
             "suppliers": (
                 ("max_contact", "TEXT NOT NULL DEFAULT ''"),
                 ("cluster", "TEXT NOT NULL DEFAULT ''"),
+                ("both_clusters", "INTEGER NOT NULL DEFAULT 0"),
             ),
             "lots": (
                 ("cluster", "TEXT NOT NULL DEFAULT ''"),

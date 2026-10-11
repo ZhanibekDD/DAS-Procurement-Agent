@@ -37,10 +37,12 @@ async function editLaunchSupplier(id){
     $('#sCategories').value=s.categories.join(', ');
     if($('#sCluster'))$('#sCluster').value=s.cluster||'';
     else $('#modalBody').insertAdjacentHTML('beforeend',`<label>Кластер поставок<select id="sCluster">${clusterOptions(s.cluster||'')}</select></label>`);
+    if(!$('#sBoth'))$('#sCluster').insertAdjacentHTML('afterend','<label class="check-inline"><input type="checkbox" id="sBoth"> Работает в обоих кластерах</label>');
+    $('#sBoth').checked=!!s.both_clusters;
     $('#modalSubmit').onclick=()=>modalAction(()=>launchJson(`/api/launch/suppliers/${id}`,'PUT',{
       revision:s.revision,name:$('#sName').value,tax_id:$('#sTax').value,region:$('#sRegion').value,
       email:$('#sEmail').value,phone:$('#sPhone').value,telegram:$('#sTelegram').value,max_contact:$('#sMax').value,
-      cluster:$('#sCluster').value,categories:$('#sCategories').value.split(',').map(x=>x.trim()).filter(Boolean),
+      cluster:$('#sCluster').value,both_clusters:$('#sBoth').checked,categories:$('#sCategories').value.split(',').map(x=>x.trim()).filter(Boolean),
       rating:Number($('#sRating').value),verified:$('#sVerified').value==='true'
     }),'Поставщик изменён');
   }catch(e){toast(e.message,true)}
