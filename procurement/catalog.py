@@ -101,6 +101,8 @@ class Catalog:
                 values=mapped(source,chosen,table['headers'],set(ALIASES))
                 if not values.get('item_name'):
                     raise ValueError('Не найдено наименование; проверьте сопоставление колонок')
+                if 'unit_price' not in chosen:
+                    raise ValueError('Колонка цены не выбрана: укажите её в сопоставлении колонок')
                 if not values.get('unit_price'):
                     raise ValueError('Цена не указана числом (например, «Договорная»); строка не импортируется')
                 values['unit_price']=number(values['unit_price'])

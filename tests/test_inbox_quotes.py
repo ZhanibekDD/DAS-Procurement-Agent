@@ -206,6 +206,22 @@ def test_guards_release_the_claim(workflow, tmp_path):
     assert not db.one('SELECT 1 FROM inbox_quotes WHERE attachment_id=?', (aid3,))
 
 
+def test_quote_committed_before_a_crash_is_recovered_not_duplicated(workflow, tmp_path):
+    db, service, _ = workflow
+    lot, supplier = purchase(service)
+    inbox, message = receive(workflow, tmp_path, reply())
+    aid = message['attachments'][0]['id']
+    with admin():
+        saved = save_quote(service, inbox, aid, form(lot, supplier, {0: '5120.50'}))
+    # Simulate a stop between add_quote() and the claim update: the claim lost its quote id long ago.
+    with db.connection() as conn:
+        conn.execute("UPDATE inbox_quotes SET quote_id=NULL, created_at='2000-01-01T00:00:00+00:00' WHERE attachment_id=?", (aid,))
+    with pytest.raises(ConflictError, match='уже сохранено'):
+        save_quote(service, inbox, aid, form(lot, supplier, {0: '5120.50'}))
+    assert len(db.all('SELECT * FROM quotes')) == 1
+    assert db.one('SELECT quote_id FROM inbox_quotes WHERE attachment_id=?', (aid,))['quote_id'] == saved['quote_id']
+
+
 def test_offer_in_another_currency_is_refused(workflow, tmp_path):
     db, service, _ = workflow
     lot, supplier = purchase(service)

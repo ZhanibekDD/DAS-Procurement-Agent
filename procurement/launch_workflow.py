@@ -59,6 +59,7 @@ def supplier_values(data):
     values['cluster'] = resolve_cluster(data.region, data.cluster)
     values['categories_json'] = encode(values.pop('categories'))
     values['verified'] = int(values['verified'])
+    values['both_clusters'] = int(values['both_clusters'])
     return values
 
 
@@ -90,8 +91,13 @@ class LaunchWorkflow:
             # Cluster changes remain explicit and subject to the used-supplier guard.
             values = supplier_values(SupplierCreate(**{**prepared, 'cluster': ''} if keep_cluster else prepared))
             if keep_cluster: values['cluster'] = before['cluster']
-            if before['cluster'] != values['cluster'] and self._supplier_used(conn,supplier_id):
+            # One-time assignment of a missing cluster is the advertised repair for used suppliers;
+            # moving an assigned cluster would re-file their history and stays refused.
+            if before['cluster'] and before['cluster'] != values['cluster'] and self._supplier_used(conn,supplier_id):
                 raise ConflictError('Поставщик уже используется; смена кластера запрещена')
+            # Adding the second cluster is always safe; removing it could orphan his quotes there.
+            if before['both_clusters'] and not values['both_clusters'] and self._supplier_used(conn,supplier_id):
+                raise ConflictError('Поставщик уже используется; убрать второй кластер нельзя')
             self._update(conn, supplier_id, values)
             after = dict(conn.execute('SELECT * FROM suppliers WHERE id=?', (supplier_id,)).fetchone())
             self.db.audit('supplier_edited', 'supplier', supplier_id,
@@ -175,6 +181,7 @@ class LaunchWorkflow:
                     supplied = {k:v for k,v in values.items() if k in mapping}
                     data = SupplierCreate(**contacts({**prior, **supplied}))
                     prepared = supplier_values(data)
+                    prepared['both_clusters'] = int(existing.get('both_clusters') or 0)  # not an import column
                 action = 'skipped' if existing and not existing['active'] else ('updated' if existing else 'added')
                 if existing and all(existing[k] == v for k, v in prepared.items()):
                     action = 'skipped'
@@ -206,7 +213,7 @@ class LaunchWorkflow:
                     if not current or dict(current) != before:
                         raise ConflictError('Поставщик изменился после предпросмотра')
                     sid = before['id']
-                    if before['cluster'] != values['cluster'] and self._supplier_used(conn,sid):
+                    if before['cluster'] and before['cluster'] != values['cluster'] and self._supplier_used(conn,sid):
                         raise ConflictError('Поставщик уже используется; смена кластера импортом запрещена')
                     self._update(conn, sid, values)
                 else:
