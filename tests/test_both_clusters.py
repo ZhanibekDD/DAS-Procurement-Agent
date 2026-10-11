@@ -113,3 +113,24 @@ def test_price_benchmark_uses_history_of_a_both_cluster_supplier(two_clusters):
             region="Воронеж", confirmed_by="Руководитель снабжения"))
     item = service.lot_price_benchmark(lots["cluster_2"]["id"])["items"][0]
     assert (item["history_count"], item["median_unit_price"]) == (1, 9.0)  # the Ural-only supplier stays out
+
+
+@pytest.mark.parametrize("both, reused", [(True, True), (False, False)])
+def test_import_draft_reuses_a_both_cluster_supplier(tmp_path, both, reused):
+    from procurement.models import SupplierDraftConfirm
+    from tests.test_launch_import_review import SYNTHETIC_PRICELIST
+    database = Database(str(tmp_path / "drafts.db"))
+    database.initialize()
+    service = ProcurementService(database)
+    batch = service.create_import_batch([("synthetic.xlsx", SYNTHETIC_PRICELIST)])
+    draft = batch["supplier_drafts"][0]
+    existing = service.create_supplier(SupplierCreate(name=draft["name"], region="Екатеринбург", cluster="cluster_1",
+                                                      both_clusters=both, email=draft["email"] or "x@example.invalid"))
+    confirm = SupplierDraftConfirm(confirmed_by="ТЕСТ reviewer", region="Воронеж", cluster="cluster_2")
+    if reused:
+        supplier = service.confirm_supplier_draft(draft["id"], confirm)
+        assert supplier["id"] == existing["id"] and supplier["cluster"] == "cluster_1" and supplier["both_clusters"] is True
+    else:
+        with pytest.raises(ConflictError, match="another cluster"):
+            service.confirm_supplier_draft(draft["id"], confirm)
+

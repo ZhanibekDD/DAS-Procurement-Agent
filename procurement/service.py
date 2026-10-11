@@ -2019,8 +2019,10 @@ class ProcurementService:
             matched = self._match_existing_supplier(
                 {'name': name, 'tax_id': draft['tax_id'], 'email': email},
                 [dict(row) for row in conn.execute(
-                    'SELECT id,name,tax_id,region,cluster,email FROM suppliers WHERE active=1').fetchall()])
-            if matched and matched['cluster'] and matched['cluster'] != cluster:
+                    'SELECT id,name,tax_id,region,cluster,both_clusters,email FROM suppliers WHERE active=1').fetchall()])
+            # A supplier that works in both clusters is reused for a draft of either cluster.
+            if matched and matched['cluster'] and not self.serves_cluster(
+                    matched['cluster'], matched.get('both_clusters'), cluster):
                 raise ConflictError('existing supplier belongs to another cluster')
             if matched:
                 supplier_id = int(matched['id'])
