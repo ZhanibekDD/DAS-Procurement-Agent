@@ -266,7 +266,9 @@ class ProcurementService:
     def suggest_categories(self, lot: dict[str, Any]) -> list[str]:
         """Supplier categories the purchase text points to, when they are one profile (ЖБИ and ФБС are);
         none when the text points to different profiles (ЖБИ and ЭХЗ) or to nothing."""
-        text = " ".join([lot["title"], *(item["name"] for item in lot.get("items", []))]).casefold().replace("ё", "е")
+        # «Блок фундаментный» with the specification «ФБС 24.4.6»: the designation counts too.
+        text = " ".join([lot["title"], *(f"{item['name']} {item.get('specification') or ''}" for item in lot.get("items", []))]
+                        ).casefold().replace("ё", "е")
         found = []
         for category in self.known_categories():
             key = category.casefold()

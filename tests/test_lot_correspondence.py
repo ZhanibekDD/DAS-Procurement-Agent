@@ -206,3 +206,16 @@ def test_umbrella_and_product_categories_are_one_profile(workflow):
     assert loaded['profile_categories'] == ['ЖБИ', 'ФБС'] and loaded['suggested_category'] == 'ЖБИ / ФБС'
     matches = {m['id'] for m in service.match_suppliers(lot['id'])}
     assert {umbrella['id'], product['id']} <= matches and cathodic['id'] not in matches
+
+
+def test_designation_in_the_specification_sets_the_profile(workflow):
+    db, service, launch = workflow
+    project = service.create_project(ProjectCreate(name='ТЕСТ спец', region='Воронежская область', cluster='cluster_2',
+                                                   delivery_address='Воронеж'))
+    lot = service.create_lot(LotCreate(project_id=project['id'], title='Блоки', region='Воронежская область',
+        cluster='cluster_2', delivery_address='Воронеж', response_deadline=date.today() + timedelta(days=7),
+        items=[LotItemCreate(name='Блок фундаментный', specification='ФБС 24.4.6', quantity=Decimal('5'), unit='шт')]))
+    supplier(service, 'Завод ЖБИ', ['ЖБИ'])
+    cathodic = supplier(service, 'СЭЗ', ['ЭХЗ'])
+    assert service.get_lot(lot['id'])['profile_categories'] == ['ЖБИ']
+    assert cathodic['id'] not in {m['id'] for m in service.match_suppliers(lot['id'])}

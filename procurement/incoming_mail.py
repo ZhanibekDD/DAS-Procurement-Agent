@@ -170,6 +170,7 @@ _QUOTE_LINE = re.compile(
     r'|(?:from|от|sent|отправлено)\s*:.{0,200}$|.{0,120}(?:wrote|пишет|написал\(а\)|написала|написал)\s*:\s*$)',
     re.IGNORECASE)
 _QUOTE_MARK = '\x00quote\x00'
+_FORWARD = re.compile(r'^\s*(?:fwd?|fw|пересл\w*)\s*:', re.IGNORECASE)
 
 
 class _HtmlText(HTMLParser):
@@ -221,7 +222,8 @@ def reply_excerpt(mail, limit=EXCERPT) -> str:
         if own:
             lines.append(line.rstrip())
     excerpt = re.sub(r'\n{3,}', '\n\n', '\n'.join(lines)).strip()
-    if not excerpt:  # a forward without a comment: show the start of the forwarded text instead
+    # A forward without a comment shows the forwarded text; a reply that is only our quoted request stays empty.
+    if not excerpt and _FORWARD.search(str(mail.get('Subject') or '')):
         excerpt = re.sub(r'\n{3,}', '\n\n', str(text).replace(_QUOTE_MARK, '')).strip()
     return excerpt[:limit]
 

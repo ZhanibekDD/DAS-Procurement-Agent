@@ -147,3 +147,14 @@ def test_reread_failure_changes_nothing(workflow, tmp_path, mailbox_env, monkeyp
     result = reread_pending(inbox, offline)
     assert result['status'] == 'error' and 'PASSWORD' not in json.dumps(result)
     assert not db.all('SELECT * FROM inbox_upgrades')
+
+
+def test_reply_that_is_only_our_quoted_request_has_no_text():
+    message = EmailMessage()
+    message['From'], message['Subject'] = 'a@b.test', 'Re: Запрос КП: ФБС'
+    message.set_content('> Просим направить КП\n> ФБС 24.4.6 — 218 шт')
+    assert reply_excerpt(message) == ''
+    html = EmailMessage()
+    html['From'], html['Subject'] = 'a@b.test', 'Re: Запрос КП: ФБС'
+    html.set_content('<blockquote>Просим направить КП</blockquote>', subtype='html')
+    assert reply_excerpt(html) == ''
