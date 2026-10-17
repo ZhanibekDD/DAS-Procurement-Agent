@@ -381,7 +381,7 @@ def test_auto_recipients_require_full_material_coverage_region_and_verified_emai
         email='other@example.test',categories=['ФБС'],verified=False))
     matched={row['id']:row for row in service.match_suppliers(lot['id'])}
     assert matched[good['id']]['auto_select'] is True
-    assert matched[wrong['id']]['auto_select'] is False
+    assert wrong['id'] not in matched  # another profile (ПБ) is not offered a ФБС purchase at all
     assert matched[unverified['id']]['auto_select'] is False
 
 

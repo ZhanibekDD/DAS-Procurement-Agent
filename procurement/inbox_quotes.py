@@ -23,7 +23,7 @@ from .db import utcnow
 from .identity import trusted_actor
 from .models import QuoteCreate, QuoteItemCreate, StrictModel
 from .price_memory import INVALID_DESIGNATION, designation_key, material_key, normalized, unit_key
-from .service import ConflictError
+from .service import ConflictError, NotFoundError
 from .upload_io import FilePayload
 
 SCHEMA = '''
@@ -34,6 +34,9 @@ CREATE TABLE IF NOT EXISTS inbox_quotes (
  attachment_id TEXT PRIMARY KEY REFERENCES inbox_attachments(id), message_id TEXT NOT NULL,
  lot_id INTEGER NOT NULL, supplier_id INTEGER NOT NULL, quote_id INTEGER REFERENCES quotes(id),
  actor TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS inbox_lot_links (
+ message_id TEXT PRIMARY KEY REFERENCES inbox_messages(id), lot_id INTEGER NOT NULL REFERENCES lots(id),
+ supplier_id INTEGER REFERENCES suppliers(id), kind TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL);
 '''
 
 _MESSAGE_ID = re.compile(r'<[^<>\s]{3,250}>')
@@ -100,10 +103,23 @@ def rfq_link(conn, mid: str) -> dict | None:
     return link
 
 
+def sender_supplier(conn, sender: str) -> dict | None:
+    """The one active supplier whose address sent the mail: a suggestion for the person, never a link."""
+    email = parseaddr(sender or '')[1].casefold()
+    if not email:
+        return None
+    rows = conn.execute('SELECT id, name FROM suppliers WHERE lower(email)=? AND active=1', (email,)).fetchall()
+    return dict(rows[0]) if len(rows) == 1 else None
+
+
 def listing_extras(db, messages: list[dict]) -> None:
     with db.connection() as conn:
         for message in messages:
             message['rfq'] = rfq_link(conn, message['id'])
+            message['sender_supplier'] = sender_supplier(conn, message.get('sender', ''))
+            link = conn.execute('''SELECT k.lot_id, k.kind, l.title AS lot_title FROM inbox_lot_links k
+                JOIN lots l ON l.id=k.lot_id WHERE k.message_id=?''', (message['id'],)).fetchone()
+            message['link'] = dict(link) if link else None
             saved = {row['attachment_id']: dict(row) for row in conn.execute(
                 '''SELECT q.attachment_id, q.quote_id, q.lot_id, l.title AS lot_title
                    FROM inbox_quotes q JOIN lots l ON l.id=q.lot_id
@@ -232,3 +248,101 @@ def save_quote(service, inbox, aid: str, data: InboxQuote) -> dict:
                          details={'quote_id': quote['id'], 'lot_id': lot['id'], 'supplier_id': data.supplier_id,
                                   'source_document_id': document['id'], 'items': len(data.items)}, conn=conn)
     return {'quote_id': quote['id'], 'lot_id': lot['id'], 'lot_title': lot['title'], 'items': len(data.items)}
+
+
+# Correspondence of a purchase: every supplier reply, also questions and refusals without prices.
+# A reply belongs to the purchase by our request's exact Message-ID, by a saved quote, or because a
+# person said so (mail sent by hand from the mailbox has no Message-ID we know).
+LINK_KINDS = ('quote', 'question', 'refusal', 'other')
+CORRESPONDENCE_DAYS = 90
+_REPLY_SUBJECT = re.compile(r'^\s*(?:re|fwd?|fw|отв|ответ|пересл)\s*:', re.IGNORECASE)
+_BOUNCE = re.compile(r'недоставленн|undeliver|delivery status notification|mail delivery|returned mail', re.IGNORECASE)
+
+
+class MessageLink(StrictModel):
+    lot_id: int = Field(gt=0)
+    supplier_id: int | None = Field(default=None, gt=0)
+    kind: Literal['quote', 'question', 'refusal', 'other']
+
+
+def link_message(service, mid: str, data: MessageLink) -> dict:
+    with service.db.connection() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        if not conn.execute('SELECT 1 FROM inbox_messages WHERE id=?', (mid,)).fetchone():
+            raise NotFoundError('Письмо не найдено')
+        lot = conn.execute('SELECT id, title, archived_at FROM lots WHERE id=?', (data.lot_id,)).fetchone()
+        if not lot:
+            raise NotFoundError('Закупка не найдена')
+        if lot['archived_at']:
+            raise ConflictError('Закупка в архиве. Верните её из архива, чтобы разбирать письма.')
+        if data.supplier_id and not conn.execute('SELECT 1 FROM suppliers WHERE id=?', (data.supplier_id,)).fetchone():
+            raise NotFoundError('Поставщик не найден')
+        rfq = rfq_link(conn, mid)
+        if rfq and rfq['lot_id'] != data.lot_id:
+            raise ConflictError(f'Письмо — ответ на запрос по закупке «{rfq["lot_title"]}»')
+        conn.execute('INSERT OR REPLACE INTO inbox_lot_links VALUES (?,?,?,?,?,?)',
+                     (mid, data.lot_id, data.supplier_id, data.kind, trusted_actor(), utcnow()))
+        service.db.audit('inbox_message_linked', 'inbox_message', mid,
+                         details={'lot_id': data.lot_id, 'supplier_id': data.supplier_id, 'kind': data.kind}, conn=conn)
+    return {'message_id': mid, 'lot_id': data.lot_id, 'kind': data.kind}
+
+
+def unlink_message(service, mid: str) -> dict:
+    with service.db.connection() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        link = conn.execute('SELECT lot_id, kind FROM inbox_lot_links WHERE message_id=?', (mid,)).fetchone()
+        if not link:
+            raise NotFoundError('Письмо не привязано к закупке')
+        conn.execute('DELETE FROM inbox_lot_links WHERE message_id=?', (mid,))
+        service.db.audit('inbox_message_unlinked', 'inbox_message', mid, details=dict(link), conn=conn)
+    return {'message_id': mid, 'unlinked': True}
+
+
+def lot_correspondence(service, lot_id: int) -> dict:
+    """Replies of this purchase and the recent replies not sorted into any purchase yet."""
+    lot = service.get_lot(lot_id)
+    since = (datetime.now(UTC) - timedelta(days=CORRESPONDENCE_DAYS)).isoformat()
+    linked, unsorted = [], []
+    with service.db.connection() as conn:
+        rows = conn.execute('''SELECT m.id, m.sender, m.subject, m.received_at, m.status, m.error,
+                COALESCE(t.excerpt, '') AS excerpt, k.lot_id AS link_lot, k.kind AS link_kind,
+                k.supplier_id AS link_supplier, s.name AS link_supplier_name
+            FROM inbox_messages m LEFT JOIN inbox_texts t ON t.message_id=m.id
+            LEFT JOIN inbox_lot_links k ON k.message_id=m.id LEFT JOIN suppliers s ON s.id=k.supplier_id
+            WHERE m.received_at>=? AND m.status!='duplicate' ORDER BY m.received_at DESC LIMIT 300''', (since,)).fetchall()
+        for row in rows:
+            row = dict(row)
+            quotes = [dict(q) for q in conn.execute('''SELECT q.attachment_id, q.lot_id, q.supplier_id, s.name AS supplier_name,
+                    l.title AS lot_title FROM inbox_quotes q JOIN lots l ON l.id=q.lot_id JOIN suppliers s ON s.id=q.supplier_id
+                WHERE q.message_id=? AND q.quote_id IS NOT NULL''', (row['id'],))]
+            rfq = rfq_link(conn, row['id'])
+            lots = {q['lot_id'] for q in quotes} | ({rfq['lot_id']} if rfq else set()) | (
+                {row['link_lot']} if row['link_lot'] else set())
+            attachments = [dict(a) for a in conn.execute(
+                'SELECT id, filename FROM inbox_attachments WHERE message_id=? ORDER BY part', (row['id'],))]
+            saved = {q['attachment_id']: q for q in quotes}
+            for attachment in attachments:
+                quote = saved.get(attachment['id'])
+                attachment['quote'] = {'lot_id': quote['lot_id'], 'lot_title': quote['lot_title']} if quote else None
+            if row['link_supplier']:
+                supplier = {'id': row['link_supplier'], 'name': row['link_supplier_name'], 'source': 'person'}
+            elif rfq:
+                supplier = {'id': rfq['supplier_id'], 'name': rfq['supplier_name'], 'source': 'request'}
+            elif quotes:
+                supplier = {'id': quotes[0]['supplier_id'], 'name': quotes[0]['supplier_name'], 'source': 'quote'}
+            else:
+                guess = sender_supplier(conn, row['sender'])
+                supplier = {**guess, 'source': 'sender'} if guess else None
+            own_quotes = [q for q in quotes if q['lot_id'] == lot_id]
+            item = {'id': row['id'], 'sender': row['sender'], 'subject': row['subject'], 'received_at': row['received_at'],
+                    'status': row['status'], 'error': row['error'], 'excerpt': row['excerpt'], 'attachments': attachments,
+                    'supplier': supplier, 'bounce': bool(_BOUNCE.search(row['subject'] or '')),
+                    'kind': row['link_kind'] if row['link_lot'] == lot_id else 'quote' if own_quotes else 'reply',
+                    'linked_by': 'person' if row['link_lot'] == lot_id else 'request' if rfq and rfq['lot_id'] == lot_id
+                                 else 'quote' if own_quotes else ''}
+            if lot_id in lots:
+                linked.append(item)
+            elif not lots and (supplier or attachments or item['bounce'] or _REPLY_SUBJECT.match(row['subject'] or '')):
+                unsorted.append(item)
+    return {'lot_id': lot['id'], 'lot_title': lot['title'], 'archived': bool(lot.get('archived_at')),
+            'linked': linked, 'unsorted': unsorted[:50]}

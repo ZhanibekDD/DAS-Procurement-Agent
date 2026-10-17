@@ -42,7 +42,8 @@ openLot=async function(id){invalidateProcurement();const epoch=purchasing.epoch;
 renderRfq=function(){
  const lot=purchasing.lot?.id===state.selectedLot?purchasing.lot:null;
  const options=state.lots.map(l=>`<option value="${Number(l.id)}" ${Number(l.id)===state.selectedLot?'selected':''}>#${l.id} · ${esc(l.title)}</option>`).join('');
- $('#rfq').innerHTML=`<section class="panel"><button class="btn secondary" onclick="showView('lots')">← Все закупки</button><h2>${lot?esc(lot.title):'Выберите закупку'}</h2><select id="procurementLot" aria-label="Закупка"><option value="">Выберите лот</option>${options}</select><p>${procurementStages.map(esc).join(' → ')}</p></section>${lot?`<div class="layout"><section class="panel"><h3>Позиции лота #${lot.id}</h3><p>Источник запроса — только выбранный immutable ID и его позиции.</p>${lot.items.map(i=>`<label style="display:block;padding:8px"><input type="checkbox" name="procurementItem" value="${i.id}" checked> ${esc(i.name)} — ${esc(i.quantity)} ${esc(i.unit)}<small> ${esc(i.specification)}</small></label>`).join('')}<h3>Поставщики</h3>${state.matches.map(s=>`<label style="display:block;padding:8px"><input type="checkbox" name="procurementSupplier" value="${s.id}" ${s.auto_select?'checked':''}> ${esc(s.name)} · ${esc(s.email||'почта не указана')} · надёжность ${Number(s.rating).toFixed(1)} / 5</label>`).join('')||'<p>Нет подходящих поставщиков этого кластера.</p>'}${procurementClusterHint(lot,state.matches.length>0)}<button class="btn secondary" id="procurementPreviewBtn" onclick="previewProcurement()">Обновить предпросмотр</button><div id="procurementPreview"></div></section><section class="panel"><h3>Запросы только этой закупки</h3>${filteredProcurementMessages(lot.id).map(m=>`<article class="message-card"><p>#${m.id} · ${esc(m.supplier_name)} · ${esc(m.status)}</p><details><summary>История запроса</summary>${messagePreview(m)}</details></article>`).join('')||'<p>Запросов ещё нет.</p>'}<button class="btn secondary" onclick="openProcurementComparison(${lot.id})">Цены и сравнение</button><button class="btn secondary" onclick="openModal('quote')">Добавить полученное КП</button></section></div>`:''}`;
+ $('#rfq').innerHTML=`<section class="panel"><button class="btn secondary" onclick="showView('lots')">← Все закупки</button><h2>${lot?esc(lot.title):'Выберите закупку'}</h2><select id="procurementLot" aria-label="Закупка"><option value="">Выберите лот</option>${options}</select><p>${procurementStages.map(esc).join(' → ')}</p></section>${lot?`<div class="layout"><section class="panel"><h3>Позиции лота #${lot.id}</h3><p>Источник запроса — только выбранный immutable ID и его позиции.</p>${lot.items.map(i=>`<label style="display:block;padding:8px"><input type="checkbox" name="procurementItem" value="${i.id}" checked> ${esc(i.name)} — ${esc(i.quantity)} ${esc(i.unit)}<small> ${esc(i.specification)}</small></label>`).join('')}<h3>Поставщики</h3>${procurementProfileControl(lot)}${state.matches.map(s=>`<label style="display:block;padding:8px"><input type="checkbox" name="procurementSupplier" value="${s.id}" ${s.auto_select?'checked':''}> ${esc(s.name)} · ${esc(s.email||'почта не указана')} · надёжность ${Number(s.rating).toFixed(1)} / 5${s.match_reasons&&s.match_reasons.uncategorized?' · <small class="muted">профиль не указан в карточке</small>':''}</label>`).join('')||'<p>Нет подходящих поставщиков этого кластера и профиля.</p>'}${procurementClusterHint(lot,state.matches.length>0)}<button class="btn secondary" id="procurementPreviewBtn" onclick="previewProcurement()">Обновить предпросмотр</button><div id="procurementPreview"></div></section><section class="panel"><h3>Запросы только этой закупки</h3>${filteredProcurementMessages(lot.id).map(m=>`<article class="message-card"><p>#${m.id} · ${esc(m.supplier_name)} · ${esc(m.status)}</p><details><summary>История запроса</summary>${messagePreview(m)}</details></article>`).join('')||'<p>Запросов ещё нет.</p>'}<button class="btn secondary" onclick="openProcurementComparison(${lot.id})">Цены и сравнение</button><button class="btn secondary" onclick="openModal('quote')">Добавить полученное КП</button><div id="lotCorrespondence" aria-live="polite"></div></section></div>`:''}`;
+ if(lot){loadLotCorrespondence(lot.id);const profile=$('#procurementProfile');if(profile)profile.onchange=async()=>{try{await launchJson(`/api/lots/${lot.id}/category`,'PUT',{category:profile.value});invalidateProcurement();await openLot(lot.id)}catch(e){toast(e.message,true)}}}
  $('#procurementLot').onchange=e=>{const id=Number(e.target.value);invalidateProcurement();state.selectedLot=id||null;purchasing.lot=null;if(id)openLot(id);else renderRfq()};
  document.querySelectorAll('[name="procurementItem"],[name="procurementSupplier"]').forEach(el=>el.onchange=()=>{
    invalidateProcurement();if(selectedRfqRequest().supplier_ids.length&&selectedRfqRequest().item_ids.length)previewProcurement();
@@ -179,7 +180,7 @@ async function loadIncomingPrices(before=null){
       const stale=!c.checked_at||Date.now()-Date.parse(c.checked_at)>180000;
       return `<p ${c.error||stale?'role="alert"':''}>${esc(c.error||(stale?'Автоматическая проверка почты задерживается.':'Почта проверяется автоматически.'))} Последняя проверка: ${esc(c.checked_at?new Date(c.checked_at).toLocaleString('ru-RU'):'ещё не выполнена')}${c.next_uid>c.last_uid+1?' · Обрабатываем предыдущие письма.':''}</p>`;
     }).join('')||'<p>Автоматический сбор ещё не запущен.</p>';
-    target.innerHTML=connections+(result.messages.length?result.messages.map(m=>`<article class="message-card"><h3>${esc(m.subject||'Без темы')}</h3><p>${esc(m.sender||'Отправитель не определён')} · ${esc(new Date(m.received_at).toLocaleString('ru-RU'))}</p>${inboxRfqLine(m)}${m.error?`<p role="alert">${esc(m.error)}</p>`:''}${m.status==='duplicate'?'<p>Повторное письмо. Повторный импорт не требуется.</p>':''}${m.attachments.length?m.attachments.map(a=>`<p>${esc(a.filename)} · ${a.applied?'Цены сохранены':a.quote?'КП сохранено в закупке «'+esc(a.quote.lot_title)+'»':'Требует проверки'} <button class="btn secondary" data-inbox-attachment="${esc(a.id)}">${a.applied?'Открыть исходник':'Проверить КП'}</button> ${inboxQuoteControl(m,a)}</p>`).join(''):'<p>Поддерживаемых прайсов для проверки нет.</p>'}</article>`).join(''):'<p>Входящих писем пока нет. Новые PDF, XLSX и CSV появятся здесь после проверки ящика.</p>')+(result.next_before?'<button class="btn secondary" id="olderIncomingPrices">Предыдущие письма</button>':'');
+    target.innerHTML=connections+(result.messages.length?result.messages.map(m=>`<article class="message-card"><h3>${esc(m.subject||'Без темы')}</h3><p>${esc(m.sender||'Отправитель не определён')} · ${esc(new Date(m.received_at).toLocaleString('ru-RU'))}</p>${inboxRfqLine(m)}${m.link?`<p>Отмечено: ${esc(CORRESPONDENCE_KIND[m.link.kind]||'Ответ')} · закупка «${esc(m.link.lot_title)}»</p>`:''}${m.excerpt?`<details><summary>Текст письма</summary><p style="white-space:pre-wrap">${esc(m.excerpt)}</p></details>`:''}${m.error?`<p role="alert">${esc(m.error)}</p>`:''}${m.status==='duplicate'?'<p>Повторное письмо. Повторный импорт не требуется.</p>':''}${m.attachments.length?m.attachments.map(a=>`<p>${esc(a.filename)} · ${a.applied?'Цены сохранены':a.quote?'КП сохранено в закупке «'+esc(a.quote.lot_title)+'»':'Требует проверки'} <button class="btn secondary" data-inbox-attachment="${esc(a.id)}">${a.applied?'Открыть исходник':'Проверить КП'}</button> ${inboxQuoteControl(m,a)}</p>`).join(''):'<p>Вложений с ценами нет. Если это вопрос или отказ, отметьте его на странице закупки в «Письмах без привязки».</p>'}</article>`).join(''):'<p>Входящих писем пока нет. Новые PDF, XLSX, DOCX и CSV появятся здесь после проверки ящика.</p>')+(result.next_before?'<button class="btn secondary" id="olderIncomingPrices">Предыдущие письма</button>':'');
     target.querySelectorAll('[data-inbox-attachment]').forEach(b=>b.onclick=()=>openInboxAttachment(b.dataset.inboxAttachment));
     target.querySelectorAll('[data-inbox-quote]').forEach(b=>b.onclick=()=>openInboxQuote(b.dataset.inboxQuote,b.dataset.inboxMessage));
     if(result.next_before)$('#olderIncomingPrices').onclick=()=>loadIncomingPrices(result.next_before);
@@ -230,18 +231,20 @@ function inboxQuotePrice(value){
   const text=String(value||'').replace(/[\s ]/g,'').replace(',','.');
   return /^\d+(\.\d+)?$/.test(text)?text:null;
 }
-async function openInboxQuote(aid,mid){
+async function openInboxQuote(aid,mid,presetLot=null,presetSupplier=null){
   const message=inboxMessages[mid]||{},rfq=message.rfq||null;
+  const lotChoice=rfq?Number(rfq.lot_id):presetLot?Number(presetLot):null;
+  const supplierChoice=rfq?Number(rfq.supplier_id):Number(presetSupplier||message.sender_supplier?.id||0)||null;
   const attachment=(message.attachments||[]).find(a=>a.id===aid)||{filename:''};
   if(rfq&&rfq.archived)return toast(`Закупка «${rfq.lot_title}» в архиве. Верните её из архива, чтобы добавить КП.`,true);
   const lots=(state.lots||[]).filter(l=>!l.archived_at);
   if(!lots.length)return toast('Нет активных закупок, к которым можно добавить КП',true);
   const original=`/api/procurement/inbox/attachments/${encodeURIComponent(aid)}/original`;
   launchModal('КП в закупку',`<p><a href="${original}" target="_blank" rel="noopener">Открыть оригинал: ${esc(attachment.filename)}</a></p>
-    <p>${rfq?`Письмо — ответ на запрос по закупке «${esc(rfq.lot_title)}», поставщик ${esc(rfq.supplier_name)}.`:'Письмо не связано с отправленным запросом. Выберите закупку и поставщика по документу.'}</p>
+    <p>${rfq?`Письмо — ответ на запрос по закупке «${esc(rfq.lot_title)}», поставщик ${esc(rfq.supplier_name)}.`:'Письмо не связано с отправленным из системы запросом. Проверьте закупку и поставщика по документу.'}</p>
     ${rfq&&!rfq.sender_matches?'<p role="alert">Адрес отправителя отличается от адреса запроса. Сверьте поставщика по документу.</p>':''}
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px">
-    <label style="display:flex;flex-direction:column;min-width:0">Закупка<select id="inboxQuoteLot"><option value="">Выберите закупку</option>${lots.map(l=>`<option value="${Number(l.id)}" ${rfq&&Number(rfq.lot_id)===Number(l.id)?'selected':''}>${esc(l.title)}${l.project_name?' · '+esc(l.project_name):''}</option>`).join('')}</select></label>
+    <label style="display:flex;flex-direction:column;min-width:0">Закупка<select id="inboxQuoteLot"><option value="">Выберите закупку</option>${lots.map(l=>`<option value="${Number(l.id)}" ${lotChoice===Number(l.id)?'selected':''}>${esc(l.title)}${l.project_name?' · '+esc(l.project_name):''}</option>`).join('')}</select></label>
     <label style="display:flex;flex-direction:column;min-width:0">Поставщик<select id="inboxQuoteSupplier"></select></label></div>
     <div id="inboxQuoteItems" aria-live="polite"></div>
     <fieldset><legend>НДС — по документу</legend><label><input type="radio" name="inboxQuoteVat" value="true"> Цены с НДС</label> <label><input type="radio" name="inboxQuoteVat" value="false"> Цены без НДС</label></fieldset>
@@ -255,8 +258,8 @@ async function openInboxQuote(aid,mid){
     <label><input id="inboxQuoteVerified" type="checkbox"> Поставщик, цены и НДС сверены с оригиналом КП</label>`,'Сохранить КП',()=>{});
   const suppliers=()=>{
     const lot=lots.find(l=>Number(l.id)===Number($('#inboxQuoteLot').value));
-    const list=(state.suppliers||[]).filter(s=>s.active!==false&&(!lot||!lot.cluster||s.cluster===lot.cluster||(s.both_clusters&&['cluster_1','cluster_2'].includes(lot.cluster))||(rfq&&Number(s.id)===Number(rfq.supplier_id))));
-    $('#inboxQuoteSupplier').innerHTML='<option value="">Выберите поставщика</option>'+list.map(s=>`<option value="${Number(s.id)}" ${rfq&&Number(rfq.supplier_id)===Number(s.id)?'selected':''}>${esc(s.name)}${s.tax_id?' · ИНН '+esc(s.tax_id):''}</option>`).join('');
+    const list=(state.suppliers||[]).filter(s=>s.active!==false&&(!lot||!lot.cluster||s.cluster===lot.cluster||(s.both_clusters&&['cluster_1','cluster_2'].includes(lot.cluster))||(supplierChoice&&Number(s.id)===supplierChoice)));
+    $('#inboxQuoteSupplier').innerHTML='<option value="">Выберите поставщика</option>'+list.map(s=>`<option value="${Number(s.id)}" ${supplierChoice===Number(s.id)?'selected':''}>${esc(s.name)}${s.tax_id?' · ИНН '+esc(s.tax_id):''}</option>`).join('');
   };
   let draft=null;
   const items=async()=>{
@@ -295,6 +298,7 @@ async function openInboxQuote(aid,mid){
         items:entered.map(e=>({lot_item_id:Number(e.dataset.quoteItem),unit_price:inboxQuotePrice(e.value)}))});
       $('#modal').close();
       toast(`КП сохранено в закупке «${saved.lot_title}»: позиций ${saved.items}`);
+      if($('#lotCorrespondence'))loadLotCorrespondence(Number(saved.lot_id));
       loadIncomingPrices();
     }catch(e){toast(e.message,true)}finally{button.disabled=false}
   };
@@ -327,4 +331,50 @@ function showInboxPriceRows(p){
     $('#pdfPriceAdd').onclick=()=>{catalogPdfRows.push({...Object.fromEntries(Object.keys(catalogFieldLabels).map(k=>[k,''])),currency:'RUB'});draw()};
   };
   draw();
+}
+
+
+// Supplier profile of the purchase: suppliers of another profile are not offered (no ЭХЗ for ФБС).
+function procurementProfileControl(lot){
+  const known=lot.known_categories||[],current=lot.category||'';
+  const note=current?'Поставщики другого профиля не показываются.':lot.suggested_category?'Определён по названию и позициям. Поставщики другого профиля не показываются.':'Не задан — показаны все поставщики кластера.';
+  return `<label style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:4px 8px">Профиль поставщиков <select id="procurementProfile"><option value="">${lot.suggested_category?'По названию: '+esc(lot.suggested_category):'Не задан'}</option>${known.map(c=>`<option value="${esc(c)}" ${c===current?'selected':''}>${esc(c)}</option>`).join('')}</select></label><p class="muted" style="padding:0 8px">${note}</p>`;
+}
+
+// Every supplier reply of the purchase, also questions and refusals without prices.
+const CORRESPONDENCE_KIND={quote:'КП',question:'Вопрос',refusal:'Отказ',other:'Ответ',reply:'Ответ — не разобран'};
+async function loadLotCorrespondence(lid){
+  const box=$('#lotCorrespondence');if(!box)return;
+  if(state.role!=='admin'){box.innerHTML='<h3>Ответы поставщиков</h3><p class="muted">Письма общего ящика видит администратор.</p>';return}
+  box.innerHTML='<h3>Ответы поставщиков</h3><p>Загрузка…</p>';
+  try{
+    const d=await api(`/api/procurement/lots/${lid}/correspondence`);
+    if(!box.isConnected||state.selectedLot!==lid)return;
+    [...d.linked,...d.unsorted].forEach(m=>{inboxMessages[m.id]={...m,rfq:null,sender_supplier:m.supplier&&m.supplier.source==='sender'?m.supplier:null}});
+    box.innerHTML=`<h3>Ответы поставщиков</h3>${d.linked.map(m=>correspondenceCard(m,true)).join('')||'<p>Ответов по этой закупке пока нет.</p>'}${d.unsorted.length?`<h3>Письма без привязки (${d.unsorted.length})</h3><p class="muted">Ответы на письма, отправленные не из системы, сами к закупке не привязываются. Отметьте, что это за письмо; КП из вложения добавьте кнопкой «КП в эту закупку».</p>${d.unsorted.map(m=>correspondenceCard(m,false)).join('')}`:''}`;
+    box.querySelectorAll('[data-corr-quote]').forEach(b=>b.onclick=()=>{const m=inboxMessages[b.dataset.corrMessage]||{};openInboxQuote(b.dataset.corrQuote,b.dataset.corrMessage,lid,m.supplier?.id||null)});
+    box.querySelectorAll('[data-corr-link]').forEach(b=>b.onclick=async()=>{const m=inboxMessages[b.dataset.corrLink]||{};b.disabled=true;
+      try{await launchJson(`/api/procurement/inbox/messages/${encodeURIComponent(b.dataset.corrLink)}/link`,'POST',{lot_id:lid,supplier_id:m.supplier?.id||null,kind:b.dataset.kind});toast('Письмо отмечено');loadLotCorrespondence(lid)}catch(e){toast(e.message,true);b.disabled=false}});
+    box.querySelectorAll('[data-corr-unlink]').forEach(b=>b.onclick=async()=>{b.disabled=true;
+      try{await launchJson(`/api/procurement/inbox/messages/${encodeURIComponent(b.dataset.corrUnlink)}/link`,'DELETE',{});loadLotCorrespondence(lid)}catch(e){toast(e.message,true);b.disabled=false}});
+  }catch(e){if(box.isConnected)box.innerHTML='<h3>Ответы поставщиков</h3><p role="alert">'+esc(e.message)+'</p>'}
+}
+function correspondenceCard(m,linked){
+  const who=m.supplier?esc(m.supplier.name)+(m.supplier.source==='sender'?' <small class="muted">(по адресу отправителя — проверьте)</small>':''):esc(m.sender||'Отправитель не указан');
+  const kind=m.bounce?'Письмо не доставлено':CORRESPONDENCE_KIND[m.kind]||'Ответ';
+  const badge=m.bounce||m.kind==='refusal'?'red':m.kind==='quote'?'green':m.kind==='question'?'amber':'blue';
+  const text=m.excerpt?`<details ${linked?'':'open'}><summary>${esc(m.excerpt.slice(0,140))}${m.excerpt.length>140?'…':''}</summary><p style="white-space:pre-wrap">${esc(m.excerpt)}</p></details>`:'<p class="muted">Текст письма ещё не прочитан из ящика — появится в течение нескольких минут.</p>';
+  const files=(m.attachments||[]).map(a=>`<p>${esc(a.filename)} · ${a.quote?'КП сохранено в закупке «'+esc(a.quote.lot_title)+'»':`<button class="btn small" data-corr-quote="${esc(a.id)}" data-corr-message="${esc(m.id)}">КП в эту закупку</button>`}</p>`).join('');
+  const actions=linked?(m.linked_by==='person'?`<button class="btn secondary small" data-corr-unlink="${esc(m.id)}">Отвязать</button>`:''):[['question','Вопрос'],['refusal','Отказ'],['other','Другое по этой закупке']].map(([k,label])=>`<button class="btn secondary small" data-corr-link="${esc(m.id)}" data-kind="${k}">${label}</button>`).join(' ');
+  return `<article class="message-card"><p><b>${who}</b> <span class="badge ${badge}">${esc(kind)}</span> <small class="muted">${esc(new Date(m.received_at).toLocaleString('ru-RU'))}</small></p><p class="muted">${esc(m.subject||'Без темы')}</p>${m.error?`<p role="note">${esc(m.error)}</p>`:''}${text}${files}${actions?`<p>${actions}</p>`:''}</article>`;
+}
+
+// No quotes yet: point to the replies waiting in the purchase instead of only «add by hand».
+if(typeof comparisonMarkup==='function'){
+  const comparisonMarkupBase=comparisonMarkup;
+  comparisonMarkup=function(){
+    const c=state.comparison;
+    if(c&&!c.quotes.length&&state.selectedLot&&state.role==='admin')return empty('Коммерческих предложений нет','КП из почты попадают сюда после проверки. Откройте ответы поставщиков этой закупки и нажмите «КП в эту закупку».',`<button class="btn" onclick="openLot(${Number(state.selectedLot)})">Ответы поставщиков</button> <button class="btn secondary" onclick="openModal('quote')">Добавить КП вручную</button>`);
+    return comparisonMarkupBase();
+  };
 }

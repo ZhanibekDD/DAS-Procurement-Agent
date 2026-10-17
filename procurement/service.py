@@ -239,12 +239,51 @@ class ProcurementService:
             )
         return self.get_lot(lot_id)
 
+    # Words that tie a purchase to a supplier profile. Used only to suggest the profile; the person can
+    # set another one on the purchase, and a profile no supplier has is never suggested.
+    CATEGORY_HINTS = {
+        "жби": (r"\bфбс\b", r"\bпб\b", r"\bжби\b", r"\bплит", r"\bкольц", r"\bлот[оа]?к", r"\bсва[яи]",
+                r"\bперемыч", r"\bжелезобетон"),
+        "эхз": (r"\bэхз\b", r"\bэлектрохим", r"\bанод", r"\bпротектор", r"\bкатодн", r"\bскз\b", r"\bкип\b"),
+    }
+
+    def known_categories(self) -> list[str]:
+        seen = {}
+        for row in self.db.all("SELECT categories_json FROM suppliers WHERE active = 1"):
+            for value in json.loads(row["categories_json"] or "[]"):
+                if isinstance(value, str) and value.strip():
+                    seen.setdefault(value.strip().casefold(), value.strip())
+        return sorted(seen.values(), key=str.casefold)
+
+    def suggest_category(self, lot: dict[str, Any]) -> str:
+        """The one supplier profile the purchase text points to, or '' when none or several do."""
+        text = " ".join([lot["title"], *(item["name"] for item in lot.get("items", []))]).casefold().replace("ё", "е")
+        found = []
+        for category in self.known_categories():
+            key = category.casefold()
+            patterns = self.CATEGORY_HINTS.get(key, ()) + (r"\b" + re.escape(key) + r"\b",)
+            if any(re.search(pattern, text) for pattern in patterns):
+                found.append(category)
+        return found[0] if len(found) == 1 else ""
+
+    def set_lot_category(self, lot_id: int, category: str) -> dict[str, Any]:
+        category = " ".join(str(category or "").split())[:100]
+        with self.db.connection() as conn:
+            if not conn.execute("SELECT 1 FROM lots WHERE id = ?", (lot_id,)).fetchone():
+                raise NotFoundError("lot not found")
+            conn.execute("UPDATE lots SET category = ? WHERE id = ?", (category, lot_id))
+            self.db.audit("lot_category_set", "lot", str(lot_id), details={"category": category}, conn=conn)
+        return self.get_lot(lot_id)
+
     def get_lot(self, lot_id: int) -> dict[str, Any]:
         row = self.db.one("SELECT * FROM lots WHERE id = ?", (lot_id,))
         if not row:
             raise NotFoundError("lot not found")
         row["rfq_requirements"] = json.loads(row.pop("rfq_requirements_json", "{}") or "{}")
         row["items"] = self.db.all("SELECT * FROM lot_items WHERE lot_id = ? ORDER BY id", (lot_id,))
+        row["suggested_category"] = "" if row.get("category") else self.suggest_category(row)
+        row["effective_category"] = row.get("category") or row["suggested_category"]
+        row["known_categories"] = self.known_categories()
         row['attachments'] = self.db.all('''SELECT d.id AS document_id,d.filename,d.sha256,d.size_bytes
             FROM lot_attachments a JOIN source_documents d ON d.id=a.document_id WHERE a.lot_id=?''', (lot_id,))
         self._lot_mail_status([row])
@@ -343,6 +382,7 @@ class ProcurementService:
     def match_suppliers(self, lot_id: int) -> list[dict[str, Any]]:
         lot = self.get_lot(lot_id)
         cluster = self._lot_cluster(lot)
+        profile = lot["effective_category"].casefold()
         search_text = " ".join([lot["title"], *(item["name"] for item in lot["items"])]).casefold()
         from .price_memory import material_key, designation_key
         from .catalog import normalize
@@ -357,6 +397,10 @@ class ProcurementService:
         for supplier in self.list_suppliers():
             if not self.serves_cluster(supplier["cluster"], supplier["both_clusters"], cluster):
                 continue
+            own = [c.casefold() for c in supplier["categories"] if isinstance(c, str) and c.strip()]
+            if profile and own and not any(profile in c or c in profile for c in own):
+                continue  # another profile: an ЭХЗ supplier is not offered a ФБС purchase
+            uncategorized = bool(profile) and not own
             region_match = lot["region"].casefold() in supplier["region"].casefold() or supplier[
                 "region"
             ].casefold() in lot["region"].casefold()
@@ -380,6 +424,10 @@ class ProcurementService:
             score = category_hits * 40 + int(region_match) * 25 + int(supplier["verified"]) * 20 + supplier[
                 "rating"
             ] * 3
+            if uncategorized:
+                score = score / 2  # profile unknown: listed after the suppliers of this profile, never preselected
+            elif profile:
+                score += 40
             if score > 0:
                 supplier["match_score"] = round(score, 2)
                 supplier["match_reasons"] = {
@@ -387,10 +435,12 @@ class ProcurementService:
                     "region": region_match,
                     "category_hits": category_hits,
                     "verified": supplier["verified"],
+                    "profile": lot["effective_category"],
+                    "uncategorized": uncategorized,
                 }
                 supplier['item_coverage']=item_coverage
                 supplier['auto_select']=bool(supplier['email'] and supplier['active'] and supplier['verified']
-                    and region_match and lot['items'] and item_coverage==len(lot['items']))
+                    and region_match and lot['items'] and item_coverage==len(lot['items']) and not uncategorized)
                 candidates.append(supplier)
         return sorted(candidates, key=lambda row: (-row["match_score"], row["name"]))
 

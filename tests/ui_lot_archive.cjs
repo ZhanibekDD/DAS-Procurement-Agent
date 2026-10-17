@@ -55,5 +55,5 @@ assert(hint(ehz,true).includes('Ещё подходят по категории'
 const sand={title:'Песок',cluster:'cluster_1',items:[{name:'Песок'}]};
 assert(hint(sand,false).includes('Добавьте поставщика с кластером «Кластер 1»'));
 assert.equal(hint(sand,true),'');
-assert(flow.includes("||'<p>Нет подходящих поставщиков этого кластера.</p>'}${procurementClusterHint(lot,state.matches.length>0)}"));
+assert(flow.includes("||'<p>Нет подходящих поставщиков этого кластера и профиля.</p>'}${procurementClusterHint(lot,state.matches.length>0)}"));
 console.log('ui_lot_archive ok');

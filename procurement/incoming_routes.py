@@ -7,7 +7,7 @@ from .identity import trusted_role
 from .models import StrictModel
 from .incoming_mail import Inbox, MAX_ROWS
 from . import inbox_quotes
-from .inbox_quotes import InboxQuote
+from .inbox_quotes import InboxQuote, MessageLink
 
 
 class Review(StrictModel):
@@ -45,6 +45,18 @@ def install(app, service, launch, require_access, write_access, call):
     @app.post('/api/procurement/inbox/attachments/{aid}/quote', dependencies=[Depends(administrator), Depends(write_access)])
     def save_quote(aid: str, data: InboxQuote):
         return call(inbox_quotes.save_quote, service, inbox, aid, data)
+
+    @app.get('/api/procurement/lots/{lot_id}/correspondence', dependencies=[Depends(administrator)])
+    def correspondence(lot_id: int):
+        return call(inbox_quotes.lot_correspondence, service, lot_id)
+
+    @app.post('/api/procurement/inbox/messages/{mid}/link', dependencies=[Depends(administrator), Depends(write_access)])
+    def link(mid: str, data: MessageLink):
+        return call(inbox_quotes.link_message, service, mid, data)
+
+    @app.delete('/api/procurement/inbox/messages/{mid}/link', dependencies=[Depends(administrator), Depends(write_access)])
+    def unlink(mid: str):
+        return call(inbox_quotes.unlink_message, service, mid)
 
     @app.api_route('/api/procurement/inbox/attachments/{aid}/original', methods=['GET','HEAD'], dependencies=[Depends(administrator)])
     def original(aid: str, request: Request):
