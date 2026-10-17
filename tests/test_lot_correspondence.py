@@ -219,3 +219,13 @@ def test_designation_in_the_specification_sets_the_profile(workflow):
     cathodic = supplier(service, 'СЭЗ', ['ЭХЗ'])
     assert service.get_lot(lot['id'])['profile_categories'] == ['ЖБИ']
     assert cathodic['id'] not in {m['id'] for m in service.match_suppliers(lot['id'])}
+
+
+def test_profile_chosen_by_hand_takes_the_whole_family(workflow):
+    db, service, launch = workflow
+    lot = lot_with(service, 'Материалы', ['Материал по проекту'])
+    product = supplier(service, 'Блоки ФБС', ['ФБС'])
+    cathodic = supplier(service, 'СЭЗ', ['ЭХЗ'])
+    service.set_lot_category(lot['id'], 'ЖБИ')
+    matches = {m['id'] for m in service.match_suppliers(lot['id'])}
+    assert product['id'] in matches and cathodic['id'] not in matches

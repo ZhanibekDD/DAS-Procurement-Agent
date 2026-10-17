@@ -399,6 +399,7 @@ class ProcurementService:
         lot = self.get_lot(lot_id)
         cluster = self._lot_cluster(lot)
         profiles = [p.casefold() for p in lot["profile_categories"]]
+        families = {self._family(p) for p in profiles}  # ЖБИ chosen by hand still takes ФБС suppliers
         search_text = " ".join([lot["title"], *(item["name"] for item in lot["items"])]).casefold()
         from .price_memory import material_key, designation_key
         from .catalog import normalize
@@ -414,7 +415,8 @@ class ProcurementService:
             if not self.serves_cluster(supplier["cluster"], supplier["both_clusters"], cluster):
                 continue
             own = [c.casefold() for c in supplier["categories"] if isinstance(c, str) and c.strip()]
-            if profiles and own and not any(p in c or c in p for p in profiles for c in own):
+            if profiles and own and not ({self._family(c) for c in own} & families
+                                         or any(p in c or c in p for p in profiles for c in own)):
                 continue  # another profile: an ЭХЗ supplier is not offered a ФБС purchase
             uncategorized = bool(profiles) and not own
             region_match = lot["region"].casefold() in supplier["region"].casefold() or supplier[
