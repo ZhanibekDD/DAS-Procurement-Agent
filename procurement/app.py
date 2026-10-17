@@ -745,18 +745,6 @@ def get_lot(lot_id: int):
         raise handle_domain_error(exc) from exc
 
 
-class LotCategory(StrictModel):
-    category: str = Field(default="", max_length=100)
-
-
-@app.put("/api/lots/{lot_id}/category", dependencies=[Depends(require_access)])
-def set_lot_category(lot_id: int, data: LotCategory):
-    try:
-        return service.set_lot_category(lot_id, data.category)
-    except Exception as exc:
-        raise handle_domain_error(exc) from exc
-
-
 @app.get("/api/lots/{lot_id}/supplier-matches", dependencies=[Depends(require_access)])
 def supplier_matches(lot_id: int):
     try:

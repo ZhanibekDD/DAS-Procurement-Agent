@@ -280,6 +280,10 @@ def link_message(service, mid: str, data: MessageLink) -> dict:
         rfq = rfq_link(conn, mid)
         if rfq and rfq['lot_id'] != data.lot_id:
             raise ConflictError(f'Письмо — ответ на запрос по закупке «{rfq["lot_title"]}»')
+        quoted = conn.execute('''SELECT l.title FROM inbox_quotes q JOIN lots l ON l.id=q.lot_id
+            WHERE q.message_id=? AND q.quote_id IS NOT NULL AND q.lot_id!=? LIMIT 1''', (mid, data.lot_id)).fetchone()
+        if quoted:
+            raise ConflictError(f'КП из этого письма сохранено в закупке «{quoted["title"]}»')
         conn.execute('INSERT OR REPLACE INTO inbox_lot_links VALUES (?,?,?,?,?,?)',
                      (mid, data.lot_id, data.supplier_id, data.kind, trusted_actor(), utcnow()))
         service.db.audit('inbox_message_linked', 'inbox_message', mid,
@@ -303,21 +307,33 @@ def lot_correspondence(service, lot_id: int) -> dict:
     lot = service.get_lot(lot_id)
     since = (datetime.now(UTC) - timedelta(days=CORRESPONDENCE_DAYS)).isoformat()
     linked, unsorted = [], []
-    with service.db.connection() as conn:
-        rows = conn.execute('''SELECT m.id, m.sender, m.subject, m.received_at, m.status, m.error,
+    select = '''SELECT m.id, m.sender, m.subject, m.received_at, m.status, m.error,
                 COALESCE(t.excerpt, '') AS excerpt, k.lot_id AS link_lot, k.kind AS link_kind,
                 k.supplier_id AS link_supplier, s.name AS link_supplier_name
             FROM inbox_messages m LEFT JOIN inbox_texts t ON t.message_id=m.id
-            LEFT JOIN inbox_lot_links k ON k.message_id=m.id LEFT JOIN suppliers s ON s.id=k.supplier_id
-            WHERE m.received_at>=? AND m.status!='duplicate' ORDER BY m.received_at DESC LIMIT 300''', (since,)).fetchall()
+            LEFT JOIN inbox_lot_links k ON k.message_id=m.id LEFT JOIN suppliers s ON s.id=k.supplier_id'''
+    with service.db.connection() as conn:
+        # Mail of this purchase, however old: filed by a person, with a saved quote, or answering our request.
+        own = {r[0] for r in conn.execute('''SELECT message_id FROM inbox_lot_links WHERE lot_id=?
+            UNION SELECT message_id FROM inbox_quotes WHERE lot_id=? AND quote_id IS NOT NULL
+            UNION SELECT r.message_id FROM inbox_message_refs r JOIN mail_receipts mr
+                ON r.in_reply_to=mr.rfc_message_id OR instr(r.references_json, mr.rfc_message_id) > 0
+              JOIN outbox_messages o ON o.id=mr.message_id JOIN campaigns c ON c.id=o.campaign_id
+            WHERE c.lot_id=?''', (lot_id, lot_id, lot_id))}
+        rows = [conn.execute(select + ' WHERE m.id=?', (mid,)).fetchone() for mid in sorted(own)]
+        # Candidates for sorting: only recent mail.
+        rows += [r for r in conn.execute(select + ''' WHERE m.received_at>=? AND m.status!='duplicate'
+            ORDER BY m.received_at DESC LIMIT 300''', (since,)).fetchall() if r['id'] not in own]
         for row in rows:
             row = dict(row)
             quotes = [dict(q) for q in conn.execute('''SELECT q.attachment_id, q.lot_id, q.supplier_id, s.name AS supplier_name,
                     l.title AS lot_title FROM inbox_quotes q JOIN lots l ON l.id=q.lot_id JOIN suppliers s ON s.id=q.supplier_id
                 WHERE q.message_id=? AND q.quote_id IS NOT NULL''', (row['id'],))]
             rfq = rfq_link(conn, row['id'])
-            lots = {q['lot_id'] for q in quotes} | ({rfq['lot_id']} if rfq else set()) | (
-                {row['link_lot']} if row['link_lot'] else set())
+            # One owner rule: a person's filing, else the purchases its quotes were saved in, else our request.
+            quote_lots = {q['lot_id'] for q in quotes}
+            lots = ({row['link_lot']} | quote_lots if row['link_lot'] else quote_lots
+                    or ({rfq['lot_id']} if rfq else set()))
             attachments = [dict(a) for a in conn.execute(
                 'SELECT id, filename FROM inbox_attachments WHERE message_id=? ORDER BY part', (row['id'],))]
             saved = {q['attachment_id']: q for q in quotes}
@@ -338,8 +354,10 @@ def lot_correspondence(service, lot_id: int) -> dict:
                     'status': row['status'], 'error': row['error'], 'excerpt': row['excerpt'], 'attachments': attachments,
                     'supplier': supplier, 'bounce': bool(_BOUNCE.search(row['subject'] or '')),
                     'kind': row['link_kind'] if row['link_lot'] == lot_id else 'quote' if own_quotes else 'reply',
-                    'linked_by': 'person' if row['link_lot'] == lot_id else 'request' if rfq and rfq['lot_id'] == lot_id
-                                 else 'quote' if own_quotes else ''}
+                    'linked_by': 'person' if row['link_lot'] == lot_id else 'quote' if own_quotes
+                                 else 'request' if rfq and rfq['lot_id'] == lot_id else '',
+                    # Saved in several purchases (one letter, two quotes): shown in each, with the others named.
+                    'other_lots': sorted(q['lot_title'] for q in quotes if q['lot_id'] != lot_id)}
             if lot_id in lots:
                 linked.append(item)
             elif not lots and (supplier or attachments or item['bounce'] or _REPLY_SUBJECT.match(row['subject'] or '')):

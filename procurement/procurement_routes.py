@@ -50,6 +50,9 @@ class ReadAlerts(StrictModel):
 class QuickMapping(StrictModel):
     mapping:dict[str,int]
 
+class LotCategory(StrictModel):
+    category:str=Field(default='',max_length=100)
+
 
 def install(app,settings,service,launch,require_access,write_access,session_claims,domain_error):
     flow=ProcurementFlow(service);catalog=Catalog(service,launch)
@@ -60,6 +63,10 @@ def install(app,settings,service,launch,require_access,write_access,session_clai
 
     from .incoming_routes import install as install_incoming
     install_incoming(app,service,launch,require_access,write_access,call)
+
+    @app.put('/api/procurement/lots/{lot_id}/category',dependencies=[Depends(write_access)])
+    def set_lot_category(lot_id:int,data:LotCategory):
+        return call(service.set_lot_category,lot_id,data.category)
 
     def role(request):
         principal=getattr(request.state,'das_principal',{}) or session_claims(request.cookies.get('procurement_session','')) or {}

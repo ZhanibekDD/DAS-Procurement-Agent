@@ -152,4 +152,31 @@ def test_correspondence_is_administrator_only_and_linking_needs_csrf(http_bounda
     assert client.post(link, json=body, headers=headers(alice)).status_code == 200
     assert client.get(url).json()['linked'][0]['kind'] == 'refusal'
     assert client.delete(link, headers=headers(alice)).status_code == 200
-    assert client.put(f'/api/lots/{lot["id"]}/category', json={'category': 'ЭХЗ'}, headers=headers(alice)).json()['category'] == 'ЭХЗ'
+    category = f'/api/procurement/lots/{lot["id"]}/category'
+    assert client.put(category, json={'category': 'ЭХЗ'}).status_code == 403  # no CSRF token
+    assert client.put(category, json={'category': 'ЭХЗ'}, headers=headers(alice)).json()['category'] == 'ЭХЗ'
+
+
+def test_old_mail_of_the_purchase_stays_after_newer_mail_arrives(workflow, tmp_path):
+    db, service, launch = workflow
+    lot, supplier = purchase(service)
+    _, message = receive(workflow, tmp_path, text_reply('Срок 3 недели', sender='a@example.test', in_reply_to=RFQ_ID))
+    with db.connection() as conn:
+        conn.execute("UPDATE inbox_messages SET received_at='2025-01-01T00:00:00+00:00'")  # older than the pool
+    assert [m['id'] for m in lot_correspondence(service, lot['id'])['linked']] == [message['id']]
+
+
+def test_a_quote_saved_elsewhere_owns_the_reply(workflow, tmp_path):
+    db, service, launch = workflow
+    lot, supplier = purchase(service)
+    other, other_supplier = purchase(service, rfq_id='<rfq-0002@dnepr.test>', email='b@example.test', title='Песок')
+    inbox, message = receive(workflow, tmp_path, reply())  # answers the request of `lot`
+    from procurement.inbox_quotes import save_quote
+    from test_inbox_quotes import form
+    from test_incoming_mail import admin
+    with admin():  # a person saved its quote in the other purchase
+        save_quote(service, inbox, message['attachments'][0]['id'], form(other, other_supplier, {0: '7'}))
+    assert lot_correspondence(service, lot['id'])['linked'] == []  # not shown in both purchases
+    assert [m['id'] for m in lot_correspondence(service, other['id'])['linked']] == [message['id']]
+    with pytest.raises(ConflictError):
+        link_message(service, message['id'], MessageLink(lot_id=lot['id'], kind='question'))
