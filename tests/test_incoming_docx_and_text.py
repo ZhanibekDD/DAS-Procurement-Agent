@@ -110,8 +110,9 @@ def test_mail_stored_by_the_old_reader_is_reread_once_from_the_mailbox(workflow,
     box = Mailbox({1: raw})
     assert poll(inbox, lambda: box)['caught_up'] is True
     mid = db.one('SELECT id FROM inbox_messages')['id']
-    with db.connection() as conn:
-        conn.execute('DELETE FROM inbox_texts')  # stored before reply texts existed
+    with db.connection() as conn:  # the old reader stored neither texts nor upgrade marks
+        conn.execute('DELETE FROM inbox_texts')
+        conn.execute('DELETE FROM inbox_upgrades')
     assert db.one('SELECT status FROM inbox_messages')['status'] == 'no_prices'
     monkeypatch.setattr(incoming_mail, 'SUPPORTED', {'.pdf', '.xlsx', '.csv', '.docx'})
     assert reread_pending(inbox, lambda: box) == {'status': 'ok', 'reread': 1}
@@ -129,6 +130,8 @@ def test_reread_never_uses_a_different_mailbox_copy(workflow, tmp_path, mailbox_
     inbox = Inbox(service, launch)
     monkeypatch.setattr(incoming_mail, 'SUPPORTED', {'.pdf', '.xlsx', '.csv'})
     poll(inbox, lambda: Mailbox({1: mail(attachments=[WORD])}))
+    with db.connection() as conn:
+        conn.execute('DELETE FROM inbox_upgrades')  # stored by the old reader
     monkeypatch.setattr(incoming_mail, 'SUPPORTED', {'.pdf', '.xlsx', '.csv', '.docx'})
     changed = Mailbox({1: mail(body='Другое письмо под тем же UID', attachments=[WORD])})
     assert reread_pending(inbox, lambda: changed)['reread'] == 1
@@ -142,6 +145,8 @@ def test_reread_failure_changes_nothing(workflow, tmp_path, mailbox_env, monkeyp
     inbox = Inbox(service, launch)
     monkeypatch.setattr(incoming_mail, 'SUPPORTED', {'.pdf', '.xlsx', '.csv'})
     poll(inbox, lambda: Mailbox({1: mail(attachments=[WORD])}))
+    with db.connection() as conn:
+        conn.execute('DELETE FROM inbox_upgrades')  # stored by the old reader
     def offline():
         raise OSError('PASSWORD transport')
     result = reread_pending(inbox, offline)
@@ -158,3 +163,14 @@ def test_reply_that_is_only_our_quoted_request_has_no_text():
     html['From'], html['Subject'] = 'a@b.test', 'Re: Запрос КП: ФБС'
     html.set_content('<blockquote>Просим направить КП</blockquote>', subtype='html')
     assert reply_excerpt(html) == ''
+
+
+def test_new_mail_is_not_downloaded_again_by_the_reread(workflow, tmp_path, mailbox_env):
+    db, service, launch = workflow
+    inbox = Inbox(service, launch)
+    box = Mailbox({1: mail(attachments=[WORD])})
+    poll(inbox, lambda: box)
+    assert db.one('SELECT result FROM inbox_upgrades')['result'] == 'ingested'
+    downloads = len(box.commands)
+    assert reread_pending(inbox, lambda: box) == {'status': 'ok', 'reread': 0}
+    assert len(box.commands) == downloads  # no second IMAP fetch

@@ -271,7 +271,7 @@ class ProcurementService:
                         ).casefold().replace("ё", "е")
         found = []
         for category in self.known_categories():
-            key = category.casefold()
+            key = category.casefold().replace("ё", "е")  # normalized like the purchase text
             # «ЖБИ изделия» inherits the ЖБИ hints: the family decides, not the exact name.
             patterns = self.CATEGORY_HINTS.get(self._family(key), ()) + (r"\b" + re.escape(key) + r"\b",)
             if any(re.search(pattern, text) for pattern in patterns):

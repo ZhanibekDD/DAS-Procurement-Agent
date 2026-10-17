@@ -347,6 +347,9 @@ class Inbox:
                 if known_parts is None:
                     self._store_message(mid, account, validity, uid, digest, 'review' if saved else 'no_prices',
                         error=' '.join(sorted(set(warnings))), mail=mail, conn=conn)
+                    # Read by the current reader already: never downloaded again by the one-time re-read.
+                    conn.execute('INSERT OR IGNORE INTO inbox_upgrades VALUES (?,?,?,?)',
+                                 (mid, UPGRADE_VERSION, 'ingested', utcnow()))
                 else:
                     has_parts = bool(saved) or bool(known_parts)
                     conn.execute("UPDATE inbox_messages SET status=CASE WHEN ? THEN 'review' ELSE status END, error=? WHERE id=?",

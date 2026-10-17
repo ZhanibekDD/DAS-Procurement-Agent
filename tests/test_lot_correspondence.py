@@ -239,3 +239,11 @@ def test_composite_category_names_inherit_the_family_hints(workflow):
     assert service.get_lot(lot['id'])['profile_categories'] == ['ЖБИ изделия']
     matches = {m['id'] for m in service.match_suppliers(lot['id'])}
     assert concrete['id'] in matches and cathodic['id'] not in matches
+
+
+def test_category_with_yo_matches_the_normalized_text(workflow):
+    db, service, launch = workflow
+    lot = lot_with(service, 'Крепёж для лотков', ['Крепёж анкерный'])
+    fixings = supplier(service, 'Метизы', ['Крепёж'])
+    assert service.get_lot(lot['id'])['profile_categories'] == ['Крепёж']
+    assert fixings['id'] in {m['id'] for m in service.match_suppliers(lot['id'])}
