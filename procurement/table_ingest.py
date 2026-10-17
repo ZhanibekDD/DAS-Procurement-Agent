@@ -162,6 +162,75 @@ def suggested_mapping(headers: list[str], aliases: dict[str, set[str]]) -> dict:
     return result
 
 
+# Supplier quotes rarely use our exact column names («Цена, руб. с НДС», «Наименование продукции»).
+# Prefixes only suggest a column: every row is still checked by a person against the original.
+_LOOSE = (('item_name', ('наименование', 'товар', 'материал', 'продукция', 'номенклатура')),
+          ('unit_price', ('цена',)),
+          ('unit', ('ед', 'единица')))
+
+
+def loose_mapping(headers: list[str], mapping: dict) -> dict:
+    """Fill item_name/unit_price/unit the exact aliases missed; an ambiguous column stays unmapped."""
+    result = dict(mapping)
+    taken = set(result.values())
+    for field, prefixes in _LOOSE:
+        if field in result:
+            continue
+        hits = [i for i, h in enumerate(headers) if i not in taken
+                and any(' '.join(str(h).casefold().replace('ё', 'е').split()).startswith(p) for p in prefixes)
+                and not (field == 'unit_price' and 'сумм' in str(h).casefold())]
+        if len(hits) == 1:
+            result[field] = hits[0]
+            taken.add(hits[0])
+    return result
+
+
+def read_docx_table(content: bytes, filename: str) -> dict:
+    """The price table of a Word quote, shaped like read_table(): the table whose header names the item
+    and the price, otherwise the largest one. Text outside tables is not read."""
+    from xml.etree import ElementTree as ET
+    safe_upload(content, filename, {'.docx'})
+    with open_payload(content) as stream, zipfile.ZipFile(stream) as archive:
+        info = archive.getinfo('word/document.xml')
+        if info.file_size > 8 * 1024 * 1024:
+            raise ValueError('DOCX слишком большой; загрузите таблицу в XLSX')
+        data = archive.read(info)
+    if b'<!DOCTYPE' in data or b'<!ENTITY' in data:
+        raise ValueError('Недопустимая структура DOCX')
+    ns = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+    tables = []
+    for table in ET.fromstring(data).iter('{%s}tbl' % ns['w']):
+        raw = []
+        for row in table.findall('w:tr', ns):
+            cells = [' '.join(''.join(t.text or '' for t in p.iter('{%s}t' % ns['w'])).strip()
+                              for p in cell.findall('w:p', ns)).strip() for cell in row.findall('w:tc', ns)]
+            if len(cells) > MAX_COLS or any(len(c) > 8000 for c in cells):
+                raise ValueError('Таблица DOCX превышает 100 колонок или ячейка длиннее 8000 символов')
+            if any(cells):
+                raw.append(cells)
+            if len(raw) > MAX_ROWS:
+                raise ValueError('Таблица превышает 10000 строк')
+        if raw:
+            tables.append(raw)
+    if not tables:
+        raise ValueError('В документе нет таблицы с ценами')
+    from .catalog import ALIASES
+
+    def header_row(raw):
+        for n, row in enumerate(raw[:5]):
+            if {'item_name', 'unit_price'} <= set(loose_mapping(row, suggested_mapping(row, ALIASES))):
+                return n
+        return None
+    priced = [(raw, header_row(raw)) for raw in tables]
+    raw, start = next(((r, n) for r, n in priced if n is not None), (max(tables, key=len), 0))
+    width = max(len(r) for r in raw)
+    padded = [r + [''] * (width - len(r)) for r in raw]
+    rows = [{'row': n + start + 2, 'cells': r} for n, r in enumerate(padded[start + 1:]) if any(r)]
+    if not rows:
+        raise ValueError('Нет строк данных')
+    return {'headers': padded[start], 'sheets': ['DOCX'], 'sheet': 'DOCX', 'header_row': start + 1, 'rows': rows}
+
+
 def mapped(row: dict, mapping: dict, headers: list[str], fields: set[str]) -> dict:
     if (set(mapping) - fields or any(type(v) is not int or not 0 <= v < len(headers) for v in mapping.values())
             or len(set(mapping.values())) != len(mapping)):

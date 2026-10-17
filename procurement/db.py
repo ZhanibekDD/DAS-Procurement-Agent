@@ -425,6 +425,8 @@ class Database:
                 # Archive hides a finished or unneeded purchase; quotes and mail stay intact.
                 ("archived_at", "TEXT NOT NULL DEFAULT ''"),
                 ("archived_by", "TEXT NOT NULL DEFAULT ''"),
+                # Supplier profile of the purchase (ЖБИ, ЭХЗ…); empty = suggested from the title and items.
+                ("category", "TEXT NOT NULL DEFAULT ''"),
             ),
             "lot_items": (
                 ("delivery_date", "TEXT"),
