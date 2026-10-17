@@ -272,7 +272,8 @@ class ProcurementService:
         found = []
         for category in self.known_categories():
             key = category.casefold()
-            patterns = self.CATEGORY_HINTS.get(key, ()) + (r"\b" + re.escape(key) + r"\b",)
+            # «ЖБИ изделия» inherits the ЖБИ hints: the family decides, not the exact name.
+            patterns = self.CATEGORY_HINTS.get(self._family(key), ()) + (r"\b" + re.escape(key) + r"\b",)
             if any(re.search(pattern, text) for pattern in patterns):
                 found.append(category)
         return found if len({self._family(c) for c in found}) == 1 else []

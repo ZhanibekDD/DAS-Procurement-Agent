@@ -229,3 +229,13 @@ def test_profile_chosen_by_hand_takes_the_whole_family(workflow):
     service.set_lot_category(lot['id'], 'ЖБИ')
     matches = {m['id'] for m in service.match_suppliers(lot['id'])}
     assert product['id'] in matches and cathodic['id'] not in matches
+
+
+def test_composite_category_names_inherit_the_family_hints(workflow):
+    db, service, launch = workflow
+    lot = lot_with(service, 'ФБС', ['ФБС 24.4.6'])
+    concrete = supplier(service, 'Завод', ['ЖБИ изделия'])
+    cathodic = supplier(service, 'СЭЗ', ['ЭХЗ'])
+    assert service.get_lot(lot['id'])['profile_categories'] == ['ЖБИ изделия']
+    matches = {m['id'] for m in service.match_suppliers(lot['id'])}
+    assert concrete['id'] in matches and cathodic['id'] not in matches
