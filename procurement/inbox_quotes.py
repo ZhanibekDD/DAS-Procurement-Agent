@@ -320,7 +320,8 @@ def lot_correspondence(service, lot_id: int) -> dict:
                 ON r.in_reply_to=mr.rfc_message_id OR instr(r.references_json, mr.rfc_message_id) > 0
               JOIN outbox_messages o ON o.id=mr.message_id JOIN campaigns c ON c.id=o.campaign_id
             WHERE c.lot_id=?''', (lot_id, lot_id, lot_id))}
-        rows = [conn.execute(select + ' WHERE m.id=?', (mid,)).fetchone() for mid in sorted(own)]
+        rows = sorted((conn.execute(select + ' WHERE m.id=?', (mid,)).fetchone() for mid in own),
+                      key=lambda r: r['received_at'], reverse=True)  # newest first, like the candidates
         # Candidates for sorting: only recent mail.
         rows += [r for r in conn.execute(select + ''' WHERE m.received_at>=? AND m.status!='duplicate'
             ORDER BY m.received_at DESC LIMIT 300''', (since,)).fetchall() if r['id'] not in own]

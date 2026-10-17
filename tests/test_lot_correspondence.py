@@ -180,3 +180,15 @@ def test_a_quote_saved_elsewhere_owns_the_reply(workflow, tmp_path):
     assert [m['id'] for m in lot_correspondence(service, other['id'])['linked']] == [message['id']]
     with pytest.raises(ConflictError):
         link_message(service, message['id'], MessageLink(lot_id=lot['id'], kind='question'))
+
+
+def test_purchase_replies_are_listed_newest_first(workflow, tmp_path):
+    db, service, launch = workflow
+    lot, supplier = purchase(service)
+    ids = []
+    for uid, day in ((1, '2026-10-01'), (2, '2026-10-05'), (3, '2026-10-03')):
+        _, message = receive(workflow, tmp_path, text_reply(f'Ответ {day}', sender='a@example.test', in_reply_to=RFQ_ID), uid=uid)
+        with db.connection() as conn:
+            conn.execute('UPDATE inbox_messages SET received_at=? WHERE id=?', (day + 'T10:00:00+00:00', message['id']))
+        ids.append(message['id'])
+    assert [m['id'] for m in lot_correspondence(service, lot['id'])['linked']] == [ids[1], ids[2], ids[0]]
