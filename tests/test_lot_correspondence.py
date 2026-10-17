@@ -177,7 +177,9 @@ def test_a_quote_saved_elsewhere_owns_the_reply(workflow, tmp_path):
     with admin():  # a person saved its quote in the other purchase
         save_quote(service, inbox, message['attachments'][0]['id'], form(other, other_supplier, {0: '7'}))
     assert lot_correspondence(service, lot['id'])['linked'] == []  # not shown in both purchases
-    assert [m['id'] for m in lot_correspondence(service, other['id'])['linked']] == [message['id']]
+    filed = lot_correspondence(service, other['id'])['linked']
+    assert [m['id'] for m in filed] == [message['id']]
+    assert filed[0]['supplier'] == {'id': other_supplier['id'], 'name': other_supplier['name'], 'source': 'quote'}
     with pytest.raises(ConflictError):
         link_message(service, message['id'], MessageLink(lot_id=lot['id'], kind='question'))
 
@@ -192,3 +194,15 @@ def test_purchase_replies_are_listed_newest_first(workflow, tmp_path):
             conn.execute('UPDATE inbox_messages SET received_at=? WHERE id=?', (day + 'T10:00:00+00:00', message['id']))
         ids.append(message['id'])
     assert [m['id'] for m in lot_correspondence(service, lot['id'])['linked']] == [ids[1], ids[2], ids[0]]
+
+
+def test_umbrella_and_product_categories_are_one_profile(workflow):
+    db, service, launch = workflow
+    lot = lot_with(service, 'ФБС', ['ФБС 24.4.6'])
+    umbrella = supplier(service, 'Завод ЖБИ', ['ЖБИ'])
+    product = supplier(service, 'Блоки ФБС', ['ФБС'])
+    cathodic = supplier(service, 'СЭЗ', ['ЭХЗ'])
+    loaded = service.get_lot(lot['id'])
+    assert loaded['profile_categories'] == ['ЖБИ', 'ФБС'] and loaded['suggested_category'] == 'ЖБИ / ФБС'
+    matches = {m['id'] for m in service.match_suppliers(lot['id'])}
+    assert {umbrella['id'], product['id']} <= matches and cathodic['id'] not in matches

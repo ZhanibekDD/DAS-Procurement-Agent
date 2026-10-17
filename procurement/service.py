@@ -255,8 +255,17 @@ class ProcurementService:
                     seen.setdefault(value.strip().casefold(), value.strip())
         return sorted(seen.values(), key=str.casefold)
 
-    def suggest_category(self, lot: dict[str, Any]) -> str:
-        """The one supplier profile the purchase text points to, or '' when none or several do."""
+    def _family(self, category: str) -> str:
+        """ФБС, ПБ… belong to ЖБИ; a category outside the known families is its own family."""
+        key = category.casefold().replace("ё", "е")
+        for family, patterns in self.CATEGORY_HINTS.items():
+            if key == family or any(re.search(pattern, key) for pattern in patterns):
+                return family
+        return key
+
+    def suggest_categories(self, lot: dict[str, Any]) -> list[str]:
+        """Supplier categories the purchase text points to, when they are one profile (ЖБИ and ФБС are);
+        none when the text points to different profiles (ЖБИ and ЭХЗ) or to nothing."""
         text = " ".join([lot["title"], *(item["name"] for item in lot.get("items", []))]).casefold().replace("ё", "е")
         found = []
         for category in self.known_categories():
@@ -264,7 +273,10 @@ class ProcurementService:
             patterns = self.CATEGORY_HINTS.get(key, ()) + (r"\b" + re.escape(key) + r"\b",)
             if any(re.search(pattern, text) for pattern in patterns):
                 found.append(category)
-        return found[0] if len(found) == 1 else ""
+        return found if len({self._family(c) for c in found}) == 1 else []
+
+    def suggest_category(self, lot: dict[str, Any]) -> str:
+        return " / ".join(self.suggest_categories(lot))
 
     def set_lot_category(self, lot_id: int, category: str) -> dict[str, Any]:
         category = " ".join(str(category or "").split())[:100]
@@ -281,8 +293,10 @@ class ProcurementService:
             raise NotFoundError("lot not found")
         row["rfq_requirements"] = json.loads(row.pop("rfq_requirements_json", "{}") or "{}")
         row["items"] = self.db.all("SELECT * FROM lot_items WHERE lot_id = ? ORDER BY id", (lot_id,))
-        row["suggested_category"] = "" if row.get("category") else self.suggest_category(row)
+        suggested = [] if row.get("category") else self.suggest_categories(row)
+        row["suggested_category"] = " / ".join(suggested)
         row["effective_category"] = row.get("category") or row["suggested_category"]
+        row["profile_categories"] = [row["category"]] if row.get("category") else suggested
         row["known_categories"] = self.known_categories()
         row['attachments'] = self.db.all('''SELECT d.id AS document_id,d.filename,d.sha256,d.size_bytes
             FROM lot_attachments a JOIN source_documents d ON d.id=a.document_id WHERE a.lot_id=?''', (lot_id,))
@@ -382,7 +396,7 @@ class ProcurementService:
     def match_suppliers(self, lot_id: int) -> list[dict[str, Any]]:
         lot = self.get_lot(lot_id)
         cluster = self._lot_cluster(lot)
-        profile = lot["effective_category"].casefold()
+        profiles = [p.casefold() for p in lot["profile_categories"]]
         search_text = " ".join([lot["title"], *(item["name"] for item in lot["items"])]).casefold()
         from .price_memory import material_key, designation_key
         from .catalog import normalize
@@ -398,9 +412,9 @@ class ProcurementService:
             if not self.serves_cluster(supplier["cluster"], supplier["both_clusters"], cluster):
                 continue
             own = [c.casefold() for c in supplier["categories"] if isinstance(c, str) and c.strip()]
-            if profile and own and not any(profile in c or c in profile for c in own):
+            if profiles and own and not any(p in c or c in p for p in profiles for c in own):
                 continue  # another profile: an ЭХЗ supplier is not offered a ФБС purchase
-            uncategorized = bool(profile) and not own
+            uncategorized = bool(profiles) and not own
             region_match = lot["region"].casefold() in supplier["region"].casefold() or supplier[
                 "region"
             ].casefold() in lot["region"].casefold()
@@ -426,7 +440,7 @@ class ProcurementService:
             ] * 3
             if uncategorized:
                 score = score / 2  # profile unknown: listed after the suppliers of this profile, never preselected
-            elif profile:
+            elif profiles:
                 score += 40
             if score > 0:
                 supplier["match_score"] = round(score, 2)

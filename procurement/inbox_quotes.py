@@ -341,8 +341,11 @@ def lot_correspondence(service, lot_id: int) -> dict:
             for attachment in attachments:
                 quote = saved.get(attachment['id'])
                 attachment['quote'] = {'lot_id': quote['lot_id'], 'lot_title': quote['lot_title']} if quote else None
+            own_quotes = [q for q in quotes if q['lot_id'] == lot_id]
             if row['link_supplier']:
                 supplier = {'id': row['link_supplier'], 'name': row['link_supplier_name'], 'source': 'person'}
+            elif own_quotes:  # the quote saved in this purchase names its supplier, whatever request it answered
+                supplier = {'id': own_quotes[0]['supplier_id'], 'name': own_quotes[0]['supplier_name'], 'source': 'quote'}
             elif rfq:
                 supplier = {'id': rfq['supplier_id'], 'name': rfq['supplier_name'], 'source': 'request'}
             elif quotes:
@@ -350,7 +353,6 @@ def lot_correspondence(service, lot_id: int) -> dict:
             else:
                 guess = sender_supplier(conn, row['sender'])
                 supplier = {**guess, 'source': 'sender'} if guess else None
-            own_quotes = [q for q in quotes if q['lot_id'] == lot_id]
             item = {'id': row['id'], 'sender': row['sender'], 'subject': row['subject'], 'received_at': row['received_at'],
                     'status': row['status'], 'error': row['error'], 'excerpt': row['excerpt'], 'attachments': attachments,
                     'supplier': supplier, 'bounce': bool(_BOUNCE.search(row['subject'] or '')),
